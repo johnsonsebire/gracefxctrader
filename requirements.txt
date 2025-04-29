@@ -1,0 +1,7 @@
+python-dotenv
+pyrofork
+tgcrypto
+motor
+colorama
+git+https://github.com/cleitonleonel/pyquotex.git
+dnspython
