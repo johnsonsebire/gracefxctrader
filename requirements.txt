@@ -5,3 +5,6 @@ motor
 colorama
 git+https://github.com/cleitonleonel/pyquotex.git
 dnspython
+flask
+gunicorn
+requests
