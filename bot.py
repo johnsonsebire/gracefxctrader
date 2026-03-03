@@ -37,6 +37,39 @@ except ImportError:
     print("Error: Motor not found. Install it: pip install motor")
     sys.exit(1)
 
+import ssl
+try:
+    import certifi
+except ImportError:
+    certifi = None
+
+# Patch pymongo's get_ssl_context to set SECLEVEL=1 for OpenSSL 3.x compatibility
+# with MongoDB Atlas (fixes TLSV1_ALERT_INTERNAL_ERROR on Python 3.12+/OpenSSL 3.x)
+try:
+    import pymongo.ssl_support as _pymongo_ssl_support
+    _orig_get_ssl_context = _pymongo_ssl_support.get_ssl_context
+    def _patched_get_ssl_context(*args, **kwargs):
+        ctx = _orig_get_ssl_context(*args, **kwargs)
+        if ctx is not None:
+            try:
+                ctx.set_ciphers("DEFAULT@SECLEVEL=1")
+            except Exception:
+                pass
+        return ctx
+    _pymongo_ssl_support.get_ssl_context = _patched_get_ssl_context
+except Exception:
+    pass
+
+_orig_create_default_context = ssl.create_default_context
+def _patched_create_default_context(purpose=ssl.Purpose.SERVER_AUTH, *args, **kwargs):
+    ctx = _orig_create_default_context(purpose, *args, **kwargs)
+    try:
+        ctx.set_ciphers("DEFAULT@SECLEVEL=1")
+    except ssl.SSLError:
+        pass
+    return ctx
+ssl.create_default_context = _patched_create_default_context
+
 try:
     from colorama import init, Fore, Style
     init(autoreset=True) # Initialize Colorama for script logging if needed
@@ -49,8 +82,8 @@ except ImportError:
 
 # --- pyquotex Imports ---
 try:
-    from quotexapi.stable_api import Quotex
-    from quotexapi.utils.processor import get_color # Optional
+    from pyquotex.stable_api import Quotex
+    from pyquotex.utils.processor import get_color # Optional
     # Monkey patch target detection function (safer approach)
     # --- Inside your script, replace the existing function ---
     
@@ -69,11 +102,11 @@ except Exception as e:
 # Load environment variables from a .env file
 load_dotenv()
 
-API_ID = int(os.getenv("API_ID", 12345678))  # Replace with a default value if needed
-API_HASH = os.getenv("API_HASH", "your_api_hash")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "your_bot_token")
-MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
-OWNER_ID = int(os.getenv("OWNER_ID", 987654321))  # Replace with a default value if needed
+API_ID = int(os.getenv("API_ID") or 12345678)  # Replace with a default value if needed
+API_HASH = os.getenv("API_HASH") or "your_api_hash"
+BOT_TOKEN = os.getenv("BOT_TOKEN") or "your_bot_token"
+MONGO_URI = os.getenv("MONGO_URI") or "mongodb://localhost:27017/"
+OWNER_ID = int(os.getenv("OWNER_ID") or 987654321)  # Replace with a default value if needed
 
 # Basic Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s')
@@ -124,7 +157,9 @@ async def setup_database():
     """Initializes MongoDB connection and collections."""
     global db, users_db, quotex_accounts_db, trade_settings_db
     try:
-        client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
+        is_atlas = MONGO_URI.startswith("mongodb+srv") or "mongodb.net" in MONGO_URI
+        tls_kwargs = {"tlsCAFile": certifi.where()} if (is_atlas and certifi) else {}
+        client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI, **tls_kwargs)
         db = client['quotexTraderBot'] # Database name
         users_db = db['users']
         quotex_accounts_db = db['quotex_accounts']
@@ -1612,32 +1647,21 @@ async def message_handler(client: Client, message: Message):
                  await message.reply_text(f"✅ Asset `{new_asset['name']}` added successfully!", quote=True)
 
               # Show updated asset list screen
-             if bot_instance: # Check if client exists (should always here)
-                  # Create a dummy CallbackQuery to call the handler again
-                 dummy_cb = CallbackQuery(
-                        id="dummy_callback_id", # This needs a real ID structure maybe? Using dummy.
-                        from_user=message.from_user,
-                        chat_instance=str(message.chat.id), # Needs instance value
-                        message=message, # Pass original message? Maybe the one with buttons
-                        data=f"asset_manage:{account_doc_id}",
-                         # Following needs correct structure if required by handler
-                         #game_short_name=None,
-                         #inline_message_id=None,
-                    )
-                    # Need to find the message with the buttons to edit
-                 try:
-                    # This is tricky - need reference to the button message. Assume last bot message
-                     await bot_instance.edit_message_text(message.chat.id, message.id -1 , "Refreshing assets...", ) # Example idea - often fails
-                     await asyncio.sleep(0.5) # Let edit register
-                     #await callback_query_handler(client, dummy_cb) # Problem: Need real CB ID and structure
-                     # Safer: just send back to main account management
-                     acc_details = await get_quotex_account_details(account_doc_id)
-                     settings_reloaded = await get_or_create_trade_settings(account_doc_id)
-                     await message.reply_text("Navigating back to account management...", reply_markup=account_management_keyboard(account_doc_id, settings_reloaded))
-
-                 except Exception as edit_err:
-                      logger.error(f"Could not auto-navigate after asset add: {edit_err}")
-                      await message.reply_text("Asset added. Please navigate back manually if needed.")
+             settings_reloaded = await get_or_create_trade_settings(account_doc_id)
+             assets_reloaded = settings_reloaded.get("assets", [])
+             text = f"✅ Asset added!\n\nCurrent Assets for account `{account_doc_id}`:\n"
+             if assets_reloaded:
+                 for i, a in enumerate(assets_reloaded):
+                     text += f"  {i+1}. `{a['name']}` | Amount: {a.get('amount', DEFAULT_TRADE_AMOUNT)} | Duration: {a.get('duration', DEFAULT_TRADE_DURATION)}s\n"
+             else:
+                 text += "  No assets configured yet.\n"
+             keyboard = [
+                 [InlineKeyboardButton("➕ Add Asset", callback_data=f"asset_add:{account_doc_id}")],
+             ]
+             if assets_reloaded:
+                 keyboard.append([InlineKeyboardButton("❌ Remove an Asset", callback_data=f"asset_remove_select:{account_doc_id}")])
+             keyboard.append(back_button(f"qx_manage:{account_doc_id}"))
+             await message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=enums.ParseMode.DEFAULT)
 
 
          except (ValueError, IndexError) as e:
@@ -2128,7 +2152,8 @@ async def run_trading_loop_for_account(user_id: int, account_doc_id: str):
              except Exception as cleanup_error:
                  logger.error(f"[Trading Task {account_doc_id}]: Error during cleanup: {cleanup_error}", exc_info=True)
              finally:
-                 break # Exit the while loop
+                 pass # Cleanup complete
+             break # Exit the while loop
         except ConnectionError as ce: # Catch connection errors from get_quotex_client or within loop
              logger.error(f"[Trading Task {account_doc_id}]: ConnectionError encountered: {ce}. Pausing for 60s.")
              await disconnect_quotex_client(account_doc_id) # Ensure cleanup on error
