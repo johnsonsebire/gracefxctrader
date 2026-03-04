@@ -148,8 +148,10 @@ users_db = None # Collection for users, roles, basic settings
 quotex_accounts_db = None # Collection for Quotex credentials
 trade_settings_db = None # Collection for trade settings per user/account
 signal_settings_db = None  # Collection for signal channel + pending signal state
+signal_logs_db = None       # Collection for per-signal timing/event log
 trade_journal_db = None  # Collection for per-account daily trade journal
 trade_journal_balances_db = None  # Collection for daily opening/closing account balances
+trade_journal_withdrawals_db = None  # Collection for withdrawal records
 
 # Temporary storage for OTP requests: {user_id: {'qx_client': qx_client_instance, 'event': asyncio.Event()}}
 active_otp_requests: Dict[int, Dict[str, Any]] = {}
@@ -160,6 +162,9 @@ user_states: Dict[int, str] = {} # e.g., {user_id: "waiting_broadcast_message"}
 # Default Quotex Settings (can be overridden from DB)
 DEFAULT_TRADE_AMOUNT = 5
 DEFAULT_TRADE_DURATION = 60 # For Timer/Time mode number
+
+# UTC+5:30 (IST) timezone for signal timing logs
+IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 DEFAULT_TRADE_MODE = "TIMER" # 'TIMER' or 'TIME'
 DEFAULT_CANDLE_SIZE = 60
 DEFAULT_SERVICE_STATUS = True # Accounts Active (participate in signal trades) by default
@@ -171,7 +176,7 @@ COOLDOWN_MINUTES = 3
 # --- Database Setup ---
 async def setup_database():
     """Initializes MongoDB connection and collections."""
-    global db, users_db, quotex_accounts_db, trade_settings_db, signal_settings_db, trade_journal_db, trade_journal_balances_db
+    global db, users_db, quotex_accounts_db, trade_settings_db, signal_settings_db, signal_logs_db, trade_journal_db, trade_journal_balances_db, trade_journal_withdrawals_db
     try:
         is_atlas = MONGO_URI.startswith("mongodb+srv") or "mongodb.net" in MONGO_URI
         tls_kwargs = {"tlsCAFile": certifi.where()} if (is_atlas and certifi) else {}
@@ -181,16 +186,24 @@ async def setup_database():
         quotex_accounts_db = db['quotex_accounts']
         trade_settings_db = db['trade_settings']
         signal_settings_db = db['signal_settings']
-        trade_journal_db = db['trade_journal']
+        signal_logs_db     = db['signal_logs']
+        trade_journal_db   = db['trade_journal']
         trade_journal_balances_db = db['trade_journal_balances']
         # Create indexes for faster lookups
         await users_db.create_index("user_id", unique=True)
         await quotex_accounts_db.create_index([("user_id", 1), ("email", 1)], unique=True)
         await trade_settings_db.create_index("account_doc_id", unique=True) # Link to quotex account document
         await signal_settings_db.create_index("owner_id", unique=True)
+        await signal_logs_db.create_index("received_at")
+        await signal_logs_db.create_index(
+            "created_at",
+            expireAfterSeconds=60 * 60 * 24 * 30,  # auto-delete after 30 days
+        )
         await trade_journal_db.create_index([("account_doc_id", 1), ("date", 1)])
         await trade_journal_db.create_index("entry_time")
         await trade_journal_balances_db.create_index([("account_doc_id", 1), ("date", 1)], unique=True)
+        trade_journal_withdrawals_db = db['trade_journal_withdrawals']
+        await trade_journal_withdrawals_db.create_index([("account_doc_id", 1), ("date", 1)])
         logger.info("Database connection successful and collections initialized.")
     except Exception as e:
         logger.error(f"Failed to connect to MongoDB: {e}", exc_info=True)
@@ -411,7 +424,8 @@ async def get_journal_summary(account_doc_ids: list, date_str: str) -> dict:
     ties   = sum(1 for e in entries if e.get("result") == "TIE")
     net_pl = sum(e.get("profit_loss", 0) for e in entries)
     daily_balances = await get_daily_balances(account_doc_ids, date_str)
-    return {"total": total, "wins": wins, "losses": losses, "ties": ties, "net_pl": round(net_pl, 2), "entries": entries, "daily_balances": daily_balances}
+    daily_withdrawals = await get_daily_withdrawals(account_doc_ids, date_str)
+    return {"total": total, "wins": wins, "losses": losses, "ties": ties, "net_pl": round(net_pl, 2), "entries": entries, "daily_balances": daily_balances, "daily_withdrawals": daily_withdrawals}
 
 async def record_opening_balance(account_doc_id: str, email: str, date_str: str, account_mode: str, balance: float) -> bool:
     """Record the opening balance for the day — only written on the very first trade."""
@@ -459,7 +473,175 @@ async def get_daily_balances(account_doc_ids: list, date_str: str) -> dict:
     docs = await cursor.to_list(length=100)
     return {d["account_doc_id"]: d for d in docs}
 
+async def save_withdrawal(account_doc_id: str, email: str, date_str: str, amount: float, note: str = "") -> bool:
+    """Record a withdrawal for an account on a given day."""
+    if trade_journal_withdrawals_db is None:
+        logger.warning("[Journal] trade_journal_withdrawals_db not initialized.")
+        return False
+    try:
+        await trade_journal_withdrawals_db.insert_one({
+            "account_doc_id": account_doc_id,
+            "email": email,
+            "date": date_str,
+            "amount": round(amount, 2),
+            "note": note,
+            "recorded_at": datetime.datetime.now(datetime.timezone.utc),
+        })
+        return True
+    except Exception as e:
+        logger.error(f"[Journal] Failed to save withdrawal: {e}", exc_info=True)
+        return False
+
+async def get_daily_withdrawals(account_doc_ids: list, date_str: str) -> dict:
+    """Return {account_doc_id: [withdrawal_docs]} for a date."""
+    if trade_journal_withdrawals_db is None:
+        return {}
+    cursor = trade_journal_withdrawals_db.find({"account_doc_id": {"$in": account_doc_ids}, "date": date_str})
+    docs = await cursor.to_list(length=200)
+    result: dict = {}
+    for d in docs:
+        result.setdefault(d["account_doc_id"], []).append(d)
+    return result
+
+
+def _build_journal_text(summary: dict, view_date: str) -> str:
+    """Build the display text for a journal view (shared helper for all 3 display locations)."""
+    entries = summary["entries"]
+    journal_text = f"📓 **Trading Journal — {view_date}**\n\n"
+
+    if not entries:
+        journal_text += "_No trades recorded for this day._\n"
+    else:
+        by_account: Dict[str, list] = {}
+        for e in entries:
+            by_account.setdefault(e.get("email", "Unknown"), []).append(e)
+
+        daily_bals = summary.get("daily_balances", {})
+        daily_wds = summary.get("daily_withdrawals", {})
+
+        def _fmt_bal(v: Optional[float]) -> str:
+            return f"${v:,.2f}" if v is not None else "N/A"
+
+        for acct_email, trades in by_account.items():
+            acct_doc_id = trades[0].get("account_doc_id", "")
+            bal_rec = daily_bals.get(acct_doc_id, {})
+            opening_bal = bal_rec.get("opening_balance")
+            closing_bal = bal_rec.get("closing_balance")
+            wds = daily_wds.get(acct_doc_id, [])
+            total_wd = sum(w.get("amount", 0) for w in wds)
+            adjusted_close = (closing_bal - total_wd) if (closing_bal is not None and total_wd) else closing_bal
+
+            journal_text += f"📧 **{acct_email}** ({trades[0].get('account_mode', '')}):\n"
+            if opening_bal is not None:
+                bal_diff = (adjusted_close - opening_bal) if adjusted_close is not None else 0
+                diff_str = (
+                    f" ({'+' if bal_diff >= 0 else ''}{bal_diff:,.2f})"
+                    if adjusted_close is not None else ""
+                )
+                close_label = f"{_fmt_bal(adjusted_close)}{diff_str}"
+                if total_wd:
+                    close_label += f"  _(−${total_wd:,.2f} withdrawn)_"
+                journal_text += f"   💵 Open: {_fmt_bal(opening_bal)}  →  Close: {close_label}\n"
+
+            for i, t in enumerate(trades, 1):
+                res_icon = "✅" if t["result"] == "WIN" else ("⚠️" if t["result"] == "TIE" else "❌")
+                pl = t.get("profit_loss", 0)
+                pl_str = f"+${abs(pl):.2f}" if pl > 0 else (f"-${abs(pl):.2f}" if pl < 0 else "$0.00")
+                entry_ts = t["entry_time"].strftime("%H:%M:%S") if isinstance(t.get("entry_time"), datetime.datetime) else "N/A"
+                close_ts = t["closing_time"].strftime("%H:%M:%S") if isinstance(t.get("closing_time"), datetime.datetime) else "N/A"
+                e_price = f"{t['entry_price']:.5f}" if t.get("entry_price") else "N/A"
+                c_price = f"{t['closing_price']:.5f}" if t.get("closing_price") else "N/A"
+                manual_tag = " ✍️" if t.get("manual") else ""
+                journal_text += (
+                    f"  {i}. {res_icon} `{t.get('symbol', 'N/A')}` | {t.get('direction', '?')} | "
+                    f"${t.get('amount', 0)} | {t.get('duration', 0) // 60}min{manual_tag}\n"
+                    f"      ⏰ Entry: {entry_ts} UTC @ {e_price}\n"
+                    f"      🏁 Close: {close_ts} UTC @ {c_price}\n"
+                    f"      📌 Result: **{t['result']}**  {pl_str}\n"
+                )
+
+            if wds:
+                for w in wds:
+                    note_str = f" — {w['note']}" if w.get("note") else ""
+                    journal_text += f"   💸 Withdrawal: ${w.get('amount', 0):,.2f}{note_str}\n"
+
+            journal_text += "\n"
+
+        # Summary footer
+        total_wd_all = sum(
+            sum(w.get("amount", 0) for w in wlist)
+            for wlist in daily_wds.values()
+        )
+        net_str = f"+${summary['net_pl']:.2f}" if summary['net_pl'] >= 0 else f"-${abs(summary['net_pl']):.2f}"
+        journal_text += (
+            f"─────────────────────\n"
+            f"📊 **Summary:** {summary['total']} trade(s) | "
+            f"✅ {summary['wins']} Win | ❌ {summary['losses']} Loss | ⚠️ {summary['ties']} Tie\n"
+            f"💰 **Net P&L:** {net_str}"
+        )
+        if total_wd_all:
+            journal_text += f"\n💸 **Total Withdrawn:** ${total_wd_all:,.2f}"
+
+    return journal_text
+
+
 # --- Signal Settings DB Functions ---
+
+async def log_signal_event(
+    event_type: str,
+    message,                        # pyrofork Message object
+    parsed: Optional[Dict] = None,
+    direction: Optional[str] = None,
+    extra: Optional[Dict] = None,
+):
+    """
+    Persist a signal timing entry to MongoDB with UTC+5:30 timestamps.
+
+    event_type values:
+        'full'              – complete signal (asset + duration + amount + direction)
+        'partial'           – signal without direction yet
+        'direction'         – standalone direction follow-up matched to pending
+        'direction_expired' – direction arrived but pending had expired
+        'unmatched_direction' – direction msg but no pending signal
+    """
+    if signal_logs_db is None:
+        return
+    try:
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        now_ist = now_utc.astimezone(IST)
+
+        # message.date is a datetime (UTC) in pyrofork
+        provider_dt_utc = message.date if message.date.tzinfo else message.date.replace(tzinfo=datetime.timezone.utc)
+        provider_dt_ist = provider_dt_utc.astimezone(IST)
+        delay_s = round((now_utc - provider_dt_utc).total_seconds(), 2)
+
+        entry = {
+            'event_type':       event_type,
+            'received_at':      now_ist,          # UTC+5:30
+            'received_at_utc':  now_utc,
+            'provider_sent_at': provider_dt_ist,  # UTC+5:30
+            'provider_sent_utc': provider_dt_utc,
+            'delay_seconds':    delay_s,
+            'channel_id':       str(message.chat.id),
+            'message_id':       message.id,
+            'raw_text':         (message.text or message.caption or '')[:300],
+            'asset':            (parsed or {}).get('asset'),
+            'asset_display':    (parsed or {}).get('asset_display'),
+            'duration':         (parsed or {}).get('duration'),
+            'amount':           (parsed or {}).get('amount'),
+            'direction':        direction or (parsed or {}).get('direction'),
+            'created_at':       now_utc,  # used by TTL index
+        }
+        if extra:
+            entry.update(extra)
+        await signal_logs_db.insert_one(entry)
+        logger.info(
+            f"[SignalLog] {event_type} | provider={provider_dt_ist.strftime('%H:%M:%S')} IST "
+            f"| received={now_ist.strftime('%H:%M:%S')} IST | delay={delay_s}s"
+        )
+    except Exception as e:
+        logger.warning(f"[SignalLog] Failed to write log entry: {e}")
+
 
 async def get_signal_settings() -> Dict[str, Any]:
     """Get the single signal-settings document for the owner (creates defaults if missing)."""
@@ -472,6 +654,7 @@ async def get_signal_settings() -> Dict[str, Any]:
             'channel_id': SIGNAL_CHANNEL_ID,  # pre-seed from .env if set
             'is_active': False,
             'pending_signal': None,
+            'signal_delay': 15,  # seconds to subtract from duration at execution (0 = disabled)
         }
         await signal_settings_db.insert_one(doc)
     return doc
@@ -1684,7 +1867,7 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
             sig_settings = await get_signal_settings()
             new_status = not sig_settings.get('is_active', False)
             if new_status and not sig_settings.get('channel_id'):
-                await callback_query.answer("Set a channel first with /setchannel", show_alert=True)
+                await callback_query.answer("Set a channel first using the Set Channel button.", show_alert=True)
                 return
             if new_status and not userbot_instance:
                 await callback_query.answer("Userbot not configured (USERBOT_PHONE missing)", show_alert=True)
@@ -1701,16 +1884,19 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
         is_active = sig_settings.get('is_active', False)
         channel_id = sig_settings.get('channel_id', 'Not set')
         pending = sig_settings.get('pending_signal')
+        signal_delay = int(sig_settings.get('signal_delay', 0))
         userbot_ok = userbot_instance is not None
 
         status_icon = "🟢" if is_active else "🔴"
         toggle_label = "🔴 Turn OFF" if is_active else "🟢 Turn ON"
+        delay_label = f"⏱ Delay: {signal_delay}s" if signal_delay > 0 else "⏱ Delay: OFF"
 
         text = (
             f"📡 **Signal Monitor**\n\n"
             f"{status_icon} Status: **{'ON' if is_active else 'OFF'}**\n"
             f"📺 Channel: `{channel_id}`\n"
             f"🤖 Userbot: **{'Running ✅' if userbot_ok else 'Not configured ❌'}**\n"
+            f"⏱ Delay Compensation: **{f'{signal_delay}s subtracted from duration' if signal_delay > 0 else 'Disabled'}**\n"
         )
         if pending:
             age_s = int(time.time() - pending.get('timestamp', 0))
@@ -1723,9 +1909,14 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
         else:
             text += "\nNo pending signal.\n"
 
+        delay_off_btn = InlineKeyboardButton("🚫 Disable Delay", callback_data="sig_delay_off")
+        delay_set_btn = InlineKeyboardButton(f"✏️ Set Delay ({signal_delay}s)", callback_data="sig_delay_set")
         keyboard = [
             [InlineKeyboardButton(toggle_label, callback_data="signal_toggle")],
+            [InlineKeyboardButton("📺 Set Channel", callback_data="sig_set_channel")],
+            [delay_set_btn, delay_off_btn],
             [InlineKeyboardButton("🗑 Clear Pending Signal", callback_data="signal_clear_pending")],
+            [InlineKeyboardButton("📋 Signal Logs", callback_data="signal_logs_view")],
             back_button("main_menu"),
         ]
         try:
@@ -1735,6 +1926,157 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
                 pass  # content unchanged — nothing to do
             else:
                 raise
+
+    # ── Signal Logs View ──────────────────────────────────────────────────────
+
+    elif data == "signal_logs_view":
+        if user_id != OWNER_ID:
+            await callback_query.answer("⛔️ Owner only.", show_alert=True)
+            return
+        await _send_signal_logs(message, edit=True)
+
+    # ── Signal Set Channel Callback ─────────────────────────────────────────────
+
+    elif data == "sig_set_channel":
+        if user_id != OWNER_ID:
+            await callback_query.answer("⛔️ Owner only.", show_alert=True)
+            return
+        user_states[user_id] = f"waiting_signal_channel:{message.id}"
+        sig_settings = await get_signal_settings()
+        current_ch = sig_settings.get('channel_id', 'Not set')
+        try:
+            await message.edit_text(
+                f"📺 **Set Signal Channel**\n\n"
+                f"Current channel: `{current_ch}`\n\n"
+                f"Send the **channel ID** or **@username** to monitor for signals.\n\n"
+                f"Examples:\n"
+                f"  • `-1001234567890` _(numeric ID — recommended)_\n"
+                f"  • `@mysignalchannel` _(public username)_\n\n"
+                f"Send /cancel to keep the current setting.",
+            )
+        except Exception:
+            pass
+
+    # ── Signal Delay Callbacks ────────────────────────────────────────────────
+
+    elif data in ("sig_delay_off", "sig_delay_set"):
+        if user_id != OWNER_ID:
+            await callback_query.answer("⛔️ Owner only.", show_alert=True)
+            return
+
+        if data == "sig_delay_off":
+            await update_signal_settings({'signal_delay': 0})
+            await callback_query.answer("Delay compensation disabled.")
+            # Re-render signal status view
+            callback_query.data = "signal_status_view"
+            sig_settings2 = await get_signal_settings()
+            is_active2 = sig_settings2.get('is_active', False)
+            channel_id2 = sig_settings2.get('channel_id', 'Not set')
+            pending2 = sig_settings2.get('pending_signal')
+            userbot_ok2 = userbot_instance is not None
+            status_icon2 = "🟢" if is_active2 else "🔴"
+            toggle_label2 = "🔴 Turn OFF" if is_active2 else "🟢 Turn ON"
+            text2 = (
+                f"📡 **Signal Monitor**\n\n"
+                f"{status_icon2} Status: **{'ON' if is_active2 else 'OFF'}**\n"
+                f"📺 Channel: `{channel_id2}`\n"
+                f"🤖 Userbot: **{'Running ✅' if userbot_ok2 else 'Not configured ❌'}**\n"
+                f"⏱ Delay Compensation: **Disabled**\n"
+            )
+            if pending2:
+                age_s2 = int(time.time() - pending2.get('timestamp', 0))
+                text2 += (
+                    f"\n⏳ **Pending Signal** (awaiting direction):\n"
+                    f"  `{pending2.get('asset_display', pending2.get('asset'))}` "
+                    f"${pending2.get('amount')} {pending2.get('duration', 0) // 60}min "
+                    f"— {age_s2}s ago {'⚠️ expired' if age_s2 > 300 else ''}\n"
+                )
+            else:
+                text2 += "\nNo pending signal.\n"
+            kb2 = [
+                [InlineKeyboardButton(toggle_label2, callback_data="signal_toggle")],
+                [InlineKeyboardButton("📺 Set Channel", callback_data="sig_set_channel")],
+                [InlineKeyboardButton("✏️ Set Delay (0s)", callback_data="sig_delay_set"),
+                 InlineKeyboardButton("🚫 Disable Delay", callback_data="sig_delay_off")],
+                [InlineKeyboardButton("🗑 Clear Pending Signal", callback_data="signal_clear_pending")],
+                [InlineKeyboardButton("📋 Signal Logs", callback_data="signal_logs_view")],
+                back_button("main_menu"),
+            ]
+            try:
+                await message.edit_text(text2, reply_markup=InlineKeyboardMarkup(kb2))
+            except Exception as e:
+                if "MESSAGE_NOT_MODIFIED" not in str(e):
+                    raise
+
+        else:  # sig_delay_set
+            user_states[user_id] = f"waiting_signal_delay:{message.id}"
+            try:
+                sig_s = await get_signal_settings()
+                cur_delay = int(sig_s.get('signal_delay', 0))
+                await message.edit_text(
+                    f"⏱ **Set Signal Delay Compensation**\n\n"
+                    f"Current delay: **{cur_delay}s**\n\n"
+                    f"Enter the number of seconds to subtract from the signal's duration at execution.\n"
+                    f"Typical value: `15` (for a 2‑min signal this gives 1m 45s).\n\n"
+                    f"Send `0` to disable, or /cancel to keep current setting.",
+                )
+            except Exception:
+                pass
+
+    # ── Signal Amount Selection Callbacks ─────────────────────────────────────
+
+    elif data.startswith("sig_amt:") or data in ("sig_amt_custom", "sig_amt_cancel"):
+        sig_settings = await get_signal_settings()
+        pending = sig_settings.get('pending_signal')
+
+        if not pending:
+            try:
+                await message.edit_text("⚠️ No pending signal to confirm amount for.")
+            except Exception:
+                pass
+            return
+
+        if data == "sig_amt_cancel":
+            await update_signal_settings({'pending_signal': None})
+            try:
+                await message.edit_text("❌ Signal cancelled.")
+            except Exception:
+                pass
+            return
+
+        if data == "sig_amt_custom":
+            user_states[user_id] = f"waiting_signal_amount:{message.id}"
+            try:
+                await message.edit_text(
+                    f"✏️ **Enter custom trade amount**\n\n"
+                    f"Current signal amount: `${pending.get('amount', 0):g}`\n\n"
+                    f"Send a number (e.g. `45` or `12.50`)\n"
+                    f"Or send /cancel to abort.",
+                )
+            except Exception:
+                pass
+            return
+
+        # data = "sig_amt:<float>"
+        try:
+            chosen_amount = float(data.split(":", 1)[1])
+        except (IndexError, ValueError):
+            return
+
+        pending['amount'] = chosen_amount
+        pending['amount_confirmed'] = True
+        await update_signal_settings({'pending_signal': pending})
+
+        dur_display = f"{pending['duration'] // 60} min" if pending['duration'] >= 60 else f"{pending['duration']} sec"
+        try:
+            await message.edit_text(
+                f"✅ **Amount confirmed: ${chosen_amount:g}**\n\n"
+                f"📊 Asset: `{pending.get('asset_display', pending.get('asset'))}`\n"
+                f"⏱ Duration: `{dur_display}`\n\n"
+                f"⏳ Waiting for direction signal (UP/DOWN)..."
+            )
+        except Exception:
+            pass
 
     # ── Trading Journal ───────────────────────────────────────────────────────
 
@@ -1765,54 +2107,7 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
         summary = await get_journal_summary(account_doc_ids, view_date)
         entries = summary["entries"]
 
-        # Build display text
-        journal_text = f"📓 **Trading Journal — {view_date}**\n\n"
-
-        if not entries:
-            journal_text += "_No trades recorded for this day._\n"
-        else:
-            # Group by account email
-            by_account: Dict[str, list] = {}
-            for e in entries:
-                by_account.setdefault(e.get("email", "Unknown"), []).append(e)
-
-            daily_bals = summary.get("daily_balances", {})
-
-            for acct_email, trades in by_account.items():
-                acct_doc_id = trades[0].get("account_doc_id", "")
-                bal_rec = daily_bals.get(acct_doc_id, {})
-                opening_bal = bal_rec.get("opening_balance")
-                closing_bal = bal_rec.get("closing_balance")
-                journal_text += f"📧 **{acct_email}** ({trades[0].get('account_mode','')}):\n"
-                if opening_bal is not None:
-                    def _fmt_bal(v): return f"${v:,.2f}" if v is not None else "N/A"
-                    bal_diff = (closing_bal - opening_bal) if closing_bal is not None else 0
-                    diff_str = f" ({'+' if bal_diff >= 0 else ''}{bal_diff:,.2f})" if closing_bal is not None else ""
-                    journal_text += f"   💵 Open: {_fmt_bal(opening_bal)}  →  Close: {_fmt_bal(closing_bal)}{diff_str}\n"
-                for i, t in enumerate(trades, 1):
-                    res_icon = "✅" if t["result"] == "WIN" else ("⚠️" if t["result"] == "TIE" else "❌")
-                    pl_str = f"+${abs(t['profit_loss']):.2f}" if t["profit_loss"] > 0 else (f"-${abs(t['profit_loss']):.2f}" if t["profit_loss"] < 0 else "$0.00")
-                    entry_ts = t["entry_time"].strftime("%H:%M:%S") if isinstance(t.get("entry_time"), datetime.datetime) else "N/A"
-                    close_ts = t["closing_time"].strftime("%H:%M:%S") if isinstance(t.get("closing_time"), datetime.datetime) else "N/A"
-                    e_price = f"{t['entry_price']:.5f}" if t.get("entry_price") else "N/A"
-                    c_price = f"{t['closing_price']:.5f}" if t.get("closing_price") else "N/A"
-                    journal_text += (
-                        f"  {i}. {res_icon} `{t.get('symbol', 'N/A')}` | {t.get('direction','?')} | "
-                        f"${t.get('amount', 0)} | {t.get('duration', 0) // 60}min\n"
-                        f"      ⏰ Entry: {entry_ts} UTC @ {e_price}\n"
-                        f"      🏁 Close: {close_ts} UTC @ {c_price}\n"
-                        f"      📌 Result: **{t['result']}**  {pl_str}\n"
-                    )
-                journal_text += "\n"
-
-            # Summary footer
-            net_str = f"+${summary['net_pl']:.2f}" if summary['net_pl'] >= 0 else f"-${abs(summary['net_pl']):.2f}"
-            journal_text += (
-                f"─────────────────────\n"
-                f"📊 **Summary:** {summary['total']} trade(s) | "
-                f"✅ {summary['wins']} Win | ❌ {summary['losses']} Loss | ⚠️ {summary['ties']} Tie\n"
-                f"💰 **Net P&L:** {net_str}"
-            )
+        journal_text = _build_journal_text(summary, view_date)
 
         # Prev / Next day navigation
         prev_dt = (view_dt - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
@@ -1823,6 +2118,8 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
         ]
         keyboard_rows = [
             nav_row,
+            [InlineKeyboardButton("✍️ Manual Entry", callback_data=f"journal_add_manual:{view_date}"),
+             InlineKeyboardButton("💸 Record Withdrawal", callback_data=f"journal_add_wd:{view_date}")],
             [InlineKeyboardButton("📅 Go to Date", callback_data="journal_pick_date")],
             back_button("main_menu"),
         ]
@@ -1835,6 +2132,124 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
         except Exception as e:
             if "MESSAGE_NOT_MODIFIED" not in str(e):
                 raise
+
+    elif data.startswith("journal_add_manual:"):
+        # journal_add_manual:{date_str}
+        date_str = data.split(":", 1)[1]
+        accounts = await get_user_quotex_accounts(user_id)
+        if not accounts:
+            await callback_query.answer("No accounts found.", show_alert=True)
+            return
+        if len(accounts) == 1:
+            acct = accounts[0]
+            acct_doc_id = str(acct["_id"])
+            user_states[user_id] = f"waiting_manual_entry:{acct_doc_id}:{date_str}"
+            await callback_query.message.reply_text(
+                f"✍️ **Manual Trade Entry** for `{acct.get('email', acct_doc_id)}`\n"
+                f"📅 Date: **{date_str}**\n\n"
+                "Send the trade details in this format:\n"
+                "`SYMBOL DIRECTION AMOUNT DURATION_MIN RESULT PL`\n\n"
+                "**Example:** `EURUSD_OTC CALL 10 1 WIN 9.20`\n"
+                "• DIRECTION: `CALL` or `PUT`\n"
+                "• RESULT: `WIN`, `LOSS`, or `TIE`\n"
+                "• PL: stake/profit as a positive number (auto-signed from RESULT)\n\n"
+                "Send /cancel to abort.",
+                reply_markup=ForceReply(selective=True),
+                parse_mode=enums.ParseMode.DEFAULT
+            )
+        else:
+            buttons = [
+                [InlineKeyboardButton(
+                    f"📧 {acct.get('email', str(acct['_id']))} ({acct.get('account_mode', '')})",
+                    callback_data=f"journal_me_acct:{str(acct['_id'])}:{date_str}"
+                )]
+                for acct in accounts
+            ]
+            buttons.append(back_button("main_menu"))
+            await callback_query.message.edit_text(
+                "✍️ **Manual Entry** — Select the account for this trade:",
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
+
+    elif data.startswith("journal_me_acct:"):
+        # journal_me_acct:{account_doc_id}:{date_str}
+        parts = data.split(":", 2)
+        if len(parts) < 3:
+            await callback_query.answer("Invalid action.", show_alert=True)
+            return
+        acct_doc_id, date_str = parts[1], parts[2]
+        accounts = await get_user_quotex_accounts(user_id)
+        acct = next((a for a in accounts if str(a["_id"]) == acct_doc_id), None)
+        acct_label = acct.get("email", acct_doc_id) if acct else acct_doc_id
+        user_states[user_id] = f"waiting_manual_entry:{acct_doc_id}:{date_str}"
+        await callback_query.message.reply_text(
+            f"✍️ **Manual Trade Entry** for `{acct_label}`\n"
+            f"📅 Date: **{date_str}**\n\n"
+            "Send the trade details in this format:\n"
+            "`SYMBOL DIRECTION AMOUNT DURATION_MIN RESULT PL`\n\n"
+            "**Example:** `EURUSD_OTC CALL 10 1 WIN 9.20`\n"
+            "• DIRECTION: `CALL` or `PUT`\n"
+            "• RESULT: `WIN`, `LOSS`, or `TIE`\n"
+            "• PL: stake/profit as a positive number (auto-signed from RESULT)\n\n"
+            "Send /cancel to abort.",
+            reply_markup=ForceReply(selective=True),
+            parse_mode=enums.ParseMode.DEFAULT
+        )
+
+    elif data.startswith("journal_add_wd:"):
+        # journal_add_wd:{date_str}
+        date_str = data.split(":", 1)[1]
+        accounts = await get_user_quotex_accounts(user_id)
+        if not accounts:
+            await callback_query.answer("No accounts found.", show_alert=True)
+            return
+        if len(accounts) == 1:
+            acct = accounts[0]
+            acct_doc_id = str(acct["_id"])
+            user_states[user_id] = f"waiting_withdrawal:{acct_doc_id}:{acct.get('email', '')}:{date_str}"
+            await callback_query.message.reply_text(
+                f"💸 **Record Withdrawal** for `{acct.get('email', acct_doc_id)}`\n"
+                f"📅 Date: **{date_str}**\n\n"
+                "Enter the withdrawal amount (e.g. `150.00` or `$150`).\n"
+                "Optionally add a note after the amount: `150 Profit withdrawal`\n\n"
+                "Send /cancel to abort.",
+                reply_markup=ForceReply(selective=True),
+                parse_mode=enums.ParseMode.DEFAULT
+            )
+        else:
+            buttons = [
+                [InlineKeyboardButton(
+                    f"📧 {acct.get('email', str(acct['_id']))} ({acct.get('account_mode', '')})",
+                    callback_data=f"journal_wd_acct:{str(acct['_id'])}:{date_str}"
+                )]
+                for acct in accounts
+            ]
+            buttons.append(back_button("main_menu"))
+            await callback_query.message.edit_text(
+                "💸 **Record Withdrawal** — Select the account:",
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
+
+    elif data.startswith("journal_wd_acct:"):
+        # journal_wd_acct:{account_doc_id}:{date_str}
+        parts = data.split(":", 2)
+        if len(parts) < 3:
+            await callback_query.answer("Invalid action.", show_alert=True)
+            return
+        acct_doc_id, date_str = parts[1], parts[2]
+        accounts = await get_user_quotex_accounts(user_id)
+        acct = next((a for a in accounts if str(a["_id"]) == acct_doc_id), None)
+        acct_label = acct.get("email", acct_doc_id) if acct else acct_doc_id
+        user_states[user_id] = f"waiting_withdrawal:{acct_doc_id}:{acct_label}:{date_str}"
+        await callback_query.message.reply_text(
+            f"💸 **Record Withdrawal** for `{acct_label}`\n"
+            f"📅 Date: **{date_str}**\n\n"
+            "Enter the withdrawal amount (e.g. `150.00` or `$150`).\n"
+            "Optionally add a note after the amount: `150 Profit withdrawal`\n\n"
+            "Send /cancel to abort.",
+            reply_markup=ForceReply(selective=True),
+            parse_mode=enums.ParseMode.DEFAULT
+        )
 
     elif data == "journal_pick_date":
         user_states[user_id] = "waiting_journal_date"
@@ -2172,52 +2587,15 @@ async def message_handler(client: Client, message: Message):
         entries = summary["entries"]
         view_dt = datetime.datetime.strptime(date_input, "%Y-%m-%d")
 
-        journal_text = f"📓 **Trading Journal — {date_input}**\n\n"
-        if not entries:
-            journal_text += "_No trades recorded for this day._\n"
-        else:
-            by_account: Dict[str, list] = {}
-            for e in entries:
-                by_account.setdefault(e.get("email", "Unknown"), []).append(e)
-            daily_bals = summary.get("daily_balances", {})
-            for acct_email, trades in by_account.items():
-                acct_doc_id = trades[0].get("account_doc_id", "")
-                bal_rec = daily_bals.get(acct_doc_id, {})
-                opening_bal = bal_rec.get("opening_balance")
-                closing_bal = bal_rec.get("closing_balance")
-                journal_text += f"📧 **{acct_email}** ({trades[0].get('account_mode','')}):\n"
-                if opening_bal is not None:
-                    def _fmt_bal(v): return f"${v:,.2f}" if v is not None else "N/A"
-                    bal_diff = (closing_bal - opening_bal) if closing_bal is not None else 0
-                    diff_str = f" ({'+' if bal_diff >= 0 else ''}{bal_diff:,.2f})" if closing_bal is not None else ""
-                    journal_text += f"   💵 Open: {_fmt_bal(opening_bal)}  →  Close: {_fmt_bal(closing_bal)}{diff_str}\n"
-                for i, t in enumerate(trades, 1):
-                    res_icon = "✅" if t["result"] == "WIN" else ("⚠️" if t["result"] == "TIE" else "❌")
-                    pl_str = f"+${abs(t['profit_loss']):.2f}" if t["profit_loss"] > 0 else (f"-${abs(t['profit_loss']):.2f}" if t["profit_loss"] < 0 else "$0.00")
-                    entry_ts = t["entry_time"].strftime("%H:%M:%S") if isinstance(t.get("entry_time"), datetime.datetime) else "N/A"
-                    close_ts = t["closing_time"].strftime("%H:%M:%S") if isinstance(t.get("closing_time"), datetime.datetime) else "N/A"
-                    e_price = f"{t['entry_price']:.5f}" if t.get("entry_price") else "N/A"
-                    c_price = f"{t['closing_price']:.5f}" if t.get("closing_price") else "N/A"
-                    journal_text += (
-                        f"  {i}. {res_icon} `{t.get('symbol','N/A')}` | {t.get('direction','?')} | "
-                        f"${t.get('amount',0)} | {t.get('duration',0) // 60}min\n"
-                        f"      ⏰ Entry: {entry_ts} UTC @ {e_price}\n"
-                        f"      🏁 Close: {close_ts} UTC @ {c_price}\n"
-                        f"      📌 Result: **{t['result']}**  {pl_str}\n"
-                    )
-                journal_text += "\n"
-            net_str = f"+${summary['net_pl']:.2f}" if summary['net_pl'] >= 0 else f"-${abs(summary['net_pl']):.2f}"
-            journal_text += (
-                f"─────────────────────\n"
-                f"📊 **Summary:** {summary['total']} trade(s) | ✅ {summary['wins']} Win | ❌ {summary['losses']} Loss | ⚠️ {summary['ties']} Tie\n"
-                f"💰 **Net P&L:** {net_str}"
-            )
+        journal_text = _build_journal_text(summary, date_input)
 
         prev_dt = (view_dt - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
         next_dt = (view_dt + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
         keyboard_rows = [
             [InlineKeyboardButton("◀ Prev Day", callback_data=f"journal_nav:{prev_dt}"),
              InlineKeyboardButton("▶ Next Day", callback_data=f"journal_nav:{next_dt}")],
+            [InlineKeyboardButton("✍️ Manual Entry", callback_data=f"journal_add_manual:{date_input}"),
+             InlineKeyboardButton("💸 Record Withdrawal", callback_data=f"journal_add_wd:{date_input}")],
             [InlineKeyboardButton("📅 Go to Date", callback_data="journal_pick_date")],
             back_button("main_menu"),
         ]
@@ -2228,32 +2606,338 @@ async def message_handler(client: Client, message: Message):
             quote=True
         )
 
+    elif state.startswith("waiting_manual_entry:"):
+        # state = "waiting_manual_entry:{account_doc_id}:{date_str}"
+        del user_states[user_id]
+        parts = state.split(":", 2)
+        if len(parts) < 3:
+            await message.reply_text("❌ Session error. Please try again.", quote=True)
+            return
+        acct_doc_id, date_str = parts[1], parts[2]
+
+        tokens = text.strip().split()
+        if len(tokens) < 6:
+            await message.reply_text(
+                "❌ Invalid format. Expected:\n"
+                "`SYMBOL DIRECTION AMOUNT DURATION_MIN RESULT PL`\n\n"
+                "Example: `EURUSD_OTC CALL 10 1 WIN 9.20`",
+                quote=True
+            )
+            return
+
+        symbol = tokens[0].upper()
+        direction = tokens[1].upper()
+        try:
+            amount = float(tokens[2])
+        except ValueError:
+            await message.reply_text("❌ Invalid amount. Must be a number.", quote=True)
+            return
+        try:
+            duration_min = int(tokens[3])
+        except ValueError:
+            await message.reply_text("❌ Invalid duration. Must be a whole number of minutes.", quote=True)
+            return
+        result = tokens[4].upper()
+        try:
+            pl_abs = float(tokens[5])
+        except ValueError:
+            await message.reply_text("❌ Invalid P&L value. Must be a number.", quote=True)
+            return
+
+        if direction not in ("CALL", "PUT"):
+            await message.reply_text("❌ Direction must be `CALL` or `PUT`.", quote=True)
+            return
+        if result not in ("WIN", "LOSS", "TIE"):
+            await message.reply_text("❌ Result must be `WIN`, `LOSS`, or `TIE`.", quote=True)
+            return
+
+        # Auto-sign profit_loss from result
+        if result == "WIN":
+            profit_loss = abs(pl_abs)
+        elif result == "LOSS":
+            profit_loss = -abs(pl_abs)
+        else:  # TIE
+            profit_loss = 0.0
+
+        # Use midnight UTC of the given date for entry/close timestamps
+        try:
+            entry_dt = datetime.datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=datetime.timezone.utc)
+        except ValueError:
+            entry_dt = datetime.datetime.now(datetime.timezone.utc)
+
+        accounts = await get_user_quotex_accounts(user_id)
+        acct = next((a for a in accounts if str(a["_id"]) == acct_doc_id), None)
+        acct_email = acct.get("email", "") if acct else ""
+        acct_mode = acct.get("account_mode", "PRACTICE") if acct else "PRACTICE"
+
+        entry = {
+            "user_id": user_id,
+            "account_doc_id": acct_doc_id,
+            "email": acct_email,
+            "account_mode": acct_mode,
+            "symbol": symbol,
+            "direction": direction,
+            "amount": amount,
+            "duration": duration_min * 60,
+            "result": result,
+            "profit_loss": profit_loss,
+            "entry_price": None,
+            "closing_price": None,
+            "entry_time": entry_dt,
+            "closing_time": entry_dt,
+            "manual": True,
+            "created_at": datetime.datetime.now(datetime.timezone.utc),
+        }
+        await save_journal_entry(entry)
+
+        res_icon = "✅" if result == "WIN" else ("⚠️" if result == "TIE" else "❌")
+        pl_display = f"+${abs(profit_loss):.2f}" if profit_loss > 0 else (f"-${abs(profit_loss):.2f}" if profit_loss < 0 else "$0.00")
+        await message.reply_text(
+            f"✍️ **Manual entry saved!**\n\n"
+            f"{res_icon} `{symbol}` | {direction} | ${amount} | {duration_min}min\n"
+            f"📌 Result: **{result}**  {pl_display}",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📓 View Journal", callback_data=f"journal_date:{date_str}")]
+            ]),
+            parse_mode=enums.ParseMode.DEFAULT,
+            quote=True
+        )
+
+    elif state.startswith("waiting_withdrawal:"):
+        # state = "waiting_withdrawal:{account_doc_id}:{email}:{date_str}"
+        del user_states[user_id]
+        parts = state.split(":", 3)
+        if len(parts) < 4:
+            await message.reply_text("❌ Session error. Please try again.", quote=True)
+            return
+        acct_doc_id, acct_email, date_str = parts[1], parts[2], parts[3]
+
+        raw = text.strip().lstrip("$").strip()
+        raw_parts = raw.split(None, 1)
+        amount_str = raw_parts[0].replace(",", "")
+        note = raw_parts[1].strip() if len(raw_parts) > 1 else ""
+        try:
+            amount = float(amount_str)
+            if amount <= 0:
+                raise ValueError("Amount must be positive")
+        except ValueError:
+            await message.reply_text(
+                "❌ Invalid amount. Please send a positive number, e.g. `150.00`",
+                quote=True
+            )
+            return
+
+        await save_withdrawal(acct_doc_id, acct_email, date_str, amount, note)
+
+        note_display = f"\n📝 Note: _{note}_" if note else ""
+        await message.reply_text(
+            f"💸 **Withdrawal recorded!**\n\n"
+            f"📧 Account: `{acct_email}`\n"
+            f"📅 Date: **{date_str}**\n"
+            f"💵 Amount: **${amount:,.2f}**{note_display}",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📓 View Journal", callback_data=f"journal_date:{date_str}")]
+            ]),
+            parse_mode=enums.ParseMode.DEFAULT,
+            quote=True
+        )
+
     # --- Placeholder for other states if needed ---
+
+    elif state and state.startswith("waiting_signal_channel:"):
+        del user_states[user_id]
+        try:
+            ch_msg_id = int(state.split(":", 1)[1])
+        except (IndexError, ValueError):
+            ch_msg_id = None
+
+        raw = text.strip()
+        if raw.lower() == "/cancel":
+            await message.reply_text("❌ Cancelled — channel unchanged.", quote=True)
+            return
+
+        # Accept numeric IDs (negative or positive) and @usernames
+        if not re.match(r'^-?\d+$', raw) and not re.match(r'^@?[\w]{4,}$', raw):
+            await message.reply_text(
+                "❌ Invalid format. Send a numeric channel ID (e.g. `-1001234567890`) "
+                "or a public username (e.g. `@channelname`).",
+                quote=True,
+            )
+            return
+
+        # Normalise: convert numeric strings to int, keep @usernames as-is
+        if re.match(r'^-?\d+$', raw):
+            new_channel: Any = int(raw)
+        else:
+            new_channel = raw if raw.startswith('@') else f'@{raw}'
+
+        await update_signal_settings({'channel_id': new_channel})
+
+        # Edit the prompt message
+        if bot_instance and ch_msg_id:
+            try:
+                await bot_instance.edit_message_text(
+                    chat_id=user_id,
+                    message_id=ch_msg_id,
+                    text=(
+                        f"✅ **Signal channel updated!**\n\n"
+                        f"Now monitoring: `{new_channel}`\n\n"
+                        f"Go back to Signal Monitor to turn monitoring ON."
+                    ),
+                )
+            except Exception:
+                pass
+
+        await message.reply_text(
+            f"✅ Signal channel set to `{new_channel}`.",
+            quote=True,
+        )
+
+    elif state and state.startswith("waiting_signal_delay:"):
+        del user_states[user_id]
+        try:
+            delay_msg_id = int(state.split(":", 1)[1])
+        except (IndexError, ValueError):
+            delay_msg_id = None
+
+        raw = text.strip()
+        if raw.lower() == "/cancel":
+            await message.reply_text("Cancelled — delay setting unchanged.", quote=True)
+            return
+        try:
+            new_delay = int(raw)
+            if new_delay < 0:
+                raise ValueError("Delay cannot be negative")
+        except ValueError:
+            await message.reply_text(
+                "❌ Invalid value. Send a whole number of seconds (e.g. `15`), or `0` to disable.",
+                quote=True,
+            )
+            return
+
+        await update_signal_settings({'signal_delay': new_delay})
+        delay_display = f"{new_delay}s" if new_delay > 0 else "Disabled"
+
+        # Edit the settings message if possible
+        if bot_instance and delay_msg_id:
+            try:
+                await bot_instance.edit_message_text(
+                    chat_id=user_id,
+                    message_id=delay_msg_id,
+                    text=(
+                        f"✅ **Delay compensation set to: {delay_display}**\n\n"
+                        f"Go back to Signal Monitor to review settings."
+                    ),
+                )
+            except Exception:
+                pass
+
+        await message.reply_text(
+            f"✅ Signal delay set to **{delay_display}**."
+            + (f" Durations will be reduced by {new_delay}s at execution." if new_delay > 0 else " No compensation will be applied."),
+            quote=True,
+        )
+
+    elif state and state.startswith("waiting_signal_amount:"):
+        # state = "waiting_signal_amount:{amount_msg_id}"
+        del user_states[user_id]
+        try:
+            amt_msg_id = int(state.split(":", 1)[1])
+        except (IndexError, ValueError):
+            amt_msg_id = None
+
+        raw = text.strip().lstrip("$").strip().replace(",", "")
+        try:
+            custom_amount = float(raw)
+            if custom_amount <= 0:
+                raise ValueError("Amount must be positive")
+        except ValueError:
+            await message.reply_text(
+                "❌ Invalid amount. Please send a positive number, e.g. `45` or `12.50`",
+                quote=True,
+            )
+            return
+
+        sig_settings = await get_signal_settings()
+        pending = sig_settings.get('pending_signal')
+        if not pending:
+            await message.reply_text("⚠️ No pending signal found. It may have expired.", quote=True)
+            return
+
+        pending['amount'] = custom_amount
+        pending['amount_confirmed'] = True
+        await update_signal_settings({'pending_signal': pending})
+
+        dur_display = f"{pending['duration'] // 60} min" if pending['duration'] >= 60 else f"{pending['duration']} sec"
+
+        # Edit the original amount selection message if possible
+        if bot_instance and amt_msg_id:
+            try:
+                await bot_instance.edit_message_text(
+                    chat_id=user_id,
+                    message_id=amt_msg_id,
+                    text=(
+                        f"✅ **Custom amount set: ${custom_amount:g}**\n\n"
+                        f"📊 Asset: `{pending.get('asset_display', pending.get('asset'))}`\n"
+                        f"⏱ Duration: `{dur_display}`\n\n"
+                        f"⏳ Waiting for direction signal (UP/DOWN)..."
+                    ),
+                )
+            except Exception:
+                pass
+
+        await message.reply_text(
+            f"✅ Trade amount set to **${custom_amount:g}**. Waiting for direction...",
+            quote=True,
+        )
 
 
 async def _check_asset_open_and_get_name(qx_client: Quotex, asset_name_original: str) -> Optional[str]:
-    """Checks if asset or its OTC variant is open, returns the name of the open asset or None."""
-    try:
-        # Check original asset first
-        checked_name, data = await qx_client.get_available_asset(asset_name_original, force_open=False)
-        if checked_name and data and data[2]:
-            logger.info(f"[{asset_name_original}] Asset is open.")
-            return checked_name # Return the name API confirmed (might be same or slightly different case)
+    """
+    Checks if the asset (or its OTC/non-OTC counterpart) is open.
+    Returns the name of the tradeable asset, or None if unavailable.
 
-        # If original closed and not already OTC, try OTC
-        if not asset_name_original.endswith("_otc"):
+    Resolution order:
+      • Non-OTC asset  → try force_open=False, then _otc with force_open=True
+      • OTC asset      → try force_open=True first, then non-OTC base as fallback
+    """
+    try:
+        is_otc = asset_name_original.endswith("_otc")
+
+        if not is_otc:
+            # 1. Try the base asset
+            checked_name, data = await qx_client.get_available_asset(asset_name_original, force_open=False)
+            if checked_name and data and data[2]:
+                logger.info(f"[{asset_name_original}] Asset is open.")
+                return checked_name
+
+            # 2. Base is closed — try the OTC variant
             otc_asset = asset_name_original + "_otc"
-            logger.info(f"[{asset_name_original}] Closed. Trying {otc_asset}...")
-            checked_name_otc, data_otc = await qx_client.get_available_asset(otc_asset, force_open=True) # Force open check for OTC
+            logger.info(f"[{asset_name_original}] Closed. Trying OTC variant {otc_asset}...")
+            checked_name_otc, data_otc = await qx_client.get_available_asset(otc_asset, force_open=True)
             if checked_name_otc and data_otc:
-                logger.info(f"[{otc_asset}] Asset is open (OTC).")
+                logger.info(f"[{otc_asset}] OTC variant is open.")
                 return checked_name_otc
-            else:
-                logger.warning(f"[{asset_name_original}/{otc_asset}] Both closed or unavailable.")
-                return None
+
+            logger.warning(f"[{asset_name_original}] Neither base nor OTC variant is available.")
+            return None
+
         else:
-            # Original was OTC and it's closed
-            logger.warning(f"[{asset_name_original}] Asset (OTC) is closed or unavailable.")
+            # 1. Asset name is already OTC — must use force_open=True
+            checked_name, data = await qx_client.get_available_asset(asset_name_original, force_open=True)
+            if checked_name and data:
+                logger.info(f"[{asset_name_original}] OTC asset is open (force_open=True).")
+                return checked_name
+
+            # 2. OTC unavailable — try the non-OTC base asset as fallback
+            base_asset = asset_name_original[:-4]  # strip "_otc"
+            logger.info(f"[{asset_name_original}] OTC unavailable. Trying base asset {base_asset}...")
+            checked_name_base, data_base = await qx_client.get_available_asset(base_asset, force_open=False)
+            if checked_name_base and data_base and data_base[2]:
+                logger.info(f"[{base_asset}] Base asset is open (fallback from OTC).")
+                return checked_name_base
+
+            logger.warning(f"[{asset_name_original}] Neither OTC nor base asset {base_asset} is available.")
             return None
 
     except Exception as e:
@@ -2265,6 +2949,56 @@ async def _check_asset_open_and_get_name(qx_client: Quotex, asset_name_original:
 # SIGNAL-BASED TRADING
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# ── Amount Selection Helpers ──────────────────────────────────────────────────
+
+async def get_owner_balance() -> Optional[float]:
+    """Fetch current account balance for the owner's first Quotex account."""
+    try:
+        accounts = await get_user_quotex_accounts(OWNER_ID)
+        if not accounts:
+            return None
+        account_doc_id = str(accounts[0]['_id'])
+        if account_doc_id in active_quotex_clients:
+            qx_client = active_quotex_clients[account_doc_id]
+            settings = await get_or_create_trade_settings(account_doc_id)
+            account_mode = settings.get('account_mode', 'PRACTICE')
+            profile = await qx_client.get_profile()
+            if profile:
+                bal = profile.live_balance if account_mode == 'REAL' else profile.demo_balance
+                return float(bal)
+    except Exception as e:
+        logger.warning(f"[SignalAmt] Could not fetch owner balance: {e}")
+    return None
+
+
+def get_amount_tiers(balance: Optional[float]) -> list:
+    """Return the tiered bet amounts based on account balance."""
+    if balance is None or balance < 50:
+        return [5, 10, 15, 20, 25, 30, 75, 100, 125, 150]
+    return [15, 20, 25, 30, 35, 65, 125, 200, 300, 350]
+
+
+def build_amount_keyboard(signal_amount: float, tiers: list) -> InlineKeyboardMarkup:
+    """Build inline keyboard for amount selection before a signal trade."""
+    # First row: use signal amount
+    keyboard = [
+        [InlineKeyboardButton(f"📊 Use Signal Amount (${signal_amount:g})", callback_data=f"sig_amt:{signal_amount}")]
+    ]
+    # Tier buttons: 3 per row
+    row: list = []
+    for amt in tiers:
+        row.append(InlineKeyboardButton(f"${int(amt)}", callback_data=f"sig_amt:{int(amt)}"))
+        if len(row) == 3:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+    # Bottom controls
+    keyboard.append([InlineKeyboardButton("✏️ Custom Amount", callback_data="sig_amt_custom")])
+    keyboard.append([InlineKeyboardButton("❌ Cancel Signal", callback_data="sig_amt_cancel")])
+    return InlineKeyboardMarkup(keyboard)
+
+
 async def execute_signal_trade(signal: Dict[str, Any]):
     """
     Execute a signal trade on ALL owner Quotex accounts simultaneously.
@@ -2273,26 +3007,40 @@ async def execute_signal_trade(signal: Dict[str, Any]):
     asset = signal.get('asset')
     direction = signal.get('direction')
     amount = float(signal.get('amount', DEFAULT_TRADE_AMOUNT))
-    duration = int(signal.get('duration', DEFAULT_TRADE_DURATION))
+    raw_duration = int(signal.get('duration', DEFAULT_TRADE_DURATION))
     asset_display = signal.get('asset_display', asset)
 
     if not asset or not direction:
         logger.error(f"[Signal Trade] Cannot execute — missing asset or direction: {signal}")
         return
 
+    # ── Apply signal-delay compensation ──────────────────────────────────────
+    sig_settings = await get_signal_settings()
+    signal_delay = int(sig_settings.get('signal_delay', 0))
+    if signal_delay > 0:
+        duration = max(raw_duration - signal_delay, 5)  # floor at 5s
+        delay_note = f" _(−{signal_delay}s delay compensation)_"
+    else:
+        duration = raw_duration
+        delay_note = ""
+    # ─────────────────────────────────────────────────────────────────────────
+
     dir_label = '🔼 BUY (CALL)' if direction == 'call' else '🔽 SELL (PUT)'
-    logger.info(f"[Signal Trade] {asset_display} | {dir_label} | ${amount} | {duration}s")
+    logger.info(f"[Signal Trade] {asset_display} | {dir_label} | ${amount} | {duration}s (signal: {raw_duration}s, delay: {signal_delay}s)")
 
     if bot_instance:
         try:
+            dur_display = f"{duration // 60}m {duration % 60}s" if duration % 60 else f"{duration // 60} min"
+            raw_dur_display = f"{raw_duration // 60}m {raw_duration % 60}s" if raw_duration % 60 else f"{raw_duration // 60} min"
             await bot_instance.send_message(
                 OWNER_ID,
                 f"🔔 **Signal Received — Executing Trades**\n\n"
                 f"📊 Asset: `{asset_display}`\n"
                 f"📈 Direction: **{dir_label}**\n"
                 f"💵 Amount: `${amount}`\n"
-                f"⏱ Duration: `{duration // 60} min ({duration}s)`\n\n"
-                f"⚡ Placing on all **Active** accounts...",
+                f"⏱ Duration: `{dur_display}`"
+                + (f" _(signal: {raw_dur_display}, −{signal_delay}s)_" if signal_delay > 0 else f" `({duration}s)`")
+                + f"\n\n⚡ Placing on all **Active** accounts...",
             )
         except Exception as e:
             logger.warning(f"[Signal Trade] Could not notify owner: {e}")
@@ -2523,12 +3271,26 @@ async def handle_channel_message(client: Client, message):
         if not channel_id:
             return
 
-        # Match by numeric id or @username
+        # Match by numeric id or @username — normalize both sides to avoid
+        # int vs str mismatches when the value was stored differently in DB.
         msg_chat_id = message.chat.id
-        chat_username = getattr(message.chat, 'username', None) or ''
-        channel_str = str(channel_id).lstrip('@')
+        chat_username = (getattr(message.chat, 'username', None) or '').lower()
+        channel_str = str(channel_id).strip()
 
-        if msg_chat_id != channel_id and channel_str.lower() != chat_username.lower():
+        # Try numeric comparison first (most reliable for channels)
+        try:
+            channel_int = int(channel_str)
+            id_match = (msg_chat_id == channel_int)
+        except (ValueError, TypeError):
+            id_match = False
+
+        # Fall back to @username comparison
+        username_match = (
+            chat_username
+            and channel_str.lstrip('@').lower() == chat_username
+        )
+
+        if not id_match and not username_match:
             return
 
         text = message.text or message.caption or ''
@@ -2547,47 +3309,149 @@ async def handle_channel_message(client: Client, message):
                 if pending:
                     age = time.time() - pending.get('timestamp', 0)
                     if age < 300:  # 5-minute window
+                        amount_confirmed = pending.get('amount_confirmed', True)
+                        trade_amount = float(pending.get('amount', DEFAULT_TRADE_AMOUNT))
                         full_signal = {**pending, 'direction': direction}
                         await update_signal_settings({'pending_signal': None})
+
+                        # Log the direction follow-up
+                        await log_signal_event('direction', message, pending, direction=direction)
+
+                        # Edit the amount selection message if it exists
+                        if bot_instance and pending.get('amount_msg_id'):
+                            try:
+                                if amount_confirmed:
+                                    edit_text = (
+                                        f"✅ **Amount confirmed: ${trade_amount:g}**\n"
+                                        f"🚀 Executing trade now ({direction.upper()})..."
+                                    )
+                                else:
+                                    edit_text = (
+                                        f"⚡ Direction arrived before selection.\n"
+                                        f"💵 Using signal amount: **${trade_amount:g}**\n"
+                                        f"🚀 Executing trade ({direction.upper()})..."
+                                    )
+                                await bot_instance.edit_message_text(
+                                    chat_id=OWNER_ID,
+                                    message_id=pending['amount_msg_id'],
+                                    text=edit_text,
+                                )
+                            except Exception:
+                                pass
+
                         await execute_signal_trade(full_signal)
                     else:
                         logger.info("[Userbot] Pending signal expired (>5 min). Discarding.")
                         await update_signal_settings({'pending_signal': None})
+                        await log_signal_event('direction_expired', message, direction=direction)
+                else:
+                    await log_signal_event('unmatched_direction', message, direction=direction)
             return
 
         if 'direction' in parsed:
             # Full signal — execute immediately
+            await log_signal_event('full', message, parsed)
             await update_signal_settings({'pending_signal': None})
             await execute_signal_trade(parsed)
         else:
             # Partial signal — store and wait for direction follow-up
+            sig_amount = float(parsed.get('amount', DEFAULT_TRADE_AMOUNT))
             pending = {
-                'asset':         parsed['asset'],
-                'asset_display': parsed.get('asset_display', parsed['asset']),
-                'duration':      parsed.get('duration', DEFAULT_TRADE_DURATION),
-                'amount':        parsed.get('amount', DEFAULT_TRADE_AMOUNT),
-                'timestamp':     time.time(),
+                'asset':            parsed['asset'],
+                'asset_display':    parsed.get('asset_display', parsed['asset']),
+                'duration':         parsed.get('duration', DEFAULT_TRADE_DURATION),
+                'amount':           sig_amount,
+                'timestamp':        time.time(),
+                'amount_confirmed': False,
+                'amount_msg_id':    None,
             }
             await update_signal_settings({'pending_signal': pending})
+            await log_signal_event('partial', message, parsed)
             logger.info(f"[Userbot] Partial signal stored: {pending}")
             if bot_instance:
                 try:
-                    await bot_instance.send_message(
+                    balance = await get_owner_balance()
+                    tiers = get_amount_tiers(balance)
+                    balance_str = f"${balance:,.2f}" if balance is not None else "N/A"
+                    dur_min = pending['duration'] // 60
+                    dur_display = f"{dur_min} min" if dur_min > 0 else f"{pending['duration']} sec"
+                    amt_msg = await bot_instance.send_message(
                         OWNER_ID,
                         f"📨 **Partial Signal Received**\n\n"
-                        f"📊 Asset: `{parsed.get('asset_display', parsed['asset'])}`\n"
-                        f"💵 Amount: `${pending['amount']}`\n"
-                        f"⏱ Duration: `{pending['duration'] // 60} min`\n\n"
-                        f"⏳ Waiting for direction (UP/DOWN)...",
+                        f"📊 Asset: `{pending['asset_display']}`\n"
+                        f"⏱ Duration: `{dur_display}`\n"
+                        f"💰 Balance: `{balance_str}`\n\n"
+                        f"💵 **Select trade amount** (signal: `${sig_amount:g}`)\n"
+                        f"_(Direction arriving soon — choose before it does)_",
+                        reply_markup=build_amount_keyboard(sig_amount, tiers),
                     )
-                except Exception:
-                    pass
+                    # Store the message ID so we can edit it when amount is chosen
+                    pending['amount_msg_id'] = amt_msg.id
+                    await update_signal_settings({'pending_signal': pending})
+                except Exception as exc:
+                    logger.warning(f"[Userbot] Could not send amount keyboard: {exc}")
 
     except Exception as e:
         logger.error(f"[Userbot] Error processing channel message: {e}", exc_info=True)
 
 
 # ── Signal Bot Commands ───────────────────────────────────────────────────────
+
+async def _send_signal_logs(target, edit: bool = False, limit: int = 20):
+    """
+    Fetch the most recent signal log entries and send/edit a formatted message.
+    target: a Message object (supports reply_text and edit_text).
+    """
+    if signal_logs_db is None:
+        text = "⚠️ Signal log database not available."
+    else:
+        cursor = signal_logs_db.find(
+            {}, sort=[('received_at', -1)], limit=limit
+        )
+        docs = await cursor.to_list(length=limit)
+
+        if not docs:
+            text = "📊 **Signal Timing Log**\n\nNo entries recorded yet."
+        else:
+            TYPE_ICON = {
+                'full':                 '🟢',
+                'partial':              '🟡',
+                'direction':            '➡️',
+                'direction_expired':    '⏰',
+                'unmatched_direction':  '❓',
+            }
+            lines = [f"📊 **Signal Timing Log** _(last {len(docs)}, UTC+5:30)_\n"]
+            for doc in docs:
+                icon    = TYPE_ICON.get(doc.get('event_type', ''), '🟤')
+                recv    = doc.get('received_at')
+                sent    = doc.get('provider_sent_at')
+                delay   = doc.get('delay_seconds', 0)
+                asset   = doc.get('asset_display') or doc.get('asset') or '—'
+                etype   = doc.get('event_type', '?')
+
+                recv_str = recv.strftime('%b %d %H:%M:%S') if recv else '?'
+                sent_str = sent.strftime('%H:%M:%S') if sent else '?'
+
+                delay_flag = ' ⚠️' if delay > 20 else ('  ✅' if delay <= 5 else '')
+                lines.append(
+                    f"{icon} `{recv_str}` — **{etype}**\n"
+                    f"   📡 Provider: `{sent_str}` | Delay: `{delay:.1f}s`{delay_flag}\n"
+                    f"   Asset: `{asset}`"
+                    + (f" | Dir: `{doc.get('direction', '—')}`" if doc.get('direction') else "")
+                    + "\n"
+                )
+            text = "\n".join(lines)
+
+    kb = InlineKeyboardMarkup([back_button("signal_status_view")])
+    try:
+        if edit:
+            await target.edit_text(text, reply_markup=kb)
+        else:
+            await target.reply_text(text, reply_markup=kb, quote=True)
+    except Exception as e:
+        if "MESSAGE_NOT_MODIFIED" not in str(e):
+            logger.warning(f"[SignalLogs] Could not send log message: {e}")
+
 
 @Client.on_message(filters.command("setchannel") & filters.private)
 @owner_only
@@ -2687,9 +3551,17 @@ async def signalstatus_command(client: Client, message: Message):
     text += (
         f"\n**Commands:**\n"
         f"`/setchannel <id>` — set channel\n"
-        f"`/signalmode` — toggle ON/OFF"
+        f"`/signalmode` — toggle ON/OFF\n"
+        f"`/signallogs` — view timing log"
     )
     await message.reply_text(text, quote=True)
+
+
+@Client.on_message(filters.command("signallogs") & filters.private)
+@owner_only
+async def signallogs_command(client: Client, message: Message):
+    """Show the recent signal timing log (UTC+5:30)."""
+    await _send_signal_logs(message, edit=False)
 
 
 @Client.on_message(filters.command("journal") & filters.private)
@@ -2705,52 +3577,15 @@ async def journal_command(client: Client, message: Message):
     summary = await get_journal_summary(account_doc_ids, today_str)
     entries = summary["entries"]
 
-    journal_text = f"📓 **Trading Journal — {today_str}**\n\n"
-    if not entries:
-        journal_text += "_No trades recorded today._\n"
-    else:
-        by_account: Dict[str, list] = {}
-        for e in entries:
-            by_account.setdefault(e.get("email", "Unknown"), []).append(e)
-        daily_bals = summary.get("daily_balances", {})
-        for acct_email, trades in by_account.items():
-            acct_doc_id = trades[0].get("account_doc_id", "")
-            bal_rec = daily_bals.get(acct_doc_id, {})
-            opening_bal = bal_rec.get("opening_balance")
-            closing_bal = bal_rec.get("closing_balance")
-            journal_text += f"📧 **{acct_email}** ({trades[0].get('account_mode','')}):\n"
-            if opening_bal is not None:
-                def _fmt_bal(v): return f"${v:,.2f}" if v is not None else "N/A"
-                bal_diff = (closing_bal - opening_bal) if closing_bal is not None else 0
-                diff_str = f" ({'+' if bal_diff >= 0 else ''}{bal_diff:,.2f})" if closing_bal is not None else ""
-                journal_text += f"   💵 Open: {_fmt_bal(opening_bal)}  →  Close: {_fmt_bal(closing_bal)}{diff_str}\n"
-            for i, t in enumerate(trades, 1):
-                res_icon = "✅" if t["result"] == "WIN" else ("⚠️" if t["result"] == "TIE" else "❌")
-                pl_str = f"+${abs(t['profit_loss']):.2f}" if t["profit_loss"] > 0 else (f"-${abs(t['profit_loss']):.2f}" if t["profit_loss"] < 0 else "$0.00")
-                entry_ts = t["entry_time"].strftime("%H:%M:%S") if isinstance(t.get("entry_time"), datetime.datetime) else "N/A"
-                close_ts = t["closing_time"].strftime("%H:%M:%S") if isinstance(t.get("closing_time"), datetime.datetime) else "N/A"
-                e_price = f"{t['entry_price']:.5f}" if t.get("entry_price") else "N/A"
-                c_price = f"{t['closing_price']:.5f}" if t.get("closing_price") else "N/A"
-                journal_text += (
-                    f"  {i}. {res_icon} `{t.get('symbol','N/A')}` | {t.get('direction','?')} | "
-                    f"${t.get('amount',0)} | {t.get('duration',0) // 60}min\n"
-                    f"      ⏰ Entry: {entry_ts} UTC @ {e_price}\n"
-                    f"      🏁 Close: {close_ts} UTC @ {c_price}\n"
-                    f"      📌 Result: **{t['result']}**  {pl_str}\n"
-                )
-            journal_text += "\n"
-        net_str = f"+${summary['net_pl']:.2f}" if summary['net_pl'] >= 0 else f"-${abs(summary['net_pl']):.2f}"
-        journal_text += (
-            f"─────────────────────\n"
-            f"📊 **Summary:** {summary['total']} trade(s) | ✅ {summary['wins']} Win | ❌ {summary['losses']} Loss | ⚠️ {summary['ties']} Tie\n"
-            f"💰 **Net P&L:** {net_str}"
-        )
+    journal_text = _build_journal_text(summary, today_str)
 
     today_dt = datetime.datetime.strptime(today_str, "%Y-%m-%d")
     prev_dt = (today_dt - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
     keyboard_rows = [
         [InlineKeyboardButton("◀ Prev Day", callback_data=f"journal_nav:{prev_dt}"),
          InlineKeyboardButton("▶ Today", callback_data="journal_today")],
+        [InlineKeyboardButton("✍️ Manual Entry", callback_data=f"journal_add_manual:{today_str}"),
+         InlineKeyboardButton("💸 Record Withdrawal", callback_data=f"journal_add_wd:{today_str}")],
         [InlineKeyboardButton("📅 Go to Date", callback_data="journal_pick_date")],
     ]
     await message.reply_text(
@@ -2762,6 +3597,23 @@ async def journal_command(client: Client, message: Message):
 
 
 # --- Main Function ---
+async def _quotex_keepalive():
+    """
+    Send a Socket.IO tick heartbeat to every active Quotex WebSocket connection
+    every 20 seconds.  This is a belt-and-suspenders guard against the server's
+    ~30 s idle-close (the primary fix is in ws/client.py on_message).
+    """
+    while True:
+        await asyncio.sleep(20)
+        for acct_id, qx_client in list(active_quotex_clients.items()):
+            try:
+                ws = getattr(qx_client, 'websocket', None)  # WebSocketApp
+                if ws:
+                    ws.send('42["tick"]')
+            except Exception as exc:
+                logger.debug(f"[KeepAlive] {acct_id}: {exc}")
+
+
 async def run_bot():
     global bot_instance, main_event_loop
     await setup_database()
@@ -2783,6 +3635,7 @@ async def run_bot():
     app.add_handler(MessageHandler(setchannel_command, filters.command("setchannel") & filters.private))
     app.add_handler(MessageHandler(signalmode_command, filters.command("signalmode") & filters.private))
     app.add_handler(MessageHandler(signalstatus_command, filters.command("signalstatus") & filters.private))
+    app.add_handler(MessageHandler(signallogs_command, filters.command("signallogs") & filters.private))
     app.add_handler(MessageHandler(journal_command, filters.command("journal") & filters.private))
     app.add_handler(CallbackQueryHandler(callback_query_handler))
     app.add_handler(MessageHandler(message_handler, filters.private))  # Handles replies and non-command text
@@ -2812,6 +3665,8 @@ async def run_bot():
                 logger.error(f"[Userbot] Failed to start userbot: {ub_err}", exc_info=True)
 
         logger.info("Bot is running... Press CTRL+C to stop.")
+        # Start Quotex WebSocket keep-alive heartbeat task
+        asyncio.create_task(_quotex_keepalive())
         # Keep the main thread alive (Pyrogram handles the event loop)
         await asyncio.Event().wait() # Keeps running until interrupted
 

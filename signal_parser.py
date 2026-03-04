@@ -44,33 +44,66 @@ def parse_direction(text: str) -> Optional[str]:
     """
     Detect trade direction from message text.
 
+    Accepted examples (case-insensitive, with or without emoji):
+        BUY / UP / CALL / ENTERING UP / THE RISE / GOING UP / BULLISH
+        📈  🔼  ↑
+        SELL / DOWN / PUT / ENTERING DOWN / FALLING / GOING DOWN / BEARISH
+        📉  🔽  ↓
+
     Returns:
-        'call'  – for BUY / UP / RISE signals
-        'put'   – for SELL / DOWN / FALL signals
-        None    – direction not detected
+        'call'  – BUY / UP direction
+        'put'   – SELL / DOWN direction
+        None    – not detected
     """
     if not text:
         return None
 
     t = text.upper()
 
-    # BUY / UP / RISE / CALL indicators
-    up_keywords = [
-        'ENTERING UP', 'THE RISE', 'GOING UP', '🔼', 'CALL', '↑',
-        'UP!', ' BUY ', 'BULLISH', 'LONG ',
+    # ── CALL / BUY / UP ────────────────────────────────────────────────────
+    # Word-boundary patterns catch standalone words (BUY, UP, CALL) as well
+    # as longer phrases (ENTERING UP, THE RISE BEGINS, etc.)
+    UP_PATTERNS = [
+        r'\bENTERING\s+UP\b',
+        r'\bTHE\s+RISE\b',
+        r'\bGOING\s+UP\b',
+        r'\bCALL\b',
+        r'\bBUY\b',
+        r'\bUP\b',
+        r'\bBULLISH\b',
+        r'\bLONG\b',
     ]
-    # SELL / DOWN / FALL / PUT indicators
-    down_keywords = [
-        'ENTERING DOWN', 'FALLING', 'GOING DOWN', '🔽', 'PUT', '↓',
-        'DOWN!', ' SELL ', 'BEARISH', 'SHORT ',
-    ]
+    UP_CHARS = ['🔼', '📈', '↑']
 
-    for kw in up_keywords:
-        if kw in t:
+    # ── PUT / SELL / DOWN ──────────────────────────────────────────────────
+    DOWN_PATTERNS = [
+        r'\bENTERING\s+DOWN\b',
+        r'\bFALLING\b',
+        r'\bGOING\s+DOWN\b',
+        r'\bPUT\b',
+        r'\bSELL\b',
+        r'\bDOWN\b',
+        r'\bBEARISH\b',
+        r'\bSHORT\b',
+    ]
+    DOWN_CHARS = ['🔽', '📉', '↓']
+
+    # Check emoji/char indicators first (unambiguous)
+    for ch in UP_CHARS:
+        if ch in text:
             return 'call'
-    for kw in down_keywords:
-        if kw in t:
+    for ch in DOWN_CHARS:
+        if ch in text:
             return 'put'
+
+    # Then word-boundary patterns on the uppercased text
+    for pattern in UP_PATTERNS:
+        if re.search(pattern, t):
+            return 'call'
+    for pattern in DOWN_PATTERNS:
+        if re.search(pattern, t):
+            return 'put'
+
     return None
 
 
@@ -93,21 +126,35 @@ def parse_signal(text: str) -> Optional[Dict[str, Any]]:
     result: Dict[str, Any] = {}
 
     # ── Asset ──────────────────────────────────────────────────────────────
-    # Matches:  👉 USD/ARS (OTC)   or   👉 EURUSD_otc
+    # Primary:  👉 USD/ARS (OTC)
     m = re.search(r'👉\s*(.+?)(?:\n|$)', text)
     if m:
         raw = m.group(1).strip()
         result['asset_display'] = raw
         result['asset'] = normalize_asset(raw)
+    else:
+        # Fallback: plain line like "NZD/USD (OTC)" or "EURUSD_otc" (no emoji)
+        m = re.search(
+            r'(?:^|\n)\s*([A-Za-z]{2,6}/[A-Za-z]{2,6}(?:\s*\(OTC\))?)\s*(?:\n|$)',
+            text, re.IGNORECASE
+        )
+        if m:
+            raw = m.group(1).strip()
+            result['asset_display'] = raw
+            result['asset'] = normalize_asset(raw)
 
     # ── Duration ───────────────────────────────────────────────────────────
-    # Matches:  ⏱ 2 MINUTE  |  ⏱ 5 MINUTES  |  ⏰ 3 MINUTE
-    m = re.search(r'[⏱⏰]\s*(\d+)\s*MINUTES?', text, re.IGNORECASE)
+    # Matches:  ⏱ 2 MINUTE  |  ⏱️ 5 MINUTES  |  ⏰ 3 MINUTE  |  5 MINUTE (no emoji)
+    # '️' (U+FE0F) is a variation selector that may trail the clock emoji — consume it.
+    m = re.search(r'[⏱⏰]\ufe0f?[\s\ufe0f]*([\d]+)\s*MINUTES?', text, re.IGNORECASE)
+    if not m:
+        # Plain-text fallback: "5 MINUTE" or "2 MINUTES" on its own segment
+        m = re.search(r'(?:^|\n|\s)([\d]+)\s*MINUTES?(?:\s|$)', text, re.IGNORECASE)
     if m:
         result['duration'] = int(m.group(1)) * 60  # convert minutes → seconds
 
     # ── Amount ─────────────────────────────────────────────────────────────
-    # Matches:  💵Use 200 $ from balance  |  Use 125$  |  Use 1,000 $
+    # Matches:  💵Use 200 $ from balance  |  Use 125$  |  Use 1,000 $  |  plain "Use 5 $"
     m = re.search(r'Use\s+([\d,]+(?:\.\d+)?)\s*\$', text, re.IGNORECASE)
     if m:
         result['amount'] = float(m.group(1).replace(',', ''))
@@ -128,6 +175,20 @@ def is_signal_message(text: str) -> bool:
     """Quick pre-filter: does this message look at all like a signal?"""
     if not text:
         return False
-    indicators = ['👉', '⏱', '💵', 'SIGNAL', '🔼', '🔽', 'ENTERING UP', 'ENTERING DOWN']
+    emoji_indicators = ['👉', '⏱', '⏰', '💵', '🔼', '🔽', '📈', '📉']
+    text_indicators  = [
+        'SIGNAL', 'ENTERING UP', 'ENTERING DOWN', 'MINUTE', 'FROM BALANCE',
+        'THE RISE', 'FALLING', 'GOING UP', 'GOING DOWN',
+    ]
+    # Standalone direction words (word-boundary aware)
+    direction_words  = [r'\bBUY\b', r'\bSELL\b', r'\bUP\b', r'\bDOWN\b',
+                        r'\bCALL\b', r'\bPUT\b']
+    # Forex pair lines like "NZD/USD" or "EUR/USD (OTC)"
+    has_pair = bool(re.search(r'[A-Za-z]{2,6}/[A-Za-z]{2,6}', text))
     text_upper = text.upper()
-    return any(ind in text_upper or ind in text for ind in indicators)
+    return (
+        has_pair
+        or any(ind in text for ind in emoji_indicators)
+        or any(ind in text_upper for ind in text_indicators)
+        or any(re.search(p, text_upper) for p in direction_words)
+    )
