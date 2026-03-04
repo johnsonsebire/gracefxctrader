@@ -96,6 +96,13 @@ except Exception as e:
     print(f"{Fore.RED}Error during pyquotex import or patching setup: {e}")
     sys.exit(1)
 
+# --- Signal Parser ---
+try:
+    from signal_parser import parse_signal, parse_direction, is_signal_message
+except ImportError:
+    print("Error: signal_parser.py not found. Place it in the same directory as bot.py.")
+    sys.exit(1)
+
 # --- Configuration (Load from environment variables or a config file) ---
 # It's better practice to load these from environment or a separate config.py
 # For simplicity in a single file as requested:
@@ -107,6 +114,11 @@ API_HASH = os.getenv("API_HASH") or "your_api_hash"
 BOT_TOKEN = os.getenv("BOT_TOKEN") or "your_bot_token"
 MONGO_URI = os.getenv("MONGO_URI") or "mongodb://localhost:27017/"
 OWNER_ID = int(os.getenv("OWNER_ID") or 987654321)  # Replace with a default value if needed
+
+# Signal channel monitoring
+USERBOT_PHONE: str = os.getenv("USERBOT_PHONE", "").strip()
+_raw_channel = os.getenv("SIGNAL_CHANNEL_ID", "").strip()
+SIGNAL_CHANNEL_ID: Optional[int] = int(_raw_channel) if _raw_channel.lstrip('-').isdigit() else None
 
 # Basic Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s')
@@ -129,11 +141,15 @@ except Exception as e:
 
 # --- Global Variables & Bot Initialization ---
 bot_instance: Optional[Client] = None
+userbot_instance: Optional[Client] = None  # MTProto user session for channel monitoring
 db = None  # Database client
 main_event_loop = None # <<< ADD THIS GLOBAL VARIABLE
 users_db = None # Collection for users, roles, basic settings
 quotex_accounts_db = None # Collection for Quotex credentials
 trade_settings_db = None # Collection for trade settings per user/account
+signal_settings_db = None  # Collection for signal channel + pending signal state
+trade_journal_db = None  # Collection for per-account daily trade journal
+trade_journal_balances_db = None  # Collection for daily opening/closing account balances
 
 # Temporary storage for OTP requests: {user_id: {'qx_client': qx_client_instance, 'event': asyncio.Event()}}
 active_otp_requests: Dict[int, Dict[str, Any]] = {}
@@ -146,7 +162,7 @@ DEFAULT_TRADE_AMOUNT = 5
 DEFAULT_TRADE_DURATION = 60 # For Timer/Time mode number
 DEFAULT_TRADE_MODE = "TIMER" # 'TIMER' or 'TIME'
 DEFAULT_CANDLE_SIZE = 60
-DEFAULT_SERVICE_STATUS = False # Trading Off by default
+DEFAULT_SERVICE_STATUS = True # Accounts Active (participate in signal trades) by default
 
 MARTINGALE_MULTIPLIER = 2.0
 MAX_CONSECUTIVE_LOSSES = 3
@@ -155,7 +171,7 @@ COOLDOWN_MINUTES = 3
 # --- Database Setup ---
 async def setup_database():
     """Initializes MongoDB connection and collections."""
-    global db, users_db, quotex_accounts_db, trade_settings_db
+    global db, users_db, quotex_accounts_db, trade_settings_db, signal_settings_db, trade_journal_db, trade_journal_balances_db
     try:
         is_atlas = MONGO_URI.startswith("mongodb+srv") or "mongodb.net" in MONGO_URI
         tls_kwargs = {"tlsCAFile": certifi.where()} if (is_atlas and certifi) else {}
@@ -164,10 +180,17 @@ async def setup_database():
         users_db = db['users']
         quotex_accounts_db = db['quotex_accounts']
         trade_settings_db = db['trade_settings']
+        signal_settings_db = db['signal_settings']
+        trade_journal_db = db['trade_journal']
+        trade_journal_balances_db = db['trade_journal_balances']
         # Create indexes for faster lookups
         await users_db.create_index("user_id", unique=True)
         await quotex_accounts_db.create_index([("user_id", 1), ("email", 1)], unique=True)
         await trade_settings_db.create_index("account_doc_id", unique=True) # Link to quotex account document
+        await signal_settings_db.create_index("owner_id", unique=True)
+        await trade_journal_db.create_index([("account_doc_id", 1), ("date", 1)])
+        await trade_journal_db.create_index("entry_time")
+        await trade_journal_balances_db.create_index([("account_doc_id", 1), ("date", 1)], unique=True)
         logger.info("Database connection successful and collections initialized.")
     except Exception as e:
         logger.error(f"Failed to connect to MongoDB: {e}", exc_info=True)
@@ -260,6 +283,20 @@ async def get_user_quotex_accounts(user_id: int) -> List[Dict[str, Any]]:
     accounts_cursor = quotex_accounts_db.find({"user_id": user_id}, {"_id": 1, "email": 1}) # Fetch ID and email
     return await accounts_cursor.to_list(length=None) # Get all accounts
 
+async def get_all_quotex_accounts(search: str = None) -> List[Dict[str, Any]]:
+    """Gets all Quotex accounts across all users, with optional email/user_id search."""
+    if quotex_accounts_db is None: return []
+    query = {}
+    if search:
+        search = search.strip()
+        # Search by email (case-insensitive) or user_id if numeric
+        if search.lstrip('-').isdigit():
+            query = {"$or": [{"user_id": int(search)}, {"email": {"$regex": search, "$options": "i"}}]}
+        else:
+            query = {"email": {"$regex": search, "$options": "i"}}
+    cursor = quotex_accounts_db.find(query, {"_id": 1, "email": 1, "user_id": 1})
+    return await cursor.to_list(length=100)
+
 async def get_quotex_account_details(account_doc_id: str) -> Optional[Dict[str, Any]]:
     """Gets full details of a specific Quotex account by its DB document ID."""
     from bson import ObjectId
@@ -334,6 +371,121 @@ async def update_trade_setting(account_doc_id: str, update_data: dict):
         upsert=True # Create if somehow missing, though get_or_create should handle it
     )
     return result.modified_count > 0 or result.upserted_id is not None
+
+# --- Trade Journal DB Functions ---
+
+async def save_journal_entry(entry: dict) -> bool:
+    """Persist a single trade journal record to the database."""
+    if trade_journal_db is None:
+        logger.warning("[Journal] trade_journal_db not initialized.")
+        return False
+    try:
+        await trade_journal_db.insert_one(entry)
+        return True
+    except Exception as e:
+        logger.error(f"[Journal] Failed to save entry: {e}", exc_info=True)
+        return False
+
+async def get_journal_entries(
+    account_doc_ids: list = None,
+    date_str: str = None,      # "YYYY-MM-DD"
+    limit: int = 100,
+) -> list:
+    """Fetch journal entries filtered by account(s) and/or date, newest first."""
+    if trade_journal_db is None:
+        return []
+    query: dict = {}
+    if account_doc_ids:
+        query["account_doc_id"] = {"$in": account_doc_ids}
+    if date_str:
+        query["date"] = date_str
+    cursor = trade_journal_db.find(query).sort("entry_time", -1).limit(limit)
+    return await cursor.to_list(length=limit)
+
+async def get_journal_summary(account_doc_ids: list, date_str: str) -> dict:
+    """Return aggregated win/loss/tie counts, net P&L, and daily balances for a given day."""
+    entries = await get_journal_entries(account_doc_ids=account_doc_ids, date_str=date_str)
+    total = len(entries)
+    wins   = sum(1 for e in entries if e.get("result") == "WIN")
+    losses = sum(1 for e in entries if e.get("result") == "LOSS")
+    ties   = sum(1 for e in entries if e.get("result") == "TIE")
+    net_pl = sum(e.get("profit_loss", 0) for e in entries)
+    daily_balances = await get_daily_balances(account_doc_ids, date_str)
+    return {"total": total, "wins": wins, "losses": losses, "ties": ties, "net_pl": round(net_pl, 2), "entries": entries, "daily_balances": daily_balances}
+
+async def record_opening_balance(account_doc_id: str, email: str, date_str: str, account_mode: str, balance: float) -> bool:
+    """Record the opening balance for the day — only written on the very first trade."""
+    if trade_journal_balances_db is None:
+        return False
+    try:
+        await trade_journal_balances_db.update_one(
+            {"account_doc_id": account_doc_id, "date": date_str},
+            {
+                "$setOnInsert": {
+                    "account_doc_id": account_doc_id,
+                    "email": email,
+                    "date": date_str,
+                    "account_mode": account_mode,
+                    "opening_balance": balance,
+                },
+                "$set": {"closing_balance": balance},  # initialise closing too
+            },
+            upsert=True,
+        )
+        return True
+    except Exception as e:
+        logger.error(f"[Journal] Failed to save opening balance: {e}", exc_info=True)
+        return False
+
+async def record_closing_balance(account_doc_id: str, date_str: str, balance: float) -> bool:
+    """Update the closing balance after each trade."""
+    if trade_journal_balances_db is None:
+        return False
+    try:
+        await trade_journal_balances_db.update_one(
+            {"account_doc_id": account_doc_id, "date": date_str},
+            {"$set": {"closing_balance": balance}},
+        )
+        return True
+    except Exception as e:
+        logger.error(f"[Journal] Failed to save closing balance: {e}", exc_info=True)
+        return False
+
+async def get_daily_balances(account_doc_ids: list, date_str: str) -> dict:
+    """Return {account_doc_id: {opening_balance, closing_balance, email, account_mode}} for a date."""
+    if trade_journal_balances_db is None:
+        return {}
+    cursor = trade_journal_balances_db.find({"account_doc_id": {"$in": account_doc_ids}, "date": date_str})
+    docs = await cursor.to_list(length=100)
+    return {d["account_doc_id"]: d for d in docs}
+
+# --- Signal Settings DB Functions ---
+
+async def get_signal_settings() -> Dict[str, Any]:
+    """Get the single signal-settings document for the owner (creates defaults if missing)."""
+    if signal_settings_db is None:
+        return {}
+    doc = await signal_settings_db.find_one({'owner_id': OWNER_ID})
+    if not doc:
+        doc = {
+            'owner_id': OWNER_ID,
+            'channel_id': SIGNAL_CHANNEL_ID,  # pre-seed from .env if set
+            'is_active': False,
+            'pending_signal': None,
+        }
+        await signal_settings_db.insert_one(doc)
+    return doc
+
+async def update_signal_settings(data: dict):
+    """Update the signal settings document for the owner."""
+    if signal_settings_db is None:
+        return
+    data['last_updated'] = datetime.datetime.now(datetime.timezone.utc)
+    await signal_settings_db.update_one(
+        {'owner_id': OWNER_ID},
+        {'$set': data},
+        upsert=True
+    )
 
 # --- Permission Decorators ---
 def owner_only(func):
@@ -415,7 +567,7 @@ async def handle_potential_pin_input(prompt: str) -> Optional[str]:
                 chat_id=user_id,
                 text=f"❗️ **QUOTEX 2FA REQUIRED** ❗️\n\n"
                      f"To log in to `{qx_client_instance.email}`, Quotex needs the PIN code sent to your email.\n\n"
-                     f"**Prompt:**\n`{prompt}`\n\n"
+                     #f"**Prompt:**\n`{prompt}`\n\n"
                      f"➡️ Please reply to **this message** with the **PIN code only**.",
                 timeout=600, # 2 minutes timeout
             )
@@ -515,9 +667,30 @@ async def get_quotex_client(user_id: int, account_doc_id: str, interaction_type:
 
     # --- Cache check logic ---
     if account_doc_id in active_quotex_clients:
-         # ... (Existing cache logic) ...
-         logger.info(f"Reusing cached client for {account_doc_id}")
-         return active_quotex_clients[account_doc_id], "Reused existing client (cache)."
+        cached = active_quotex_clients[account_doc_id]
+        # Verify the cached connection is still alive before reusing it
+        try:
+            still_connected = cached.check_connect()
+        except Exception:
+            still_connected = False
+        if still_connected:
+            # Re-apply the account mode from DB every time — the user may have
+            # switched between PRACTICE and REAL since this client was cached.
+            try:
+                current_settings = await get_or_create_trade_settings(account_doc_id)
+                required_mode = current_settings.get("account_mode", "PRACTICE")
+                await cached.change_account(required_mode)
+                logger.info(f"Reusing cached client for {account_doc_id} (mode: {required_mode})")
+            except Exception as mode_err:
+                logger.warning(f"Could not re-apply account mode for {account_doc_id}: {mode_err}")
+            return cached, "Reused existing client (cache)."
+        else:
+            logger.warning(f"Cached client for {account_doc_id} is stale/disconnected. Reconnecting...")
+            try:
+                await cached.close()
+            except Exception:
+                pass
+            del active_quotex_clients[account_doc_id]
 
     # --- Get account details ---
     logger.info(f"Fetching Quotex account details for Doc ID: {account_doc_id} (User: {user_id})")
@@ -592,7 +765,7 @@ async def get_quotex_client(user_id: int, account_doc_id: str, interaction_type:
             settings = await get_or_create_trade_settings(account_doc_id)
             account_mode = settings.get("account_mode", "PRACTICE")
             try:
-                qx_client.change_account(account_mode)
+                await qx_client.change_account(account_mode)
                 logger.info(f"Switched Quotex account {email} to {account_mode} mode.")
             except Exception as e_mode:
                 logger.error(f"Failed to switch account {email} to {account_mode}: {e_mode}", exc_info=True)
@@ -675,13 +848,14 @@ async def disconnect_quotex_client(account_doc_id: str):
 async def main_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
     """Generates the main menu keyboard."""
     keyboard = [
-        [InlineKeyboardButton("➕ Add Quotex Account", callback_data="quotex_add")],
-        [InlineKeyboardButton("👤 My Quotex Accounts", callback_data="quotex_list")],
+        [InlineKeyboardButton("➕ Add Trading Account", callback_data="quotex_add")],
+        [InlineKeyboardButton("👤 My Trading Accounts", callback_data="quotex_list")],
     ]
     # Dynamic buttons based on role
     # Add settings etc. later
     keyboard.append([InlineKeyboardButton("⚙️ Settings", callback_data="settings_main")])
-    keyboard.append([InlineKeyboardButton("Trading Dashboard", callback_data="trade_dashboard")]) # Maybe
+    keyboard.append([InlineKeyboardButton("📊 Trading Dashboard", callback_data="trade_dashboard")])
+    keyboard.append([InlineKeyboardButton("📓 Trading Journal", callback_data="journal_today")])
     # Check role ASYNCHRONOUSLY
     is_user_sudo = await is_sudo_user(user_id) # Correct use of await
     if is_user_sudo:
@@ -694,25 +868,18 @@ def back_button(callback_data="main_menu"):
 
 def account_management_keyboard(account_doc_id: str, settings: Dict) -> InlineKeyboardMarkup:
     """Keyboard for managing a specific Quotex account."""
-    trading_status = "ON" if settings.get('service_status', False) else "OFF"
-    toggle_trading_text = f"🔴 Stop Trading" if trading_status == "ON" else f"🟢 Start Trading"
-
+    is_active = settings.get('service_status', False)
+    status_label = "🟢 Active" if is_active else "🔴 Inactive"
     keyboard = [
-         [
+        [
             InlineKeyboardButton("📊 Get Profile", callback_data=f"qx_profile:{account_doc_id}"),
-            InlineKeyboardButton("💰 Get Balance", callback_data=f"qx_balance:{account_doc_id}")
+            InlineKeyboardButton("💰 Get Balance", callback_data=f"qx_balance:{account_doc_id}"),
         ],
         [
-             InlineKeyboardButton("💱 Manage Assets", callback_data=f"asset_manage:{account_doc_id}"),
-             InlineKeyboardButton(f"Mode: {settings.get('trade_mode', 'N/A')}", callback_data=f"set_tmode:{account_doc_id}"),
+            InlineKeyboardButton(f"Status: {status_label}", callback_data=f"toggle_status:{account_doc_id}"),
         ],
         [
-            InlineKeyboardButton(f"Candle: {settings.get('candle_size', 'N/A')}s", callback_data=f"set_csize:{account_doc_id}"),
-             InlineKeyboardButton(f"Acct: {settings.get('account_mode', 'N/A')}", callback_data=f"set_amode:{account_doc_id}"),
-
-        ],
-        [
-             InlineKeyboardButton(toggle_trading_text, callback_data=f"toggle_trade:{account_doc_id}"),
+            InlineKeyboardButton(f"Account Type: {settings.get('account_mode', 'N/A')}", callback_data=f"set_amode:{account_doc_id}"),
         ],
         [InlineKeyboardButton("🗑 Delete Account", callback_data=f"qx_delete_confirm:{account_doc_id}")],
         back_button("quotex_list") # Back to account list
@@ -729,7 +896,28 @@ def admin_panel_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("⭐ Manage Sudo", callback_data="admin_manage_sudo"),
             InlineKeyboardButton("💎 Manage Premium", callback_data="admin_manage_premium")
         ],
+        [InlineKeyboardButton("🏦 Account Management", callback_data="admin_acct_mgmt")],
         back_button("main_menu")
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def admin_acct_mgmt_keyboard() -> InlineKeyboardMarkup:
+    keyboard = [
+        [
+            InlineKeyboardButton("📋 List All Accounts", callback_data="admin_accts_list"),
+            InlineKeyboardButton("🔍 Search Accounts", callback_data="admin_acct_search"),
+        ],
+        back_button("admin_panel")
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def admin_acct_view_keyboard(account_doc_id: str, is_active: bool, account_mode: str) -> InlineKeyboardMarkup:
+    status_label = "🟢 Active" if is_active else "🔴 Inactive"
+    keyboard = [
+        [InlineKeyboardButton(f"Status: {status_label} (tap to toggle)", callback_data=f"admin_acct_toggle_status:{account_doc_id}")],
+        [InlineKeyboardButton(f"Account Type: {account_mode} (tap to toggle)", callback_data=f"admin_acct_toggle_type:{account_doc_id}")],
+        [InlineKeyboardButton("🗑 Delete This Account", callback_data=f"admin_acct_del_confirm:{account_doc_id}")],
+        back_button("admin_accts_list")
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -758,9 +946,18 @@ async def start_command(client: Client, message: Message):
     await add_user_if_not_exists(user_id)
     logger.info(f"User {user_id} ({message.from_user.first_name}) started the bot.")
 
-    welcome_text = f"👋 Welcome, {message.from_user.mention}!\n\n" \
-                   f"This bot helps you interact with your Quotex account(s).\n\n" \
-                   f"Use the buttons below to navigate."
+    welcome_text = (
+        f"👋 Welcome, {message.from_user.mention}!\n\n"
+        f"**GraceFXCTrader** automates your trades based on high-quality, curated trading signals — "
+        f"so you never miss a market opportunity.\n\n"
+        f"📊 **New to Quotex?** We recommend registering through our official partner link to get started "
+        f"with the best available conditions:\n"
+        f"🔗 [Create your Quotex account here](https://broker-qx.pro/sign-up/?lid=2024742)\n\n"
+        f"⚠️ **Risk Disclaimer:** Trading financial instruments involves substantial risk of loss and "
+        f"may not be suitable for all investors. Past performance is not indicative of future results. "
+        f"Only trade with capital you can afford to lose.\n\n"
+        f"Use the menu below to get started."
+    )
 
     await message.reply_text(
         welcome_text,
@@ -772,28 +969,33 @@ async def start_command(client: Client, message: Message):
 async def help_command(client: Client, message: Message):
     # Add more detailed help information here
     help_text = """
-    **ℹ️ Bot Help & Information**
+    **ℹ️ GraceFXCTrader — Help & Information**
 
-    This bot allows you to:
-    - Add and manage multiple Quotex accounts.
-    - Check account profile and balance.
-    - Manage assets for trading.
-    - Configure trade settings (Mode, Candle Size, Account Type).
-    - Toggle automated trading (Premium feature, requires setup).
-    - (Admin) Manage users and broadcast messages.
+    **GraceFXCTrader** is a signal-driven automated trading bot for Binary Trading. When a verified trading signal arrives, the bot instantly places the trade on all your linked active accounts — no manual intervention required.
 
-    **Key Features:**
-    - **➕ Add Quotex Account:** Securely add your credentials (Requires 2FA/PIN verification via bot).
-    - **👤 My Quotex Accounts:** View and manage your linked accounts and their specific settings.
-    - **⚙️ Settings:** Configure bot or global preferences (if applicable).
-    - **👑 Admin Panel:** (For Owner/Sudo) Access user management and broadcast tools.
+    **What this bot does:**
+    - Receives high-quality trading signals from a monitored channel.
+    - Automatically executes trades on your linked Quotex accounts.
+    - Maintains a **Trading Journal** — daily trade logs with opening & closing account balances, per-trade results, and P&L summaries.
+
+    **Key Menu Options:**
+    - **➕ Add Trading Account:** Securely link a Quotex account using your credentials (2FA-verified).
+    - **👤 My Trading Accounts:** View, manage, and configure your linked accounts (account type, active/inactive status, deletion).
+    - **📊 Trading Dashboard:** Overview of all linked accounts and their current status.
+    - **📓 Trading Journal:** Daily trade history with balance snapshots and performance summaries.
+    - **⚙️ Settings:** Configure signal mode and other bot preferences.
+
+    **🏦 Our Recommended Broker**
+    We partner exclusively with **Quotex** — a fast, reliable, and user-friendly binary options platform. If you haven't opened an account yet, we strongly encourage you to register through our referral link. It costs you nothing extra and directly supports the continued development of this bot:
+
+    🔗 [Sign up on Quotex — Our Partner Link](https://broker-qx.pro/sign-up/?lid=2024742)
 
     **Important Notes:**
-    - **Security:** While we try to be secure, storing credentials always has risks. Be cautious.
-    - **Quotex API:** This bot uses the `pyquotex` library, which interacts with Quotex in ways that might be unofficial. Use at your own risk. API changes can break functionality.
-    - **Trading:** Automated trading involves significant financial risk. Ensure you understand the strategy and risks before enabling it.
+    - ⚠️ Trading involves risk. Never risk funds you cannot afford to lose.
+    - This bot uses the `pyquotex` library to interface with Quotex. API changes may occasionally affect functionality.
+    - Your credentials are stored in the bot's database. Use with caution and only on accounts you control.
 
-    Use the buttons or contact the owner if you need further assistance.
+    For assistance, contact the bot owner.
     """
     await message.reply_text(
         help_text,
@@ -1096,7 +1298,7 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
              # If a client is active, try changing its mode immediately? Risky maybe.
              if account_doc_id in active_quotex_clients:
                  try:
-                     active_quotex_clients[account_doc_id].change_account(new_mode)
+                     await active_quotex_clients[account_doc_id].change_account(new_mode)
                      await callback_query.answer(f"Account mode set to {new_mode} and active client updated.")
                  except Exception as e_mode:
                      await callback_query.answer(f"Account mode set to {new_mode}. Error updating active client: {e_mode}")
@@ -1114,44 +1316,23 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
               await callback_query.answer("Invalid account mode selected.", show_alert=True)
 
 
-        # Example for toggle_trade:
-    elif data.startswith("toggle_trade:"):
+    # --- Simple Status Toggle (Active/Inactive) ---
+    elif data.startswith("toggle_status:"):
         account_doc_id = data.split(":")[1]
-        settings = await get_or_create_trade_settings(account_doc_id)
-        current_status = settings.get('service_status', False)
-        new_status = not current_status
-
-        action_result = False
-        if new_status: # Turning ON
-            # --- ADD PREMIUM CHECK ---
-            if not await is_premium_user(user_id):
-                await callback_query.answer("Trading requires Premium/Sudo.", show_alert=True)
-                # Ensure status is OFF in DB if check fails
-                await update_trade_setting(account_doc_id, {"service_status": False})
-                # No need to refresh keyboard here as nothing should change
-                return # Stop processing
-            # --- END PREMIUM CHECK ---
-
-            action_result = await start_trading_task(user_id, account_doc_id) # This now also updates DB and checks assets
-            status_text = "started" if action_result else "failed to start (check logs/assets)"
-            answer_text = f"Trading service {status_text}"
-            final_db_status = action_result # If started, status is ON
-        else: # Turning OFF
-            await stop_trading_task(account_doc_id) # This now also updates DB to OFF
-            status_text = "stopped"
-            answer_text = f"Trading service {status_text}"
-            final_db_status = False # Status is OFF
-
-        await callback_query.answer(answer_text)
-
-        # Refresh the management screen - Need to fetch settings *again* after task function might have changed them
+        # Verify ownership
         account_details = await get_quotex_account_details(account_doc_id)
-        refreshed_settings = await get_or_create_trade_settings(account_doc_id) # Get latest state
-        final_status_text = "ON" if refreshed_settings.get("service_status", False) else "OFF" # Display actual DB status
-
+        if not account_details or account_details["user_id"] != user_id:
+            await callback_query.answer("Account not found or access denied.", show_alert=True)
+            return
+        settings = await get_or_create_trade_settings(account_doc_id)
+        new_status = not settings.get('service_status', False)
+        await update_trade_setting(account_doc_id, {"service_status": new_status})
+        status_label = "Active" if new_status else "Inactive"
+        await callback_query.answer(f"Status set to {status_label}")
+        refreshed_settings = await get_or_create_trade_settings(account_doc_id)
         await message.edit_text(
-            f"Managing account: **{account_details.get('email', 'N/A')}**\nTrading is now **{final_status_text}**.",
-            reply_markup=account_management_keyboard(account_doc_id, refreshed_settings) # Use refreshed settings
+            f"Managing account: **{account_details['email']}**\nStatus updated to **{status_label}**.",
+            reply_markup=account_management_keyboard(account_doc_id, refreshed_settings)
         )
 
 
@@ -1232,189 +1413,33 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
 
         dashboard_text = "📊 **Trading Dashboard Overview**\n\n"
         keyboard_rows = []
-        can_trade_count = 0 # Count accounts potentially eligible for trading
 
         for acc in accounts:
             account_doc_id = str(acc['_id'])
             email = acc['email']
             settings = await get_or_create_trade_settings(account_doc_id)
 
-            status_icon = "🟢 ON" if settings.get('service_status', False) else "🔴 OFF"
             acc_mode = settings.get('account_mode', 'N/A')
-            trade_mode = settings.get('trade_mode', 'N/A')
-            can_trade_count += 1 # Assume all accounts are eligible for controls here initially
 
+            active_status = "Active" if settings.get('service_status', False) else "Inactive"
             dashboard_text += (
                 f"👤 **Account:** `{email}`\n"
-                f"   ┣ Status: **{status_icon}**\n"
-                # Uncomment if you want balance here (slower loading)
-                # f"   ┣ Balance: Fetching...\n" # Add logic later if needed
-                f"   ┣ Acct Mode: `{acc_mode}`\n"
-                f"   ┗ Trade Mode: `{trade_mode}`\n\n"
+                f"   ┣ Status: **{active_status}**\n"
+                f"   ┗ Account Type: `{acc_mode}`\n\n"
             )
             # Add a button to manage this specific account
             keyboard_rows.append(
                 [InlineKeyboardButton(f"⚙️ Manage {email}", callback_data=f"qx_manage:{account_doc_id}")]
             )
 
-        # --- Add Global Action Buttons (Optional) ---
-        if can_trade_count > 0:
-            # Add start/stop all only if there are accounts
-             action_buttons = [
-                InlineKeyboardButton("🚀 Start All Trading", callback_data="trade_start_all"),
-                InlineKeyboardButton("🛑 Stop All Trading", callback_data="trade_stop_all")
-             ]
-             # You might want to add these on separate rows for clarity if many accounts
-             keyboard_rows.append(action_buttons)
 
-
+        keyboard_rows.append([InlineKeyboardButton("📓 Today's Journal", callback_data="journal_today")])
         keyboard_rows.append(back_button("main_menu"))
         await callback_query.message.edit_text(
             dashboard_text,
             reply_markup=InlineKeyboardMarkup(keyboard_rows),
             parse_mode=enums.ParseMode.DEFAULT
         )
-
-    # --- Place this inside the Client.on_callback_query() handler function ---
-
-    # (...) other callback handlers like qx_manage, set_tmode, etc.
-
-    elif data == "trade_start_all" or data == "trade_stop_all":
-        # Determine the action based on callback data
-        action = "start" if data == "trade_start_all" else "stop"
-        new_status = (action == "start") # True if starting, False if stopping
-        action_verb_present = "Starting" if new_status else "Stopping"
-        action_verb_past = "started" if new_status else "stopped"
-
-        # Let the user know we are working on it
-        await callback_query.answer(f"{action_verb_present} trading for all eligible accounts...")
-        msg = await callback_query.message.edit_text(f"⏳ {action_verb_present} trading for your account(s)...") # Edit original message
-
-        # --- Premium Check (Only necessary for starting) ---
-        is_user_eligible = await is_premium_user(user_id)
-        if action == "start" and not is_user_eligible:
-            logger.warning(f"User {user_id} attempted 'Start All' without Premium/Sudo.")
-            await msg.edit_text(
-                f"⛔️ Starting all trading services requires Premium or Sudo privileges.",
-                reply_markup=InlineKeyboardMarkup([back_button("trade_dashboard")]) # Back to dashboard
-            )
-            return # Stop processing this action
-        # --- End Premium Check ---
-
-        # Get all accounts for this user
-        accounts = await get_user_quotex_accounts(user_id)
-        if not accounts:
-            await msg.edit_text("You have no Quotex accounts configured to manage.", reply_markup=InlineKeyboardMarkup([back_button("trade_dashboard")]))
-            return
-
-        # Initialize counters for results
-        success_count = 0
-        fail_start_no_assets = 0 # Specific counter for start failure due to missing assets
-
-        # Loop through each account and apply the action
-        for acc in accounts:
-            account_doc_id = str(acc['_id'])
-            email = acc['email'] # Get email for logging clarity
-
-            try:
-                if action == "start":
-                    # start_trading_task already includes the Premium check and asset check
-                    started = await start_trading_task(user_id, account_doc_id)
-                    if started:
-                        success_count += 1
-                    else:
-                        # If starting failed, check if it was due to no assets
-                        settings = await get_or_create_trade_settings(account_doc_id)
-                        if not settings.get("assets"):
-                            fail_start_no_assets += 1
-                            logger.info(f"Start failed for {email} (ID: {account_doc_id}): No assets configured.")
-                        else:
-                            # Log other potential start failures if needed (start_trading_task handles logging too)
-                            logger.warning(f"Start failed for {email} (ID: {account_doc_id}) for other reason (check logs).")
-
-                else: # action == "stop"
-                    # stop_trading_task handles turning off service in DB and cancelling the task
-                    stopped = await stop_trading_task(account_doc_id)
-                    # 'stopped' returns True if a running task was actually cancelled
-                    if stopped:
-                       success_count += 1
-                       logger.info(f"Stopped running task for {email} (ID: {account_doc_id}).")
-                    # else: task wasn't running or found, no need to increment count
-
-            except Exception as e:
-                logger.error(f"Error processing {action} action for {email} (ID: {account_doc_id}): {e}", exc_info=True)
-                # Notify user? For now, just log it.
-
-            await asyncio.sleep(0.1) # Brief pause between accounts to avoid overwhelming system/API
-
-        # --- Build the Result Summary ---
-        result_text = f"✅ **Action Complete**\n\n"
-        result_text += f"Attempted to **{action.upper()}** trading for eligible accounts.\n"
-        if action == "start":
-            result_text += f"- Successfully started for: **{success_count}** account(s)\n"
-            if fail_start_no_assets > 0:
-                result_text += f"- Failed (No Assets): **{fail_start_no_assets}** account(s)\n"
-            # Add line for premium skips if that check was moved inside the loop (currently it's outside)
-        else: # stop
-            result_text += f"- Stopped running tasks for: **{success_count}** account(s)\n"
-            # Note: It might say 0 stopped if no tasks were actually running
-
-        # --- Refresh the Dashboard View ---
-        try:
-            # Fetch accounts and their LATEST statuses again
-            accounts_refresh = await get_user_quotex_accounts(user_id)
-            dashboard_text_refresh = "📊 **Trading Dashboard Overview** (Refreshed)\n\n"
-            keyboard_rows_refresh = []
-            can_trade_count_refresh = 0
-
-            if not accounts_refresh: # Should not happen if loop ran, but safe check
-                dashboard_text_refresh += "No accounts found."
-            else:
-                for acc_refresh in accounts_refresh:
-                    acc_doc_id_ref = str(acc_refresh['_id'])
-                    email_ref = acc_refresh['email']
-                    settings_ref = await get_or_create_trade_settings(acc_doc_id_ref) # Fetch fresh settings
-
-                    status_icon_ref = "🟢 ON" if settings_ref.get('service_status', False) else "🔴 OFF"
-                    acc_mode_ref = settings_ref.get('account_mode', 'N/A')
-                    trade_mode_ref = settings_ref.get('trade_mode', 'N/A')
-                    can_trade_count_refresh += 1 # Count accounts displayed
-
-                    dashboard_text_refresh += (
-                        f"👤 **Account:** `{email_ref}`\n"
-                        f"   ┣ Status: **{status_icon_ref}**\n"
-                        f"   ┣ Acct Mode: `{acc_mode_ref}`\n"
-                        f"   ┗ Trade Mode: `{trade_mode_ref}`\n\n"
-                    )
-                    # Add button to manage this specific account
-                    keyboard_rows_refresh.append(
-                        [InlineKeyboardButton(f"⚙️ Manage {email_ref}", callback_data=f"qx_manage:{acc_doc_id_ref}")]
-                    )
-
-            # Re-add global action buttons if there are accounts
-            if can_trade_count_refresh > 0:
-                action_buttons_ref = [
-                    InlineKeyboardButton("🚀 Start All Trading", callback_data="trade_start_all"),
-                    InlineKeyboardButton("🛑 Stop All Trading", callback_data="trade_stop_all")
-                 ]
-                keyboard_rows_refresh.append(action_buttons_ref)
-
-            # Add the back button
-            keyboard_rows_refresh.append(back_button("main_menu"))
-
-            # Combine the result text and the refreshed dashboard
-            final_text = result_text + "\n---\n" + dashboard_text_refresh
-
-            # Edit the message that showed "in progress" with the final summary and keyboard
-            await msg.edit_text(
-                final_text,
-                reply_markup=InlineKeyboardMarkup(keyboard_rows_refresh),
-                parse_mode=enums.ParseMode.DEFAULT
-            )
-        except Exception as refresh_err:
-            logger.error(f"Error refreshing dashboard after {action} all: {refresh_err}", exc_info=True)
-            # If refresh fails, show the results but indicate refresh error
-            await msg.edit_text(result_text + "\n\n⚠️ _Could not refresh dashboard view._", reply_markup=InlineKeyboardMarkup([back_button("main_menu")]))
 
     # --- Broadcast ---
     elif data == "admin_broadcast":
@@ -1448,7 +1473,135 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
          text += f"\n\n(__Note: Sudo users have all premium privileges automatically__)"
          # Add pagination if list is very long
          await message.edit_text(text, reply_markup=InlineKeyboardMarkup([back_button("admin_panel")]))
-        
+
+    # --- Admin: Account Management ---
+    elif data == "admin_acct_mgmt":
+        if not await is_sudo_user(user_id): await callback_query.answer("⛔️ Access Denied", show_alert=True); return
+        await message.edit_text(
+            "🏦 **Account Management**\nList, search, update or delete any Quotex account across all users.",
+            reply_markup=admin_acct_mgmt_keyboard()
+        )
+
+    elif data in ("admin_accts_list", "admin_acct_search_all"):
+        if not await is_sudo_user(user_id): await callback_query.answer("⛔️ Access Denied", show_alert=True); return
+        await message.edit_text("⏳ Fetching all accounts...", reply_markup=InlineKeyboardMarkup([back_button("admin_acct_mgmt")]))
+        all_accts = await get_all_quotex_accounts()
+        if not all_accts:
+            await message.edit_text("No accounts found.", reply_markup=InlineKeyboardMarkup([back_button("admin_acct_mgmt")]))
+            return
+        text = f"🏦 **All Accounts ({len(all_accts)})**\n\n"
+        keyboard_rows = []
+        for acct in all_accts:
+            doc_id = str(acct['_id'])
+            email = acct.get('email', 'N/A')
+            uid = acct.get('user_id', 'N/A')
+            text += f"\u2022 `{email}` — User: `{uid}`\n"
+            keyboard_rows.append([InlineKeyboardButton(f"⚙️ {email}", callback_data=f"admin_acct_view:{doc_id}")])
+        keyboard_rows.append(back_button("admin_acct_mgmt"))
+        await message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard_rows), parse_mode=enums.ParseMode.DEFAULT)
+
+    elif data == "admin_acct_search":
+        if not await is_sudo_user(user_id): await callback_query.answer("⛔️ Access Denied", show_alert=True); return
+        user_states[user_id] = "waiting_admin_acct_search"
+        await message.reply_text(
+            "🔍 Enter an **email** or **User ID** to search for accounts.\nSend /cancel to abort.",
+            reply_markup=ForceReply(selective=True)
+        )
+
+    elif data.startswith("admin_acct_view:"):
+        if not await is_sudo_user(user_id): await callback_query.answer("⛔️ Access Denied", show_alert=True); return
+        account_doc_id = data.split(":")[1]
+        acct = await get_quotex_account_details(account_doc_id)
+        if not acct:
+            await callback_query.answer("Account not found.", show_alert=True); return
+        settings = await get_or_create_trade_settings(account_doc_id)
+        is_active = settings.get('service_status', False)
+        acc_mode = settings.get('account_mode', 'N/A')
+        text = (
+            f"🏦 **Account Details**\n\n"
+            f"📧 Email: `{acct.get('email', 'N/A')}`\n"
+            f"👤 User ID: `{acct.get('user_id', 'N/A')}`\n"
+            f"Status: **{'Active 🟢' if is_active else 'Inactive 🔴'}**\n"
+            f"Account Type: **{acc_mode}**"
+        )
+        await message.edit_text(text, reply_markup=admin_acct_view_keyboard(account_doc_id, is_active, acc_mode))
+
+    elif data.startswith("admin_acct_toggle_status:"):
+        if not await is_sudo_user(user_id): await callback_query.answer("⛔️ Access Denied", show_alert=True); return
+        account_doc_id = data.split(":")[1]
+        acct = await get_quotex_account_details(account_doc_id)
+        if not acct: await callback_query.answer("Account not found.", show_alert=True); return
+        settings = await get_or_create_trade_settings(account_doc_id)
+        new_status = not settings.get('service_status', False)
+        await update_trade_setting(account_doc_id, {"service_status": new_status})
+        await callback_query.answer(f"Status set to {'Active' if new_status else 'Inactive'}")
+        refreshed = await get_or_create_trade_settings(account_doc_id)
+        acc_mode = refreshed.get('account_mode', 'N/A')
+        text = (
+            f"🏦 **Account Details**\n\n"
+            f"📧 Email: `{acct.get('email', 'N/A')}`\n"
+            f"👤 User ID: `{acct.get('user_id', 'N/A')}`\n"
+            f"Status: **{'Active 🟢' if new_status else 'Inactive 🔴'}**\n"
+            f"Account Type: **{acc_mode}**"
+        )
+        await message.edit_text(text, reply_markup=admin_acct_view_keyboard(account_doc_id, new_status, acc_mode))
+
+    elif data.startswith("admin_acct_toggle_type:"):
+        if not await is_sudo_user(user_id): await callback_query.answer("⛔️ Access Denied", show_alert=True); return
+        account_doc_id = data.split(":")[1]
+        acct = await get_quotex_account_details(account_doc_id)
+        if not acct: await callback_query.answer("Account not found.", show_alert=True); return
+        settings = await get_or_create_trade_settings(account_doc_id)
+        current_mode = settings.get('account_mode', 'PRACTICE')
+        new_mode = 'REAL' if current_mode == 'PRACTICE' else 'PRACTICE'
+        await update_trade_setting(account_doc_id, {"account_mode": new_mode})
+        await callback_query.answer(f"Account Type set to {new_mode}")
+        refreshed = await get_or_create_trade_settings(account_doc_id)
+        is_active = refreshed.get('service_status', False)
+        text = (
+            f"🏦 **Account Details**\n\n"
+            f"📧 Email: `{acct.get('email', 'N/A')}`\n"
+            f"👤 User ID: `{acct.get('user_id', 'N/A')}`\n"
+            f"Status: **{'Active 🟢' if is_active else 'Inactive 🔴'}**\n"
+            f"Account Type: **{new_mode}**"
+        )
+        await message.edit_text(text, reply_markup=admin_acct_view_keyboard(account_doc_id, is_active, new_mode))
+
+    elif data.startswith("admin_acct_del_confirm:"):
+        if not await is_sudo_user(user_id): await callback_query.answer("⛔️ Access Denied", show_alert=True); return
+        account_doc_id = data.split(":")[1]
+        acct = await get_quotex_account_details(account_doc_id)
+        if not acct: await callback_query.answer("Account not found.", show_alert=True); return
+        keyboard = [
+            [InlineKeyboardButton("❗️ YES, DELETE IT", callback_data=f"admin_acct_del_do:{account_doc_id}")],
+            back_button(f"admin_acct_view:{account_doc_id}")
+        ]
+        await message.edit_text(
+            f"🚨 **Delete Account `{acct.get('email', 'N/A')}`?**\n\n"
+            f"User ID: `{acct.get('user_id', 'N/A')}`\n\n"
+            "This will permanently remove the account and all its settings. **Cannot be undone!**",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    elif data.startswith("admin_acct_del_do:"):
+        if not await is_sudo_user(user_id): await callback_query.answer("⛔️ Access Denied", show_alert=True); return
+        account_doc_id = data.split(":")[1]
+        acct = await get_quotex_account_details(account_doc_id)
+        deleted = await delete_quotex_account(account_doc_id)
+        if deleted:
+            await disconnect_quotex_client(account_doc_id)
+            await callback_query.answer(f"Account deleted.", show_alert=True)
+            all_accts = await get_all_quotex_accounts()
+            text = f"🏦 **All Accounts ({len(all_accts)})**\n\n"
+            keyboard_rows = []
+            for a in all_accts:
+                did = str(a['_id'])
+                keyboard_rows.append([InlineKeyboardButton(f"⚙️ {a.get('email','N/A')}", callback_data=f"admin_acct_view:{did}")])
+            keyboard_rows.append(back_button("admin_acct_mgmt"))
+            await message.edit_text(text or "No accounts remaining.", reply_markup=InlineKeyboardMarkup(keyboard_rows))
+        else:
+            await callback_query.answer("Failed to delete account.", show_alert=True)
+
     
     elif data == "settings_main":
         # --- User Settings Menu ---
@@ -1466,17 +1619,12 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
             f"Here you can configure general bot settings (if available).\n\n"
             f"👤 **Your Status:**\n"
             f"   - User ID: `{user_id}`\n"
-            f"   - Role: **{user_role}**\n\n"
-            f"➡️ Most trading configurations (Assets, Mode, Candle Size, Start/Stop) "
-            f"are managed individually for each linked account via the "
-            f"➡️ **My Quotex Accounts** section."
+            f"   - Role: **{user_role}**"
         )
 
-        keyboard_rows = [
-            # Add buttons for future settings here, e.g.:
-            # [InlineKeyboardButton("🔔 Notification Preferences (NYI)", callback_data="settings_notifications")],
-            # [InlineKeyboardButton("🌐 Language (NYI)", callback_data="settings_language")],
-        ]
+        keyboard_rows = []
+        if user_id == OWNER_ID:
+            keyboard_rows.append([InlineKeyboardButton("📡 Signal Mode", callback_data="signal_status_view")])
 
         keyboard_rows.append(back_button("main_menu")) # Always provide a way back
 
@@ -1525,6 +1673,176 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
         else:
             text += "No users found with this role."
         await message.edit_text(text, reply_markup=InlineKeyboardMarkup([back_button(f"admin_manage_{role}")]))
+
+    elif data in ("signal_status_view", "signal_toggle", "signal_clear_pending"):
+        if user_id != OWNER_ID:
+            await callback_query.answer("⛔️ Owner only.", show_alert=True)
+            return
+
+        # ── Actions first ────────────────────────────────────────────────
+        if data == "signal_toggle":
+            sig_settings = await get_signal_settings()
+            new_status = not sig_settings.get('is_active', False)
+            if new_status and not sig_settings.get('channel_id'):
+                await callback_query.answer("Set a channel first with /setchannel", show_alert=True)
+                return
+            if new_status and not userbot_instance:
+                await callback_query.answer("Userbot not configured (USERBOT_PHONE missing)", show_alert=True)
+                return
+            await update_signal_settings({'is_active': new_status})
+            await callback_query.answer(f"Signal mode {'ON' if new_status else 'OFF'}")
+
+        elif data == "signal_clear_pending":
+            await update_signal_settings({'pending_signal': None})
+            await callback_query.answer("Pending signal cleared.")
+
+        # ── Always re-render the view with fresh DB state ────────────────
+        sig_settings = await get_signal_settings()
+        is_active = sig_settings.get('is_active', False)
+        channel_id = sig_settings.get('channel_id', 'Not set')
+        pending = sig_settings.get('pending_signal')
+        userbot_ok = userbot_instance is not None
+
+        status_icon = "🟢" if is_active else "🔴"
+        toggle_label = "🔴 Turn OFF" if is_active else "🟢 Turn ON"
+
+        text = (
+            f"📡 **Signal Monitor**\n\n"
+            f"{status_icon} Status: **{'ON' if is_active else 'OFF'}**\n"
+            f"📺 Channel: `{channel_id}`\n"
+            f"🤖 Userbot: **{'Running ✅' if userbot_ok else 'Not configured ❌'}**\n"
+        )
+        if pending:
+            age_s = int(time.time() - pending.get('timestamp', 0))
+            text += (
+                f"\n⏳ **Pending Signal** (awaiting direction):\n"
+                f"  `{pending.get('asset_display', pending.get('asset'))}` "
+                f"${pending.get('amount')} {pending.get('duration', 0) // 60}min "
+                f"— {age_s}s ago {'⚠️ expired' if age_s > 300 else ''}\n"
+            )
+        else:
+            text += "\nNo pending signal.\n"
+
+        keyboard = [
+            [InlineKeyboardButton(toggle_label, callback_data="signal_toggle")],
+            [InlineKeyboardButton("🗑 Clear Pending Signal", callback_data="signal_clear_pending")],
+            back_button("main_menu"),
+        ]
+        try:
+            await message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        except Exception as e:
+            if "MESSAGE_NOT_MODIFIED" in str(e):
+                pass  # content unchanged — nothing to do
+            else:
+                raise
+
+    # ── Trading Journal ───────────────────────────────────────────────────────
+
+    elif data.startswith("journal_today") or data.startswith("journal_date:") or data.startswith("journal_nav:"):
+        # Resolve which date to show
+        today_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+        if data.startswith("journal_date:"):
+            view_date = data.split(":", 1)[1]
+        elif data.startswith("journal_nav:"):
+            view_date = data.split(":", 1)[1]
+        else:
+            view_date = today_str
+
+        # Validate date format
+        try:
+            view_dt = datetime.datetime.strptime(view_date, "%Y-%m-%d")
+        except ValueError:
+            await callback_query.answer("Invalid date format.", show_alert=True)
+            return
+
+        await callback_query.message.edit_text(
+            f"⏳ Loading journal for **{view_date}**...",
+            reply_markup=InlineKeyboardMarkup([back_button("main_menu")])
+        )
+
+        accounts = await get_user_quotex_accounts(user_id)
+        account_doc_ids = [str(a['_id']) for a in accounts]
+        summary = await get_journal_summary(account_doc_ids, view_date)
+        entries = summary["entries"]
+
+        # Build display text
+        journal_text = f"📓 **Trading Journal — {view_date}**\n\n"
+
+        if not entries:
+            journal_text += "_No trades recorded for this day._\n"
+        else:
+            # Group by account email
+            by_account: Dict[str, list] = {}
+            for e in entries:
+                by_account.setdefault(e.get("email", "Unknown"), []).append(e)
+
+            daily_bals = summary.get("daily_balances", {})
+
+            for acct_email, trades in by_account.items():
+                acct_doc_id = trades[0].get("account_doc_id", "")
+                bal_rec = daily_bals.get(acct_doc_id, {})
+                opening_bal = bal_rec.get("opening_balance")
+                closing_bal = bal_rec.get("closing_balance")
+                journal_text += f"📧 **{acct_email}** ({trades[0].get('account_mode','')}):\n"
+                if opening_bal is not None:
+                    def _fmt_bal(v): return f"${v:,.2f}" if v is not None else "N/A"
+                    bal_diff = (closing_bal - opening_bal) if closing_bal is not None else 0
+                    diff_str = f" ({'+' if bal_diff >= 0 else ''}{bal_diff:,.2f})" if closing_bal is not None else ""
+                    journal_text += f"   💵 Open: {_fmt_bal(opening_bal)}  →  Close: {_fmt_bal(closing_bal)}{diff_str}\n"
+                for i, t in enumerate(trades, 1):
+                    res_icon = "✅" if t["result"] == "WIN" else ("⚠️" if t["result"] == "TIE" else "❌")
+                    pl_str = f"+${abs(t['profit_loss']):.2f}" if t["profit_loss"] > 0 else (f"-${abs(t['profit_loss']):.2f}" if t["profit_loss"] < 0 else "$0.00")
+                    entry_ts = t["entry_time"].strftime("%H:%M:%S") if isinstance(t.get("entry_time"), datetime.datetime) else "N/A"
+                    close_ts = t["closing_time"].strftime("%H:%M:%S") if isinstance(t.get("closing_time"), datetime.datetime) else "N/A"
+                    e_price = f"{t['entry_price']:.5f}" if t.get("entry_price") else "N/A"
+                    c_price = f"{t['closing_price']:.5f}" if t.get("closing_price") else "N/A"
+                    journal_text += (
+                        f"  {i}. {res_icon} `{t.get('symbol', 'N/A')}` | {t.get('direction','?')} | "
+                        f"${t.get('amount', 0)} | {t.get('duration', 0) // 60}min\n"
+                        f"      ⏰ Entry: {entry_ts} UTC @ {e_price}\n"
+                        f"      🏁 Close: {close_ts} UTC @ {c_price}\n"
+                        f"      📌 Result: **{t['result']}**  {pl_str}\n"
+                    )
+                journal_text += "\n"
+
+            # Summary footer
+            net_str = f"+${summary['net_pl']:.2f}" if summary['net_pl'] >= 0 else f"-${abs(summary['net_pl']):.2f}"
+            journal_text += (
+                f"─────────────────────\n"
+                f"📊 **Summary:** {summary['total']} trade(s) | "
+                f"✅ {summary['wins']} Win | ❌ {summary['losses']} Loss | ⚠️ {summary['ties']} Tie\n"
+                f"💰 **Net P&L:** {net_str}"
+            )
+
+        # Prev / Next day navigation
+        prev_dt = (view_dt - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+        next_dt = (view_dt + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+        nav_row = [
+            InlineKeyboardButton("◀ Prev Day", callback_data=f"journal_nav:{prev_dt}"),
+            InlineKeyboardButton("▶ Next Day", callback_data=f"journal_nav:{next_dt}"),
+        ]
+        keyboard_rows = [
+            nav_row,
+            [InlineKeyboardButton("📅 Go to Date", callback_data="journal_pick_date")],
+            back_button("main_menu"),
+        ]
+        try:
+            await callback_query.message.edit_text(
+                journal_text,
+                reply_markup=InlineKeyboardMarkup(keyboard_rows),
+                parse_mode=enums.ParseMode.DEFAULT
+            )
+        except Exception as e:
+            if "MESSAGE_NOT_MODIFIED" not in str(e):
+                raise
+
+    elif data == "journal_pick_date":
+        user_states[user_id] = "waiting_journal_date"
+        await callback_query.message.reply_text(
+            "📅 Enter the date you want to view in **YYYY-MM-DD** format (e.g. `2026-03-01`).\n"
+            "Send /cancel to abort.",
+            reply_markup=ForceReply(selective=True)
+        )
 
     else:
         logger.warning(f"Unhandled callback data from user {user_id}: {data}")
@@ -1806,55 +2124,112 @@ async def message_handler(client: Client, message: Message):
         )
 
 
+    # --- Admin: Account Search ---
+    elif state == "waiting_admin_acct_search":
+        if not await is_sudo_user(user_id): return
+        del user_states[user_id]
+        query = text.strip()
+        results = await get_all_quotex_accounts(search=query)
+        if not results:
+            await message.reply_text(
+                f"No accounts found matching `{query}`.",
+                reply_markup=InlineKeyboardMarkup([back_button("admin_acct_mgmt")]),
+                quote=True
+            )
+            return
+        resp_text = f"🔍 **Search Results for `{query}` ({len(results)})**\n\n"
+        keyboard_rows = []
+        for acct in results:
+            doc_id = str(acct['_id'])
+            email = acct.get('email', 'N/A')
+            uid = acct.get('user_id', 'N/A')
+            resp_text += f"• `{email}` — User: `{uid}`\n"
+            keyboard_rows.append([InlineKeyboardButton(f"⚙️ {email}", callback_data=f"admin_acct_view:{doc_id}")])
+        keyboard_rows.append(back_button("admin_acct_mgmt"))
+        await message.reply_text(
+            resp_text,
+            reply_markup=InlineKeyboardMarkup(keyboard_rows),
+            parse_mode=enums.ParseMode.DEFAULT,
+            quote=True
+        )
+
+    # --- Journal Date Picker ---
+    elif state == "waiting_journal_date":
+        del user_states[user_id]
+        date_input = text.strip()
+        try:
+            datetime.datetime.strptime(date_input, "%Y-%m-%d")  # validate
+        except ValueError:
+            await message.reply_text(
+                "❌ Invalid format. Please use **YYYY-MM-DD** (e.g. `2026-03-01`).",
+                quote=True
+            )
+            return
+        # Trigger the journal view for the chosen date
+        accounts = await get_user_quotex_accounts(user_id)
+        account_doc_ids = [str(a['_id']) for a in accounts]
+        summary = await get_journal_summary(account_doc_ids, date_input)
+        entries = summary["entries"]
+        view_dt = datetime.datetime.strptime(date_input, "%Y-%m-%d")
+
+        journal_text = f"📓 **Trading Journal — {date_input}**\n\n"
+        if not entries:
+            journal_text += "_No trades recorded for this day._\n"
+        else:
+            by_account: Dict[str, list] = {}
+            for e in entries:
+                by_account.setdefault(e.get("email", "Unknown"), []).append(e)
+            daily_bals = summary.get("daily_balances", {})
+            for acct_email, trades in by_account.items():
+                acct_doc_id = trades[0].get("account_doc_id", "")
+                bal_rec = daily_bals.get(acct_doc_id, {})
+                opening_bal = bal_rec.get("opening_balance")
+                closing_bal = bal_rec.get("closing_balance")
+                journal_text += f"📧 **{acct_email}** ({trades[0].get('account_mode','')}):\n"
+                if opening_bal is not None:
+                    def _fmt_bal(v): return f"${v:,.2f}" if v is not None else "N/A"
+                    bal_diff = (closing_bal - opening_bal) if closing_bal is not None else 0
+                    diff_str = f" ({'+' if bal_diff >= 0 else ''}{bal_diff:,.2f})" if closing_bal is not None else ""
+                    journal_text += f"   💵 Open: {_fmt_bal(opening_bal)}  →  Close: {_fmt_bal(closing_bal)}{diff_str}\n"
+                for i, t in enumerate(trades, 1):
+                    res_icon = "✅" if t["result"] == "WIN" else ("⚠️" if t["result"] == "TIE" else "❌")
+                    pl_str = f"+${abs(t['profit_loss']):.2f}" if t["profit_loss"] > 0 else (f"-${abs(t['profit_loss']):.2f}" if t["profit_loss"] < 0 else "$0.00")
+                    entry_ts = t["entry_time"].strftime("%H:%M:%S") if isinstance(t.get("entry_time"), datetime.datetime) else "N/A"
+                    close_ts = t["closing_time"].strftime("%H:%M:%S") if isinstance(t.get("closing_time"), datetime.datetime) else "N/A"
+                    e_price = f"{t['entry_price']:.5f}" if t.get("entry_price") else "N/A"
+                    c_price = f"{t['closing_price']:.5f}" if t.get("closing_price") else "N/A"
+                    journal_text += (
+                        f"  {i}. {res_icon} `{t.get('symbol','N/A')}` | {t.get('direction','?')} | "
+                        f"${t.get('amount',0)} | {t.get('duration',0) // 60}min\n"
+                        f"      ⏰ Entry: {entry_ts} UTC @ {e_price}\n"
+                        f"      🏁 Close: {close_ts} UTC @ {c_price}\n"
+                        f"      📌 Result: **{t['result']}**  {pl_str}\n"
+                    )
+                journal_text += "\n"
+            net_str = f"+${summary['net_pl']:.2f}" if summary['net_pl'] >= 0 else f"-${abs(summary['net_pl']):.2f}"
+            journal_text += (
+                f"─────────────────────\n"
+                f"📊 **Summary:** {summary['total']} trade(s) | ✅ {summary['wins']} Win | ❌ {summary['losses']} Loss | ⚠️ {summary['ties']} Tie\n"
+                f"💰 **Net P&L:** {net_str}"
+            )
+
+        prev_dt = (view_dt - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+        next_dt = (view_dt + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+        keyboard_rows = [
+            [InlineKeyboardButton("◀ Prev Day", callback_data=f"journal_nav:{prev_dt}"),
+             InlineKeyboardButton("▶ Next Day", callback_data=f"journal_nav:{next_dt}")],
+            [InlineKeyboardButton("📅 Go to Date", callback_data="journal_pick_date")],
+            back_button("main_menu"),
+        ]
+        await message.reply_text(
+            journal_text,
+            reply_markup=InlineKeyboardMarkup(keyboard_rows),
+            parse_mode=enums.ParseMode.DEFAULT,
+            quote=True
+        )
+
     # --- Placeholder for other states if needed ---
 
-# --- Trading Loop Logic (Conceptual - Needs Careful Implementation) ---
-# This is highly complex to manage per user account via a bot.
-# Consider if manual trade initiation is sufficient first.
-
-active_trading_tasks: Dict[str, asyncio.Task] = {} # {account_doc_id: task_instance}
-
-# --- REPLACE THE EXISTING run_trading_loop_for_account FUNCTION ---
-
-async def _get_candle_direction(qx_client: Quotex, asset_name: str, candle_size: int) -> Optional[str]:
-    """
-    Fetches the last completed candle and determines its direction ('call', 'put', 'doji').
-    Internal helper for the trading loop.
-    """
-    if not qx_client or not qx_client.check_connect: # Should check connection status appropriately
-        logger.warning(f"[{asset_name}] QX client not connected in _get_candle_direction.")
-        return None
-    try:
-        end_time = time.time()
-        offset_seconds = 0 # Usually fetches last ~1min needed for 60s candle check
-        # Important: Use the candle_size passed from settings
-        candles = await qx_client.get_candles(asset_name, end_time, offset_seconds, candle_size) # Request 2 candles to better identify last completed one
-        # Note: `amount` and `end_time` args might vary based on specific pyquotex version/method used
-
-        if candles and isinstance(candles, list) and len(candles) > 0:
-             # Often the last candle is incomplete, second-to-last is the target
-             target_candle = None
-             if len(candles) > 1 and all(k in candles[-2] for k in ['open', 'close']):
-                  target_candle = candles[-1] # Prefer second to last
-             elif len(candles) >= 1 and all(k in candles[-1] for k in ['open', 'close']):
-                 target_candle = candles[-1] # Use last if second to last invalid or only one received
-
-             if target_candle:
-                open_price = target_candle['open']
-                close_price = target_candle['close']
-                logger.debug(f"[{asset_name}] Candle Check: Open={open_price}, Close={close_price}")
-                if close_price > open_price: return 'call'
-                elif close_price < open_price: return 'put'
-                else: return 'doji'
-             else:
-                  logger.warning(f"[{asset_name}] Could not identify valid candle structure from response: {candles}")
-                  return None
-        else:
-            logger.warning(f"[{asset_name}] No candle data received or empty list. Response: {candles}")
-            return None
-    except Exception as e:
-        logger.error(f"[{asset_name}] Error fetching candle data: {e}", exc_info=True)
-        return None
 
 async def _check_asset_open_and_get_name(qx_client: Quotex, asset_name_original: str) -> Optional[str]:
     """Checks if asset or its OTC variant is open, returns the name of the open asset or None."""
@@ -1886,408 +2261,505 @@ async def _check_asset_open_and_get_name(qx_client: Quotex, asset_name_original:
         return None
 
 
-async def run_trading_loop_for_account(user_id: int, account_doc_id: str):
-    """The background task function that runs the trading logic for one account."""
-    logger.info(f"[Trading Task {account_doc_id}]: Starting loop for User {user_id}")
-    is_first_run = True # Flag to prevent immediate shutdown if turned off before first check
+# ═══════════════════════════════════════════════════════════════════════════════
+# SIGNAL-BASED TRADING
+# ═══════════════════════════════════════════════════════════════════════════════
 
-    while True:
-        # --- Check External Cancellation ---
-        # Important: Check if the task is still supposed to be running early in the loop
-        if account_doc_id not in active_trading_tasks:
-             logger.info(f"[Trading Task {account_doc_id}]: Task record not found in active_trading_tasks. Stopping loop.")
-             break
+async def execute_signal_trade(signal: Dict[str, Any]):
+    """
+    Execute a signal trade on ALL owner Quotex accounts simultaneously.
+    Notifies the owner with per-account trade results.
+    """
+    asset = signal.get('asset')
+    direction = signal.get('direction')
+    amount = float(signal.get('amount', DEFAULT_TRADE_AMOUNT))
+    duration = int(signal.get('duration', DEFAULT_TRADE_DURATION))
+    asset_display = signal.get('asset_display', asset)
 
+    if not asset or not direction:
+        logger.error(f"[Signal Trade] Cannot execute — missing asset or direction: {signal}")
+        return
+
+    dir_label = '🔼 BUY (CALL)' if direction == 'call' else '🔽 SELL (PUT)'
+    logger.info(f"[Signal Trade] {asset_display} | {dir_label} | ${amount} | {duration}s")
+
+    if bot_instance:
         try:
-            # 1. Fetch Latest Settings & Check Status from DB
-            # Use account_doc_id passed to the function
-            settings = await get_or_create_trade_settings(account_doc_id)
-            if not settings:
-                logger.error(f"[Trading Task {account_doc_id}]: Failed to get trade settings. Stopping loop.")
-                break # Stop if settings can't be retrieved
-
-            if not settings.get("service_status", False) and not is_first_run:
-                logger.info(f"[Trading Task {account_doc_id}]: Service status is OFF in DB. Stopping loop.")
-                # Ensure the task is actually removed from the global dict by calling stop_trading_task
-                # Need to schedule this outside the loop's context or handle it carefully
-                # The most reliable way is if the trigger (button press) calls stop_trading_task itself.
-                # Here, we just break the loop.
-                await stop_trading_task(account_doc_id) # Attempt cleanup
-                break
-
-            is_first_run = False # Service status checked at least once
-
-            # Extract settings needed
-            assets_to_trade = settings.get("assets", [])
-            trade_mode = settings.get("trade_mode", DEFAULT_TRADE_MODE) # 'TIME' or 'TIMER'
-            candle_size = settings.get("candle_size", DEFAULT_CANDLE_SIZE)
-            martingale_state_db = settings.get("martingale_state", {})
-            cooldown_until_db = settings.get("cooldown_until", 0.0)
-
-            # 2. Check Cooldown Period
-            now_time = time.time()
-            if now_time < cooldown_until_db:
-                remaining_cooldown = int(cooldown_until_db - now_time)
-                if remaining_cooldown % 30 == 0 or remaining_cooldown < 5: # Log periodically
-                    logger.info(f"[Trading Task {account_doc_id}]: In cooldown for {remaining_cooldown}s.")
-                await asyncio.sleep(5) # Check frequently during cooldown
-                continue # Skip to next loop iteration
-
-            if not assets_to_trade:
-                logger.warning(f"[Trading Task {account_doc_id}]: No assets configured in DB. Pausing for 60s.")
-                await asyncio.sleep(60)
-                continue
-
-            # 3. Get Connected Quotex Client
-            # Use the user_id and account_doc_id passed to the function
-            qx_client, status_msg = await get_quotex_client(user_id, account_doc_id, "trading")
-            if not qx_client:
-                logger.error(f"[Trading Task {account_doc_id}]: Cannot get Quotex client ({status_msg}). Pausing for 60s.")
-                await asyncio.sleep(60)
-                continue # Try again next iteration
-            # Ensure client is connected (get_quotex_client usually handles this)
-            # if not await qx_client.check_connect(): ... (optional extra check)
-
-            # 4. --- Trading Cycle Start ---
-            logger.debug(f"[Trading Task {account_doc_id}]: Starting trade processing cycle...")
-            active_cooldown_until = cooldown_until_db # Use local var for updates within the cycle
-            active_martingale_state = martingale_state_db.copy() # Work with a copy for updates
-
-            for asset_info in assets_to_trade:
-                 # Check if service turned OFF or task cancelled mid-cycle
-                 current_settings_check = await get_or_create_trade_settings(account_doc_id)
-                 if not current_settings_check.get("service_status", False):
-                     logger.info(f"[Trading Task {account_doc_id}]: Service turned OFF during asset loop. Stopping.")
-                     await stop_trading_task(account_doc_id)
-                     return # Exit function completely
-                 if account_doc_id not in active_trading_tasks:
-                    logger.info(f"[Trading Task {account_doc_id}]: Task removed during asset loop. Stopping.")
-                    return # Exit function completely
-
-                 # Check cooldown again before *each* trade (could be triggered by previous asset)
-                 if time.time() < active_cooldown_until:
-                     logger.info(f"[Trading Task {account_doc_id}]: Cooldown activated mid-cycle. Skipping remaining assets.")
-                     break # Break from assets loop for this cycle
-
-                 asset_name_original = asset_info.get('name')
-                 base_amount = asset_info.get('amount', DEFAULT_TRADE_AMOUNT)
-                 # 'duration' field stores the value used for BOTH timer/time expiry setting
-                 duration_or_timeframe_value = asset_info.get('duration', DEFAULT_TRADE_DURATION)
-
-                 if not asset_name_original: continue # Skip if asset structure is invalid
-
-                 # Get Martingale state for *this specific asset* from our working copy
-                 asset_mtg = active_martingale_state.get(asset_name_original, {'current_amount': base_amount, 'consecutive_losses': 0})
-                 current_trade_amount = asset_mtg['current_amount']
-                 consecutive_losses = asset_mtg['consecutive_losses']
-
-                 logger.info(f"[Trading Task {account_doc_id}]---> Processing Asset: {asset_name_original}")
-                 logger.info(f"  Settings: Mode={trade_mode}, Candle={candle_size}s, Base Amount={base_amount}, Duration/TF={duration_or_timeframe_value}s")
-                 logger.info(f"  MTG State: Trade Amount={current_trade_amount}, Losses={consecutive_losses}")
-
-                 # 4a. Check Asset Availability & Get Correct Name (e.g., _otc)
-                 asset_name_open = await _check_asset_open_and_get_name(qx_client, asset_name_original)
-                 if not asset_name_open:
-                     logger.warning(f"[{asset_name_original}] Skipping: Asset or OTC variant not open/available.")
-                     await asyncio.sleep(0.5) # Small delay before next asset
-                     continue # Go to next asset in the list
-                    
-
-                 # --- Update MTG state key if OTC name is different ---
-                 if asset_name_open != asset_name_original and asset_name_original in active_martingale_state:
-                      logger.info(f"Trading using OTC name '{asset_name_open}', migrating MTG state from '{asset_name_original}'.")
-                      active_martingale_state[asset_name_open] = active_martingale_state.pop(asset_name_original)
-                      asset_mtg = active_martingale_state[asset_name_open] # Update local ref
-                 # Ensure MTG state exists for the open asset name
-                 if asset_name_open not in active_martingale_state:
-                      active_martingale_state[asset_name_open] = {'current_amount': base_amount, 'consecutive_losses': 0}
-                      asset_mtg = active_martingale_state[asset_name_open]
-                 #---------------------------------------------------
-
-
-                 # 4b. Get Trading Direction
-                 direction = await _get_candle_direction(qx_client, asset_name_open, candle_size)
-                 if direction is None:
-                      logger.warning(f"[{asset_name_open}] Skipping: Could not determine trade direction.")
-                      await asyncio.sleep(0.5)
-                      continue
-                 if direction == 'doji':
-                      logger.info(f"[{asset_name_open}] Skipping: Last candle was Doji.")
-                      await asyncio.sleep(0.5)
-                      continue
-                 logger.info(f"[{asset_name_open}] Trade Direction Signal: {direction.upper()}")
-
-
-                 # 4c. Place the Trade
-                 logger.info(f"[{asset_name_open}] Placing {direction.upper()} trade. Amount: {current_trade_amount}, Exp: {duration_or_timeframe_value}s, Mode: {trade_mode}")
-                 trade_placed_success = False
-                 profit_or_loss_amount = 0
-                 buy_error_reason = ""
-                 try:
-                      status, buy_info = await qx_client.buy(current_trade_amount, asset_name_open, direction, duration_or_timeframe_value, trade_mode) # Pass 'TIMER' or 'TIME'
-
-                      if status:
-                           trade_id = buy_info.get('id', 'N/A')
-                           logger.info(f"[{asset_name_open}] Trade placed successfully! ID: {trade_id}. Waiting for result...")
-
-                           # Wait for duration + buffer
-                           await asyncio.sleep(duration_or_timeframe_value + 2) # Increased buffer slightly
-
-                           logger.info(f"[{asset_name_open}] Checking result for Trade ID: {trade_id}...")
-                           # IMPORTANT: Use buy_info which might contain necessary identifiers for check_win_v3/v4/get_order
-                           # Adapt based on the exact check_win version you are using. Assume it takes ID.
-                           win_result = await qx_client.check_win(buy_info["id"]) # Or check_win, check_win_v3 depending on library version and details needed
-
-                           # Get profit might depend on check_win or need separate call
-                           profit_or_loss_amount = qx_client.get_profit() # Returns positive for win, negative for loss, 0 for tie
-                           trade_placed_success = True # Mark as successful execution pathway
-
-                           if win_result:
-                                logger.info(f"[{asset_name_open}] Trade Result: WIN! Profit: {profit_or_loss_amount:.2f}")
-                                await bot_instance.send_message(user_id, f"✅ Trade Result: WIN! Profit: {profit_or_loss_amount:.2f}")  
-                                # Reset MTG state for this asset on WIN
-                                asset_mtg['current_amount'] = base_amount
-                                asset_mtg['consecutive_losses'] = 0
-                                await update_trade_setting(account_doc_id, {
-                                    f"martingale_state.{asset_name_open}.current_amount": asset_mtg['current_amount']
-                                })
-                                await update_trade_setting(account_doc_id, {
-                                    f"martingale_state.{asset_name_open}.consecutive_losses": asset_mtg['consecutive_losses']
-                                })
-                           else:
-                                if profit_or_loss_amount == 0: # Tie / Doji
-                                    logger.warning(f"[{asset_name_open}] Trade Result: TIE/DOJI.")
-                                    await bot_instance.send_message(user_id, f"⚠️ Trade Result: TIE/DOJI. No profit/loss.")
-                                    # No change in MTG state needed for a tie
-                                else: # Loss
-                                    logger.warning(f"[{asset_name_open}] Trade Result: LOSS! Lost: {abs(profit_or_loss_amount):.2f}")
-                                    await bot_instance.send_message(user_id, f"❌ Trade Result: LOSS! Lost: {abs(profit_or_loss_amount):.2f}")
-                                    asset_mtg['consecutive_losses'] += 1
-                                    # Update consecutive losses in the database for the asset
-                                    await update_trade_setting(account_doc_id, {
-                                        f"martingale_state.{asset_name_open}.consecutive_losses": asset_mtg['consecutive_losses']
-                                    })
-                                    asset_mtg['current_amount'] = round(asset_mtg['current_amount'] * MARTINGALE_MULTIPLIER, 2)
-                                    await update_trade_setting(account_doc_id, {
-                                        f"martingale_state.{asset_name_open}.current_amount": asset_mtg['current_amount']
-                                    })
-
-                                    if asset_mtg['consecutive_losses'] >= MAX_CONSECUTIVE_LOSSES:
-                                         logger.warning(f"[{asset_name_open}] Max losses ({MAX_CONSECUTIVE_LOSSES}) reached. Activating {COOLDOWN_MINUTES} min cooldown.")
-                                         active_cooldown_until = time.time() + (COOLDOWN_MINUTES * 60)
-                                         # Reset MTG state for the asset AFTER triggering cooldown
-                                         asset_mtg['current_amount'] = base_amount
-                                         asset_mtg['consecutive_losses'] = 0
-                                         await update_trade_setting(account_doc_id, {
-                                            f"martingale_state.{asset_name_open}.current_amount": asset_mtg['current_amount']
-                                        })
-                                         await update_trade_setting(account_doc_id, {
-                                            f"martingale_state.{asset_name_open}.consecutive_losses": asset_mtg['consecutive_losses']
-                                         })
-
-                      else: # buy status = False
-                           buy_error_reason = buy_info if isinstance(buy_info, str) else str(buy_info)
-                           logger.error(f"[{asset_name_open}] Trade placement failed: {buy_error_reason}")
-                           # Decide if this error warrants stopping or pausing (e.g., Not enough money)
-                           if "not_money" in buy_error_reason or "Insufficient balance" in buy_error_reason:
-                                logger.critical(f"[Trading Task {account_doc_id}]: Insufficient funds detected for {asset_name_open}. Turning off trading service.")
-                                await update_trade_setting(account_doc_id, {"service_status": False})
-                                # Notify user?
-                                try: await bot_instance.send_message(user_id, f"⚠️ Trading stopped for account `{qx_client.email}`: Insufficient balance to place trade on `{asset_name_open}`.")
-                                except Exception: pass
-                                await stop_trading_task(account_doc_id) # Clean up task
-                                return # Exit the loop completely
-
-
-                 except Exception as trade_exec_error:
-                     logger.error(f"[{asset_name_open}] Unexpected error during trade execution/check: {trade_exec_error}", exc_info=True)
-                     # Consider if connection should be dropped or retried
-
-                 # 4d. Update Martingale state IN THE WORKING COPY
-                 active_martingale_state[asset_name_open] = asset_mtg # Update the main dict with changes for this asset
-
-                 # 4e. Update Database State IMMEDIATELY
-                 # This prevents losing state if the bot crashes or is stopped.
-                 # Only update if state actually changed (or cooldown activated)
-                 state_update_payload = {}
-                 if active_martingale_state != martingale_state_db:
-                     state_update_payload["martingale_state"] = active_martingale_state
-                 if active_cooldown_until > cooldown_until_db:
-                      state_update_payload["cooldown_until"] = active_cooldown_until
-
-                 if state_update_payload:
-                      logger.debug(f"[{asset_name_open}] Saving updated state to DB: {state_update_payload}")
-                      try:
-                           await update_trade_setting(account_doc_id, state_update_payload)
-                           # Refresh local DB vars to match the saved state
-                           martingale_state_db = active_martingale_state.copy()
-                           cooldown_until_db = active_cooldown_until
-                      except Exception as db_save_err:
-                           logger.error(f"[Trading Task {account_doc_id}]: CRITICAL: Failed to save state to DB after trade: {db_save_err}. State may be inconsistent.", exc_info=True)
-                           # Maybe stop the task here to prevent further inconsistency? Or retry saving? For now, log and continue.
-
-
-                 # 4f. TIMER Mode Pacing (Wait until next minute)
-                 if trade_placed_success and trade_mode == "TIMER":
-                     now_dt = datetime.datetime.now()
-                     wait_seconds = max(0, 60 - now_dt.second - (now_dt.microsecond / 1_000_000))
-                     if wait_seconds > 0.2: # Only wait if significant time remaining
-                         logger.info(f"[{asset_name_open}] {trade_mode} mode: Waiting {wait_seconds:.2f}s for next candle/minute.")
-                         await asyncio.sleep(wait_seconds)
-
-                 # Small delay before processing next asset to avoid overwhelming API/system
-                 await asyncio.sleep(1)
-
-            # --- End of Asset Loop ---
-            logger.debug(f"[Trading Task {account_doc_id}]: Finished asset processing cycle.")
-
-            # Wait a bit before starting the *next full cycle* unless in cooldown
-            if time.time() >= active_cooldown_until:
-                 await asyncio.sleep(5) # Wait 5 seconds before next check
-
-        except asyncio.CancelledError:
-             logger.info(f"[Trading Task {account_doc_id}]: Loop cancelled.")
-             try:
-                 await disconnect_quotex_client(account_doc_id) # Clean up connection
-             except Exception as cleanup_error:
-                 logger.error(f"[Trading Task {account_doc_id}]: Error during cleanup: {cleanup_error}", exc_info=True)
-             finally:
-                 pass # Cleanup complete
-             break # Exit the while loop
-        except ConnectionError as ce: # Catch connection errors from get_quotex_client or within loop
-             logger.error(f"[Trading Task {account_doc_id}]: ConnectionError encountered: {ce}. Pausing for 60s.")
-             await disconnect_quotex_client(account_doc_id) # Ensure cleanup on error
-             await asyncio.sleep(60)
+            await bot_instance.send_message(
+                OWNER_ID,
+                f"🔔 **Signal Received — Executing Trades**\n\n"
+                f"📊 Asset: `{asset_display}`\n"
+                f"📈 Direction: **{dir_label}**\n"
+                f"💵 Amount: `${amount}`\n"
+                f"⏱ Duration: `{duration // 60} min ({duration}s)`\n\n"
+                f"⚡ Placing on all **Active** accounts...",
+            )
         except Exception as e:
-             # Catch unexpected errors in the main loop logic
-             logger.error(f"[Trading Task {account_doc_id}]: Unexpected error in trading loop: {e}", exc_info=True)
-             await disconnect_quotex_client(account_doc_id) # Ensure cleanup on error
-             logger.info(f"[Trading Task {account_doc_id}]: Pausing for 60s due to error.")
-             await asyncio.sleep(60) # Wait after unexpected error
+            logger.warning(f"[Signal Trade] Could not notify owner: {e}")
 
-    logger.info(f"[Trading Task {account_doc_id}]: Exiting trading loop function.")
-    # Final check: ensure client is disconnected if loop terminates unexpectedly
-    await disconnect_quotex_client(account_doc_id)
-    # Remove from active tasks just in case stop_trading_task wasn't called
-    if account_doc_id in active_trading_tasks:
-        if account_doc_id in active_trading_tasks:
-            if account_doc_id in active_trading_tasks:
-                if account_doc_id in active_trading_tasks:
-                    active_trading_tasks.pop(account_doc_id, None)
-                else:
-                    logger.warning(f"Attempted to delete non-existent task for account_doc_id: {account_doc_id}")
-            else:
-                logger.warning(f"Attempted to delete non-existent task for account_doc_id: {account_doc_id}")
-        else:
-            logger.warning(f"Attempted to delete non-existent task for account_doc_id: {account_doc_id}")
-
-
-# --- Ensure these functions handle the task lifecycle correctly ---
-
-async def start_trading_task(user_id: int, account_doc_id: str):
-    """Starts the trading loop task for a given account if not already running."""
-    global active_trading_tasks
-    # Ensure user is Premium or Sudo if this is a Premium feature
-    if not await is_premium_user(user_id):
-        logger.warning(f"Attempt to start trading for non-premium user {user_id} on account {account_doc_id}. Denied.")
-        # Maybe notify the user via bot?
+    accounts = await get_user_quotex_accounts(OWNER_ID)
+    if not accounts:
+        logger.warning("[Signal Trade] No Quotex accounts found for owner.")
         if bot_instance:
-             try: await bot_instance.send_message(user_id, "⛔️ Trading is a premium feature. Please upgrade or contact the owner.")
-             except Exception: pass
-        return False # Indicate failure
+            await bot_instance.send_message(OWNER_ID, "⚠️ Signal received but no Quotex accounts are linked.")
+        return
 
-    if account_doc_id in active_trading_tasks:
-        # Check if task is actually running
-        task = active_trading_tasks[account_doc_id]
-        if task and not task.done():
-            logger.warning(f"Trading task for {account_doc_id} is already running.")
-            return True # Task already exists and running
-        else:
-             logger.warning(f"Found a completed/cancelled task entry for {account_doc_id}. Will restart.")
-             # Remove the old entry before creating a new one
-             del active_trading_tasks[account_doc_id]
-
-
-    # Create and store the task
-    # Crucial: Check if the user has assets configured BEFORE starting
-    settings = await get_or_create_trade_settings(account_doc_id)
-    if not settings.get("assets"):
-         logger.warning(f"Cannot start trading for {account_doc_id}: No assets configured.")
-         if bot_instance:
-             try: await bot_instance.send_message(user_id, f"⚠️ Cannot start trading for account linked to {settings.get('email', account_doc_id)}: No assets are configured. Please add assets first.")
-             except Exception: pass
-         # Make sure the DB status reflects OFF if we can't start
-         await update_trade_setting(account_doc_id, {"service_status": False})
-         return False
+    trade_tasks = [
+        _execute_single_account_signal_trade(
+            str(acc['_id']), acc['email'], asset, asset_display, direction, amount, duration
+        )
+        for acc in accounts
+    ]
+    results = await asyncio.gather(*trade_tasks, return_exceptions=True)
+    for r in results:
+        if isinstance(r, Exception):
+            logger.error(f"[Signal Trade] Unhandled exception in trade task: {r}", exc_info=r)
 
 
-    logger.info(f"Scheduling trading task for account {account_doc_id} (User: {user_id})...")
-    # Make sure the DB reflects that the service is ON
-    await update_trade_setting(account_doc_id, {"service_status": True})
-    task = asyncio.create_task(run_trading_loop_for_account(user_id, account_doc_id))
-    active_trading_tasks[account_doc_id] = task
-    # Optional: Add callback to remove task from dict if it finishes unexpectedly
-    # task.add_done_callback(lambda t: active_trading_tasks.pop(account_doc_id, None)) # Needs careful implementation
-    return True # Indicate success
+async def _execute_single_account_signal_trade(
+    account_doc_id: str, email: str,
+    asset: str, asset_display: str,
+    direction: str, amount: float, duration: int,
+):
+    """Execute a signal-based trade on one Quotex account and report result to owner."""
+    try:
+        qx_client, status_msg = await get_quotex_client(OWNER_ID, account_doc_id, "signal_trade")
+        if not qx_client:
+            if bot_instance:
+                await bot_instance.send_message(
+                    OWNER_ID,
+                    f"❌ **{email}**\nCould not connect to Quotex.\n_Reason: {status_msg}_",
+                )
+            return
 
-async def stop_trading_task(account_doc_id: str):
-    """Stops the trading loop task for a given account and updates DB status."""
-    global active_trading_tasks
-    was_running = False
-    if account_doc_id in active_trading_tasks:
-        task = active_trading_tasks[account_doc_id]
-        if task and not task.done():
-            logger.info(f"Sending cancellation request to trading task for {account_doc_id}")
-            task.cancel()
-            was_running = True
-            try:
-                # Wait briefly for the task to acknowledge cancellation
-                await asyncio.wait_for(task, timeout=5.0)
-            except asyncio.CancelledError:
-                 logger.info(f"Trading task {account_doc_id} acknowledged cancellation.")
-            except asyncio.TimeoutError:
-                 logger.warning(f"Trading task {account_doc_id} did not finish cancellation within timeout.")
-            except Exception as e:
-                 logger.error(f"Error during task cancellation await for {account_doc_id}: {e}")
+        settings = await get_or_create_trade_settings(account_doc_id)
 
-        # Remove from dict regardless of whether it was running or finished/cancelled cleanly
-        removed_task = active_trading_tasks.pop(account_doc_id, None)
-        if removed_task:
-            logger.info(f"Trading task removed from active list for {account_doc_id}.")
-        else:
-            logger.warning(f"Attempted to delete non-existent task for account_doc_id: {account_doc_id}")
-    else:
-         logger.warning(f"No active trading task found in dict for {account_doc_id} to stop.")
+        # Skip accounts that are not Active
+        if not settings.get('service_status', False):
+            logger.info(f"[Signal Trade] [{email}] Skipping — account is Inactive.")
+            if bot_instance:
+                await bot_instance.send_message(
+                    OWNER_ID,
+                    f"⏭ **{email}**\nSkipped — account status is **Inactive**.",
+                )
+            return
 
-    # Update DB status to OFF
-    logger.info(f"Setting service_status to OFF in DB for {account_doc_id}.")
-    await update_trade_setting(account_doc_id, {"service_status": False})
+        trade_mode = settings.get("trade_mode", DEFAULT_TRADE_MODE)
+        account_mode = settings.get("account_mode", "PRACTICE")
 
-    # Also disconnect any active client session for this account
-    logger.info(f"Requesting disconnect for any cached client for {account_doc_id}.")
-    await disconnect_quotex_client(account_doc_id)
-    return was_running # Indicate if a running task was actually stopped
-
-async def resume_active_trading_tasks():
-    """Checks DB on startup and resumes tasks for accounts with service ON."""
-    logger.info("Checking for trading tasks to resume...")
-    active_settings_cursor = trade_settings_db.find({"service_status": True})
-    count = 0
-    async for settings in active_settings_cursor:
+        # Explicitly switch to the account mode from settings (PRACTICE / REAL).
+        # This is critical — the cached client may still be in PRACTICE mode even
+        # after the user switches to REAL in the bot settings.
         try:
-            account_doc_id = str(settings['account_doc_id'])
-             # Find the user_id associated with this account_doc_id
-            account_info = await get_quotex_account_details(account_doc_id)
-            if account_info:
-                user_id = account_info['user_id']
-                logger.info(f"Resuming trading task for account {account_doc_id} (User: {user_id})...")
-                await start_trading_task(user_id, account_doc_id)
-                count += 1
-            else:
-                 logger.warning(f"Cannot resume task for account {account_doc_id}: Associated user/account info not found.")
-        except Exception as e:
-             logger.error(f"Error resuming task for account_doc_id {settings.get('account_doc_id')}: {e}", exc_info=True)
-    logger.info(f"Resumed {count} active trading tasks.")
+            await qx_client.change_account(account_mode)
+            logger.info(f"[Signal Trade] [{email}] Account mode set to {account_mode}")
+        except Exception as mode_err:
+            logger.warning(f"[Signal Trade] [{email}] Could not switch to {account_mode}: {mode_err}")
+
+        # Check asset availability (tries OTC variant automatically)
+        asset_open = await _check_asset_open_and_get_name(qx_client, asset)
+        if not asset_open:
+            if bot_instance:
+                await bot_instance.send_message(
+                    OWNER_ID,
+                    f"⚠️ **{email}**\nAsset `{asset_display}` is not available right now. Trade skipped.",
+                )
+            return
+
+        logger.info(f"[Signal Trade] [{email}] {direction.upper()} {asset_open} ${amount} {duration}s {trade_mode}")
+
+        # Capture opening balance (only persisted on first trade of the calendar day)
+        date_str_today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+        try:
+            balance_before = await qx_client.get_balance()
+            await record_opening_balance(account_doc_id, email, date_str_today, account_mode, balance_before)
+            logger.info(f"[Signal Trade] [{email}] Balance before trade: {balance_before}")
+        except Exception as bal_err:
+            logger.warning(f"[Signal Trade] [{email}] Could not fetch pre-trade balance: {bal_err}")
+            balance_before = None
+
+        # Attempt buy with one automatic reconnect on connection-reset errors
+        entry_time = datetime.datetime.now(datetime.timezone.utc)
+        _CONNECTION_ERRS = (ConnectionResetError, ConnectionAbortedError, ConnectionError, OSError)
+        for attempt in range(2):
+            try:
+                status, buy_info = await qx_client.buy(amount, asset_open, direction, duration, trade_mode)
+                break  # success — exit retry loop
+            except _CONNECTION_ERRS as conn_err:
+                if attempt == 0:
+                    logger.warning(
+                        f"[Signal Trade] [{email}] Connection error on buy() (attempt 1): {conn_err}. "
+                        "Evicting stale client and reconnecting..."
+                    )
+                    await disconnect_quotex_client(account_doc_id)
+                    qx_client, status_msg = await get_quotex_client(OWNER_ID, account_doc_id, "signal_trade_retry")
+                    if not qx_client:
+                        if bot_instance:
+                            await bot_instance.send_message(
+                                OWNER_ID,
+                                f"❌ **{email}**\nReconnect failed after connection drop.\n_{status_msg}_",
+                            )
+                        return
+                    # re-check asset availability on fresh client
+                    asset_open = await _check_asset_open_and_get_name(qx_client, asset) or asset_open
+                else:
+                    raise  # second attempt also failed — let outer handler report it
+
+        if not status:
+            err = buy_info if isinstance(buy_info, str) else str(buy_info)
+            if bot_instance:
+                await bot_instance.send_message(
+                    OWNER_ID,
+                    f"❌ **{email}**\nTrade placement failed.\n_Reason: {err}_",
+                )
+            return
+
+        trade_id = buy_info.get('id', 'N/A')
+        entry_price = (
+            buy_info.get('openPrice') or buy_info.get('open_price')
+            or buy_info.get('price') or buy_info.get('open')
+        )
+        logger.info(f"[Signal Trade] [{email}] Trade ID {trade_id} placed. Waiting {duration + 2}s...")
+        await asyncio.sleep(duration + 2)
+
+        win_result = await qx_client.check_win(buy_info["id"])
+        profit = qx_client.get_profit()
+        closing_time = datetime.datetime.now(datetime.timezone.utc)
+        closing_price = (
+            (win_result.get('closePrice') if isinstance(win_result, dict) else None)
+            or buy_info.get('closePrice') or buy_info.get('close_price') or buy_info.get('close')
+        )
+
+        if win_result:
+            icon, outcome, result_str = "✅", f"WIN!  Profit: +${abs(profit):.2f}", "WIN"
+        elif profit == 0:
+            icon, outcome, result_str = "⚠️", "TIE  (no profit/loss)", "TIE"
+        else:
+            icon, outcome, result_str = "❌", f"LOSS!  Lost: -${abs(profit):.2f}", "LOSS"
+
+        # Capture closing balance after trade settlement
+        try:
+            balance_after = await qx_client.get_balance()
+            await record_closing_balance(account_doc_id, date_str_today, balance_after)
+            logger.info(f"[Signal Trade] [{email}] Balance after trade: {balance_after}")
+        except Exception as bal_err:
+            logger.warning(f"[Signal Trade] [{email}] Could not fetch post-trade balance: {bal_err}")
+            balance_after = None
+
+        # ── Record to trading journal ──────────────────────────────────
+        await save_journal_entry({
+            "account_doc_id":  account_doc_id,
+            "email":           email,
+            "date":            entry_time.strftime("%Y-%m-%d"),
+            "symbol":          asset_display,
+            "symbol_actual":   asset_open,
+            "direction":       direction.upper(),
+            "duration":        duration,
+            "amount":          amount,
+            "account_mode":    account_mode,
+            "trade_id":        str(trade_id),
+            "entry_time":      entry_time,
+            "entry_price":     entry_price,
+            "closing_time":    closing_time,
+            "closing_price":   closing_price,
+            "result":          result_str,
+            "profit_loss":     round(profit, 2),
+            "balance_before":  balance_before,
+            "balance_after":   balance_after,
+        })
+
+        if bot_instance:
+            await bot_instance.send_message(
+                OWNER_ID,
+                f"{icon} **Signal Trade Result** — `{email}`\n\n"
+                f"📊 Asset: `{asset_display}` → `{asset_open}`\n"
+                f"📈 Direction: `{direction.upper()}`\n"
+                f"💵 Amount: `${amount}`\n"
+                f"🏷 Trade ID: `{trade_id}`\n"
+                f"📌 Result: **{outcome}**",
+            )
+
+    except Exception as e:
+        logger.error(f"[Signal Trade] Error on account {account_doc_id}: {e}", exc_info=True)
+        if bot_instance:
+            try:
+                await bot_instance.send_message(
+                    OWNER_ID,
+                    f"❌ **{email}**\nUnexpected error during signal trade.\n`{type(e).__name__}: {e}`",
+                )
+            except Exception:
+                pass
+
+
+# ── Userbot Channel Listener ─────────────────────────────────────────────────
+
+def build_userbot() -> Optional[Client]:
+    """Create (but do not start) the MTProto userbot Client."""
+    global userbot_instance
+    if not USERBOT_PHONE:
+        logger.warning(
+            "[Userbot] USERBOT_PHONE not set in .env — signal channel monitoring disabled. "
+            "Set USERBOT_PHONE and restart to enable."
+        )
+        return None
+    userbot_instance = Client(
+        "userbot_session",
+        api_id=API_ID,
+        api_hash=API_HASH,
+        phone_number=USERBOT_PHONE,
+    )
+    return userbot_instance
+
+
+async def handle_channel_message(client: Client, message):
+    """Processes every incoming message on the userbot and applies signal logic."""
+    global bot_instance
+    try:
+        sig_settings = await get_signal_settings()
+        if not sig_settings or not sig_settings.get('is_active'):
+            return
+
+        channel_id = sig_settings.get('channel_id')
+        if not channel_id:
+            return
+
+        # Match by numeric id or @username
+        msg_chat_id = message.chat.id
+        chat_username = getattr(message.chat, 'username', None) or ''
+        channel_str = str(channel_id).lstrip('@')
+
+        if msg_chat_id != channel_id and channel_str.lower() != chat_username.lower():
+            return
+
+        text = message.text or message.caption or ''
+        if not text or not is_signal_message(text):
+            return
+
+        logger.info(f"[Userbot] Signal-like message from channel {channel_id}: {text[:120]!r}")
+
+        parsed = parse_signal(text)
+
+        if not parsed:
+            # Maybe it's a standalone direction message for a stored partial signal
+            direction = parse_direction(text)
+            if direction:
+                pending = sig_settings.get('pending_signal')
+                if pending:
+                    age = time.time() - pending.get('timestamp', 0)
+                    if age < 300:  # 5-minute window
+                        full_signal = {**pending, 'direction': direction}
+                        await update_signal_settings({'pending_signal': None})
+                        await execute_signal_trade(full_signal)
+                    else:
+                        logger.info("[Userbot] Pending signal expired (>5 min). Discarding.")
+                        await update_signal_settings({'pending_signal': None})
+            return
+
+        if 'direction' in parsed:
+            # Full signal — execute immediately
+            await update_signal_settings({'pending_signal': None})
+            await execute_signal_trade(parsed)
+        else:
+            # Partial signal — store and wait for direction follow-up
+            pending = {
+                'asset':         parsed['asset'],
+                'asset_display': parsed.get('asset_display', parsed['asset']),
+                'duration':      parsed.get('duration', DEFAULT_TRADE_DURATION),
+                'amount':        parsed.get('amount', DEFAULT_TRADE_AMOUNT),
+                'timestamp':     time.time(),
+            }
+            await update_signal_settings({'pending_signal': pending})
+            logger.info(f"[Userbot] Partial signal stored: {pending}")
+            if bot_instance:
+                try:
+                    await bot_instance.send_message(
+                        OWNER_ID,
+                        f"📨 **Partial Signal Received**\n\n"
+                        f"📊 Asset: `{parsed.get('asset_display', parsed['asset'])}`\n"
+                        f"💵 Amount: `${pending['amount']}`\n"
+                        f"⏱ Duration: `{pending['duration'] // 60} min`\n\n"
+                        f"⏳ Waiting for direction (UP/DOWN)...",
+                    )
+                except Exception:
+                    pass
+
+    except Exception as e:
+        logger.error(f"[Userbot] Error processing channel message: {e}", exc_info=True)
+
+
+# ── Signal Bot Commands ───────────────────────────────────────────────────────
+
+@Client.on_message(filters.command("setchannel") & filters.private)
+@owner_only
+async def setchannel_command(client: Client, message: Message):
+    """Set the Telegram channel/group to monitor for signals."""
+    parts = message.text.strip().split(maxsplit=1)
+    if len(parts) < 2:
+        await message.reply_text(
+            "**Usage:** `/setchannel <channel_id>`\n\n"
+            "Pass the numeric channel ID (negative for groups/channels, e.g. `-1001234567890`).\n"
+            "You can also pass a `@username`.\n\n"
+            "The userbot must already be a member of that channel.",
+            quote=True,
+        )
+        return
+
+    raw = parts[1].strip()
+    # Accept numeric ids (possibly negative) or @username strings
+    if raw.lstrip('-').isdigit():
+        new_channel = int(raw)
+    else:
+        new_channel = raw  # Store as username string
+
+    await update_signal_settings({'channel_id': new_channel})
+    await message.reply_text(
+        f"✅ Signal channel set to `{new_channel}`.\n\n"
+        f"Use /signalmode to toggle monitoring ON/OFF.",
+        quote=True,
+    )
+
+
+@Client.on_message(filters.command("signalmode") & filters.private)
+@owner_only
+async def signalmode_command(client: Client, message: Message):
+    """Toggle signal monitoring on or off."""
+    sig_settings = await get_signal_settings()
+    current = sig_settings.get('is_active', False)
+    new_status = not current
+
+    if new_status and not sig_settings.get('channel_id'):
+        await message.reply_text(
+            "⚠️ No signal channel configured. Set one first with `/setchannel <channel_id>`.",
+            quote=True,
+        )
+        return
+
+    if new_status and not userbot_instance:
+        await message.reply_text(
+            "⚠️ Userbot is not running (USERBOT_PHONE not configured or bot not started with userbot).\n"
+            "Set `USERBOT_PHONE` in your `.env` and restart the bot.",
+            quote=True,
+        )
+        return
+
+    await update_signal_settings({'is_active': new_status})
+    status_text = "🟢 **ON**" if new_status else "🔴 **OFF**"
+    channel_id = sig_settings.get('channel_id', 'not set')
+    await message.reply_text(
+        f"📡 **Signal Mode:** {status_text}\n\n"
+        f"📺 Channel: `{channel_id}`\n"
+        f"{'Monitoring active — trades will execute automatically when signals arrive.' if new_status else 'Monitoring paused.'}",
+        quote=True,
+    )
+
+
+@Client.on_message(filters.command("signalstatus") & filters.private)
+@owner_only
+async def signalstatus_command(client: Client, message: Message):
+    """Show current signal monitoring status and any pending partial signal."""
+    sig_settings = await get_signal_settings()
+    is_active = sig_settings.get('is_active', False)
+    channel_id = sig_settings.get('channel_id', 'Not set')
+    pending = sig_settings.get('pending_signal')
+    userbot_ok = userbot_instance is not None
+
+    status_icon = "🟢" if is_active else "🔴"
+    userbot_icon = "✅" if userbot_ok else "❌"
+
+    text = (
+        f"📡 **Signal Monitor Status**\n\n"
+        f"{status_icon} Monitoring: **{'ON' if is_active else 'OFF'}**\n"
+        f"📺 Channel: `{channel_id}`\n"
+        f"{userbot_icon} Userbot: **{'Running' if userbot_ok else 'Not configured'}**\n"
+    )
+    if pending:
+        age_s = int(time.time() - pending.get('timestamp', 0))
+        text += (
+            f"\n⏳ **Pending Partial Signal** (waiting for direction):\n"
+            f"  Asset: `{pending.get('asset_display', pending.get('asset'))}`\n"
+            f"  Amount: `${pending.get('amount')}`\n"
+            f"  Duration: `{pending.get('duration', 0) // 60} min`\n"
+            f"  Age: `{age_s}s` {'⚠️ (expired — will be discarded)' if age_s > 300 else ''}\n"
+        )
+    else:
+        text += "\nNo pending partial signal.\n"
+
+    text += (
+        f"\n**Commands:**\n"
+        f"`/setchannel <id>` — set channel\n"
+        f"`/signalmode` — toggle ON/OFF"
+    )
+    await message.reply_text(text, quote=True)
+
+
+@Client.on_message(filters.command("journal") & filters.private)
+async def journal_command(client: Client, message: Message):
+    """Show today's trading journal."""
+    user_id = message.from_user.id
+    today_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+    accounts = await get_user_quotex_accounts(user_id)
+    if not accounts:
+        await message.reply_text("You have no linked Quotex accounts.", quote=True)
+        return
+    account_doc_ids = [str(a['_id']) for a in accounts]
+    summary = await get_journal_summary(account_doc_ids, today_str)
+    entries = summary["entries"]
+
+    journal_text = f"📓 **Trading Journal — {today_str}**\n\n"
+    if not entries:
+        journal_text += "_No trades recorded today._\n"
+    else:
+        by_account: Dict[str, list] = {}
+        for e in entries:
+            by_account.setdefault(e.get("email", "Unknown"), []).append(e)
+        daily_bals = summary.get("daily_balances", {})
+        for acct_email, trades in by_account.items():
+            acct_doc_id = trades[0].get("account_doc_id", "")
+            bal_rec = daily_bals.get(acct_doc_id, {})
+            opening_bal = bal_rec.get("opening_balance")
+            closing_bal = bal_rec.get("closing_balance")
+            journal_text += f"📧 **{acct_email}** ({trades[0].get('account_mode','')}):\n"
+            if opening_bal is not None:
+                def _fmt_bal(v): return f"${v:,.2f}" if v is not None else "N/A"
+                bal_diff = (closing_bal - opening_bal) if closing_bal is not None else 0
+                diff_str = f" ({'+' if bal_diff >= 0 else ''}{bal_diff:,.2f})" if closing_bal is not None else ""
+                journal_text += f"   💵 Open: {_fmt_bal(opening_bal)}  →  Close: {_fmt_bal(closing_bal)}{diff_str}\n"
+            for i, t in enumerate(trades, 1):
+                res_icon = "✅" if t["result"] == "WIN" else ("⚠️" if t["result"] == "TIE" else "❌")
+                pl_str = f"+${abs(t['profit_loss']):.2f}" if t["profit_loss"] > 0 else (f"-${abs(t['profit_loss']):.2f}" if t["profit_loss"] < 0 else "$0.00")
+                entry_ts = t["entry_time"].strftime("%H:%M:%S") if isinstance(t.get("entry_time"), datetime.datetime) else "N/A"
+                close_ts = t["closing_time"].strftime("%H:%M:%S") if isinstance(t.get("closing_time"), datetime.datetime) else "N/A"
+                e_price = f"{t['entry_price']:.5f}" if t.get("entry_price") else "N/A"
+                c_price = f"{t['closing_price']:.5f}" if t.get("closing_price") else "N/A"
+                journal_text += (
+                    f"  {i}. {res_icon} `{t.get('symbol','N/A')}` | {t.get('direction','?')} | "
+                    f"${t.get('amount',0)} | {t.get('duration',0) // 60}min\n"
+                    f"      ⏰ Entry: {entry_ts} UTC @ {e_price}\n"
+                    f"      🏁 Close: {close_ts} UTC @ {c_price}\n"
+                    f"      📌 Result: **{t['result']}**  {pl_str}\n"
+                )
+            journal_text += "\n"
+        net_str = f"+${summary['net_pl']:.2f}" if summary['net_pl'] >= 0 else f"-${abs(summary['net_pl']):.2f}"
+        journal_text += (
+            f"─────────────────────\n"
+            f"📊 **Summary:** {summary['total']} trade(s) | ✅ {summary['wins']} Win | ❌ {summary['losses']} Loss | ⚠️ {summary['ties']} Tie\n"
+            f"💰 **Net P&L:** {net_str}"
+        )
+
+    today_dt = datetime.datetime.strptime(today_str, "%Y-%m-%d")
+    prev_dt = (today_dt - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+    keyboard_rows = [
+        [InlineKeyboardButton("◀ Prev Day", callback_data=f"journal_nav:{prev_dt}"),
+         InlineKeyboardButton("▶ Today", callback_data="journal_today")],
+        [InlineKeyboardButton("📅 Go to Date", callback_data="journal_pick_date")],
+    ]
+    await message.reply_text(
+        journal_text,
+        reply_markup=InlineKeyboardMarkup(keyboard_rows),
+        parse_mode=enums.ParseMode.DEFAULT,
+        quote=True
+    )
+
 
 # --- Main Function ---
 async def run_bot():
@@ -2307,8 +2779,16 @@ async def run_bot():
     app.add_handler(MessageHandler(start_command, filters.command("start") & filters.private))
     app.add_handler(MessageHandler(help_command, filters.command("help") & filters.private))
     app.add_handler(MessageHandler(broadcast_command_handler, filters.command("broadcast") & filters.private))  # Has own perm check
+    # Signal trading commands
+    app.add_handler(MessageHandler(setchannel_command, filters.command("setchannel") & filters.private))
+    app.add_handler(MessageHandler(signalmode_command, filters.command("signalmode") & filters.private))
+    app.add_handler(MessageHandler(signalstatus_command, filters.command("signalstatus") & filters.private))
+    app.add_handler(MessageHandler(journal_command, filters.command("journal") & filters.private))
     app.add_handler(CallbackQueryHandler(callback_query_handler))
     app.add_handler(MessageHandler(message_handler, filters.private))  # Handles replies and non-command text
+
+    # Build the userbot (MTProto user session for channel monitoring)
+    ubot = build_userbot()
 
     try:
         await app.start()
@@ -2316,8 +2796,20 @@ async def run_bot():
         main_event_loop = asyncio.get_running_loop()
         bot_info = await app.get_me()
         logger.info(f"Bot started as @{bot_info.username} (ID: {bot_info.id})")
-        # Resume trading tasks after bot starts and DB is ready
-        await resume_active_trading_tasks() # Uncomment carefully - ensure loop logic is solid first
+
+        # Start the userbot if configured
+        if ubot:
+            try:
+                ubot.add_handler(
+                    __import__('pyrogram.handlers', fromlist=['MessageHandler']).MessageHandler(
+                        handle_channel_message,
+                        filters.all
+                    )
+                )
+                await ubot.start()
+                logger.info("[Userbot] Userbot started and listening for signals.")
+            except Exception as ub_err:
+                logger.error(f"[Userbot] Failed to start userbot: {ub_err}", exc_info=True)
 
         logger.info("Bot is running... Press CTRL+C to stop.")
         # Keep the main thread alive (Pyrogram handles the event loop)
@@ -2329,9 +2821,13 @@ async def run_bot():
         logger.error(f"An error occurred during bot execution: {e}", exc_info=True)
     finally:
         if app.is_connected:
-            logger.info("Stopping all active trading tasks...")
-             # Stop all trading tasks gracefully
-            await asyncio.gather(*(stop_trading_task(doc_id) for doc_id in list(active_trading_tasks.keys())))
+            # Stop userbot if running
+            if ubot and ubot.is_connected:
+                try:
+                    await ubot.stop()
+                    logger.info("[Userbot] Userbot stopped.")
+                except Exception:
+                    pass
 
             logger.info("Stopping bot...")
             await app.stop()
