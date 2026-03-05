@@ -8,3 +8,6 @@ dnspython
 flask
 gunicorn
 requests
+setuptools
+selenium
+undetected-chromedriver

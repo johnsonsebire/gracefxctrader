@@ -7,9 +7,15 @@ import asyncio
 import logging
 import datetime
 import re # For PIN detection
+import json
 from pathlib import Path
 import builtins
 from unittest.mock import patch
+
+try:
+    import quotex_auth as _quotex_auth
+except ImportError:
+    _quotex_auth = None
 import asyncio # Ensure asyncio is imported if not already globally
 from functools import wraps
 from typing import Optional, Dict, Any, Tuple, List
@@ -120,10 +126,34 @@ USERBOT_PHONE: str = os.getenv("USERBOT_PHONE", "").strip()
 _raw_channel = os.getenv("SIGNAL_CHANNEL_ID", "").strip()
 SIGNAL_CHANNEL_ID: Optional[int] = int(_raw_channel) if _raw_channel.lstrip('-').isdigit() else None
 
+# Quotex session overrides (optional). Useful when anti-bot protection blocks
+# raw credential login from server environments.
+QUOTEX_USER_AGENT = os.getenv("QUOTEX_USER_AGENT", USER_AGENT).strip() or USER_AGENT
+QUOTEX_SSID = os.getenv("QUOTEX_SSID", "").strip()
+QUOTEX_COOKIES = os.getenv("QUOTEX_COOKIES", "").strip()
+
 # Basic Logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s')
+_LOG_FMT = '%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s'
+_log_dir = Path(os.path.dirname(os.path.abspath(__file__)))
+_log_file = _log_dir / 'bot.log'
+
+_root_logger = logging.getLogger()
+_root_logger.setLevel(logging.INFO)
+_console_handler = logging.StreamHandler()
+_console_handler.setFormatter(logging.Formatter(_LOG_FMT))
+_root_logger.addHandler(_console_handler)
+try:
+    from logging.handlers import RotatingFileHandler as _RFH
+    _file_handler = _RFH(_log_file, maxBytes=5*1024*1024, backupCount=3, encoding='utf-8')
+    _file_handler.setFormatter(logging.Formatter(_LOG_FMT))
+    _root_logger.addHandler(_file_handler)
+except Exception as _e:
+    print(f'[WARNING] Could not create log file {_log_file}: {_e}')
+
 logger = logging.getLogger(__name__)
 logging.getLogger("pyrofork").setLevel(logging.WARNING) # Reduce pyrogram verbosity
+logging.getLogger("undetected_chromedriver").setLevel(logging.WARNING)
+logging.getLogger("selenium").setLevel(logging.WARNING)
 
 try:
     import dns.resolver
@@ -654,7 +684,11 @@ async def get_signal_settings() -> Dict[str, Any]:
             'channel_id': SIGNAL_CHANNEL_ID,  # pre-seed from .env if set
             'is_active': False,
             'pending_signal': None,
-            'signal_delay': 15,  # seconds to subtract from duration at execution (0 = disabled)
+            'signal_delay': 15,          # seconds to subtract from duration at execution (0 = disabled)
+            'duration_remap_enabled': False,   # remap 2-min signals to 5-min
+            'ask_duration_on_partial': False,  # show duration selector when a partial signal arrives
+            'manual_trade_mode': False,        # require manual UP/DOWN confirmation before executing
+            'inverse_mode': False,             # flip direction: CALL→PUT, PUT→CALL
         }
         await signal_settings_db.insert_one(doc)
     return doc
@@ -851,9 +885,10 @@ async def get_quotex_client(user_id: int, account_doc_id: str, interaction_type:
     # --- Cache check logic ---
     if account_doc_id in active_quotex_clients:
         cached = active_quotex_clients[account_doc_id]
-        # Verify the cached connection is still alive before reusing it
+        # Verify the cached connection is still alive before reusing it.
+        # check_connect() is async — MUST be awaited or it returns a truthy coroutine.
         try:
-            still_connected = cached.check_connect()
+            still_connected = await cached.check_connect()
         except Exception:
             still_connected = False
         if still_connected:
@@ -886,6 +921,18 @@ async def get_quotex_client(user_id: int, account_doc_id: str, interaction_type:
     # session_dir = Path(temp_session_path).parent
     # session_dir.mkdir(parents=True, exist_ok=True)
 
+    # Per-account isolated session directory so multiple accounts don't share tokens
+    session_path = f"sessions/{account_doc_id}"
+
+    # --- Playwright pre-auth: populate session.json before pyquotex touches it ---
+    if _quotex_auth:
+        try:
+            await _quotex_auth.ensure_session(email, password, session_path=session_path)
+        except Exception as _pw_err:
+            logger.warning(f"[Auth] Playwright pre-auth for {email} failed: {_pw_err}")
+    else:
+        logger.warning("[Auth] quotex_auth not available; skipping Playwright pre-auth.")
+
     qx_client: Optional[Quotex] = None
     connection_check = False
     connection_reason = "Initialization error"
@@ -901,13 +948,41 @@ async def get_quotex_client(user_id: int, account_doc_id: str, interaction_type:
         is_patched = True
         logger.info("Aggressive builtins.input patch STARTED.")
 
-        # Create instance UNDER the patch
+        # Create instance UNDER the patch — use per-account session directory
         logger.info(f"Creating new Quotex client instance for {email} UNDER PATCH")
-        qx_client = Quotex(email=email, password=password)
+        qx_client = Quotex(
+            email=email,
+            password=password,
+            user_agent=QUOTEX_USER_AGENT,
+            root_path=session_path,
+            user_data_dir="browser",
+        )
+
+        # pyquotex always loads ./session.json from CWD; override with our per-account session
+        _per_acct_session_file = Path(f"{session_path}/session.json")
+        if _per_acct_session_file.exists():
+            try:
+                with open(_per_acct_session_file) as _sf:
+                    _saved_session = json.load(_sf)
+                if _saved_session.get("token") or _saved_session.get("cookies"):
+                    qx_client.session_data = _saved_session
+                    logger.info(f"[Auth] Loaded per-account session for {email} (token={'ok' if _saved_session.get('token') else 'MISSING'}, cookies={'ok' if _saved_session.get('cookies') else 'MISSING'})")
+            except Exception as _se:
+                logger.warning(f"[Auth] Could not load per-account session from {_per_acct_session_file}: {_se}")
+
+        # If env-level override is provided, apply it (overrides the file)
+        if QUOTEX_SSID or QUOTEX_COOKIES:
+            qx_client.set_session(
+                user_agent=QUOTEX_USER_AGENT,
+                cookies=QUOTEX_COOKIES or None,
+                ssid=QUOTEX_SSID or None,
+            )
 
         # Add context *before* connect call
         logger.info(f"Adding user {user_id} to active_otp_requests BEFORE connect (under patch).")
-        if not bot_instance: raise ConnectionAbortedError("Bot instance not available for OTP context.")
+        # Allow startup pre-connect to proceed even before the Telegram bot is live.
+        if not bot_instance and interaction_type != "startup_preconnect":
+            raise ConnectionAbortedError("Bot instance not available for OTP context.")
         active_otp_requests[user_id] = {'qx_client': qx_client, 'doc_id': account_doc_id}
 
         # Activate patch state
@@ -952,8 +1027,12 @@ async def get_quotex_client(user_id: int, account_doc_id: str, interaction_type:
                 logger.info(f"Switched Quotex account {email} to {account_mode} mode.")
             except Exception as e_mode:
                 logger.error(f"Failed to switch account {email} to {account_mode}: {e_mode}", exc_info=True)
-                active_quotex_clients[account_doc_id] = qx_client
-                return qx_client, f"Connected but failed to switch to {account_mode} mode."
+                # Socket closed immediately after connect — the client is unusable; discard it
+                try:
+                    await qx_client.close()
+                except Exception:
+                    pass
+                return None, f"Connection Failed: socket closed before account mode could be set ({e_mode})"
 
             active_quotex_clients[account_doc_id] = qx_client
             return qx_client, f"Connected successfully in {account_mode} mode."
@@ -970,6 +1049,18 @@ async def get_quotex_client(user_id: int, account_doc_id: str, interaction_type:
             elif "Token rejected" in reason_str:
                 # ...(delete session file logic)...
                 return None, "Connection Failed: Token rejected. Session deleted."
+            elif (
+                "403" in reason_str
+                or "forbidden" in reason_str.lower()
+                or "cf-mitigated" in reason_str.lower()
+                or "just a moment" in reason_str.lower()
+                or "cloudflare" in reason_str.lower()
+            ):
+                return None, (
+                    "Connection blocked by Quotex/Cloudflare anti-bot challenge. "
+                    "Use a valid Quotex session token/cookies (QUOTEX_SSID/QUOTEX_COOKIES) "
+                    "or run from an environment/IP that can pass browser challenge."
+                )
             else:
                  return None, f"Connection Failed: {reason_str}"
 
@@ -1120,7 +1211,10 @@ def manage_role_keyboard(role_name: str) -> InlineKeyboardMarkup: # role_name = 
 
 # --- Command Handlers ---
 
-@Client.on_message(filters.command("start") & filters.private)
+@Client.on_message(
+    (filters.command(["start", "hello", "menu"]) | filters.regex(r'^(hi|/)$', re.IGNORECASE))
+    & filters.private
+)
 async def start_command(client: Client, message: Message):
     global bot_instance # Store the client instance
     if not bot_instance: bot_instance = client
@@ -1295,34 +1389,67 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
         if qx_client:
             try:
                 if action == "profile":
-                    profile = await qx_client.get_profile() # Profile often includes both balances
+                    try:
+                        profile = await qx_client.get_profile()
+                    except TypeError as _te:
+                        # Stale session — evict and reconnect once
+                        await disconnect_quotex_client(account_doc_id)
+                        qx_client, _status = await get_quotex_client(user_id, account_doc_id, "profile_retry")
+                        try:
+                            profile = await qx_client.get_profile() if qx_client else None
+                        except Exception:
+                            profile = None
                     if profile:
-                        #current_mode = qx_client.account_type # Check instance mode
-                        #balance_val = profile.live_balance if current_mode == 'REAL' else profile.demo_balance
-                        text += f"**🆔 ID: `{profile.profile_id}`**\n"
+                        pid   = getattr(profile, 'profile_id',   'N/A')
+                        demo  = getattr(profile, 'demo_balance',  'N/A')
+                        real  = getattr(profile, 'live_balance',  'N/A')
+                        nick  = getattr(profile, 'nick_name',     'N/A')
+                        avatar= getattr(profile, 'avatar',        'N/A')
+                        country=getattr(profile,'country_name',  'N/A')
+                        try:
+                            real = f"{float(real):.2f}"
+                        except (TypeError, ValueError):
+                            pass
+                        text += f"**🆔 ID: `{pid}`**\n"
                         text += f"**💰 Current Balance:**\n\n"
-                        text += f" - 🪙 Demo: `{float(profile.demo_balance)}`\n"
-                        text += f" - 💵 Real: `{float(profile.live_balance):.2f}`\n"
-                        text += f"**👤 User Name: {profile.nick_name}**\n"
-                        text += f"**🖼️ Avatar: {profile.avatar}**\n"
-                        text += f"**🌍 Country: {profile.country_name}**\n"
+                        text += f" - 🪙 Demo: `{demo}`\n"
+                        text += f" - 💵 Real: `{real}`\n"
+                        text += f"**👤 User Name: {nick}**\n"
+                        text += f"**🖼️ Avatar: {avatar}**\n"
+                        text += f"**🌍 Country: {country}**\n"
                     else:
                         text += "❌ Failed to retrieve profile details."
                 elif action == "balance":
-                    # Get current settings for account mode before fetching balance
-                    #settings = await get_or_create_trade_settings(account_doc_id)
-                    #current_mode = settings.get("account_mode", "PRACTICE")
-                    # Balance from profile is often sufficient and quicker
-                    #balance = await qx_client.get_balance() # Uses currently set mode
+                    async def _fetch_profile(client):
+                        """Fetch profile, raising on stale-session NoneType errors."""
+                        try:
+                            return await client.get_profile()
+                        except TypeError as _te:
+                            raise ConnectionError(f"Stale session: {_te}") from _te
 
-                    profile = await qx_client.get_profile() # Profile often includes both balances
+                    try:
+                        profile = await _fetch_profile(qx_client)
+                    except ConnectionError:
+                        # Session went stale — evict cache and reconnect once
+                        await disconnect_quotex_client(account_doc_id)
+                        qx_client, status_msg = await get_quotex_client(user_id, account_doc_id, "balance_retry")
+                        if qx_client:
+                            try:
+                                profile = await _fetch_profile(qx_client)
+                            except Exception as _retry_err:
+                                profile = None
+                                text += f"❌ Reconnected but still failed to get balance: {_retry_err}"
+                        else:
+                            profile = None
+                            text += f"❌ Session expired and reconnect failed: {status_msg}"
+
                     if profile:
-                        #current_mode = qx_client.account_type # Check instance mode
-                        #balance_val = profile.live_balance if current_mode == 'REAL' else profile.demo_balance
+                        demo_bal = getattr(profile, 'demo_balance', 'N/A')
+                        real_bal = getattr(profile, 'live_balance', 'N/A')
                         text += f"**💰 Current Balance:**\n\n"
-                        text += f" - Demo: `{profile.demo_balance}`\n"
-                        text += f" - Real: `{profile.live_balance}`"
-                    else:
+                        text += f" - Demo: `{demo_bal}`\n"
+                        text += f" - Real: `{real_bal}`"
+                    elif '❌' not in text:
                         text += "❌ Failed to retrieve balance information (could not get profile)."
 
 
@@ -1885,11 +2012,13 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
         channel_id = sig_settings.get('channel_id', 'Not set')
         pending = sig_settings.get('pending_signal')
         signal_delay = int(sig_settings.get('signal_delay', 0))
+        dur_remap_on = sig_settings.get('duration_remap_enabled', False)
+        ask_dur_on = sig_settings.get('ask_duration_on_partial', False)
+        manual_on = sig_settings.get('manual_trade_mode', False)
         userbot_ok = userbot_instance is not None
 
         status_icon = "🟢" if is_active else "🔴"
         toggle_label = "🔴 Turn OFF" if is_active else "🟢 Turn ON"
-        delay_label = f"⏱ Delay: {signal_delay}s" if signal_delay > 0 else "⏱ Delay: OFF"
 
         text = (
             f"📡 **Signal Monitor**\n\n"
@@ -1897,6 +2026,10 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
             f"📺 Channel: `{channel_id}`\n"
             f"🤖 Userbot: **{'Running ✅' if userbot_ok else 'Not configured ❌'}**\n"
             f"⏱ Delay Compensation: **{f'{signal_delay}s subtracted from duration' if signal_delay > 0 else 'Disabled'}**\n"
+            f"🔄 2min→5min Remap: **{'ON ✅' if dur_remap_on else 'OFF'}**\n"
+            f"⏱ Ask Duration on Partial: **{'ON ✅' if ask_dur_on else 'OFF'}**\n"
+            f"🕹 Manual Trade Mode: **{'ON ✅' if manual_on else 'OFF'}**\n"
+            f"🔁 Inverse Mode: **{'ON ✅' if sig_settings.get('inverse_mode', False) else 'OFF'}**\n"
         )
         if pending:
             age_s = int(time.time() - pending.get('timestamp', 0))
@@ -1911,10 +2044,28 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
 
         delay_off_btn = InlineKeyboardButton("🚫 Disable Delay", callback_data="sig_delay_off")
         delay_set_btn = InlineKeyboardButton(f"✏️ Set Delay ({signal_delay}s)", callback_data="sig_delay_set")
+        remap_btn = InlineKeyboardButton(
+            f"🔄 2min→5min: {'ON ✅' if dur_remap_on else 'OFF'}",
+            callback_data="sig_dur_remap_toggle",
+        )
+        ask_dur_btn = InlineKeyboardButton(
+            f"⏱ Ask Duration: {'ON ✅' if ask_dur_on else 'OFF'}",
+            callback_data="sig_ask_dur_toggle",
+        )
+        manual_btn = InlineKeyboardButton(
+            f"🕹 Manual Mode: {'ON ✅' if manual_on else 'OFF'}",
+            callback_data="sig_manual_mode_toggle",
+        )
+        inverse_btn = InlineKeyboardButton(
+            f"🔁 Inverse Mode: {'ON ✅' if sig_settings.get('inverse_mode', False) else 'OFF'}",
+            callback_data="sig_inverse_toggle",
+        )
         keyboard = [
             [InlineKeyboardButton(toggle_label, callback_data="signal_toggle")],
             [InlineKeyboardButton("📺 Set Channel", callback_data="sig_set_channel")],
             [delay_set_btn, delay_off_btn],
+            [remap_btn, ask_dur_btn],
+            [manual_btn, inverse_btn],
             [InlineKeyboardButton("🗑 Clear Pending Signal", callback_data="signal_clear_pending")],
             [InlineKeyboardButton("📋 Signal Logs", callback_data="signal_logs_view")],
             back_button("main_menu"),
@@ -1973,6 +2124,8 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
             is_active2 = sig_settings2.get('is_active', False)
             channel_id2 = sig_settings2.get('channel_id', 'Not set')
             pending2 = sig_settings2.get('pending_signal')
+            dur_remap2 = sig_settings2.get('duration_remap_enabled', False)
+            ask_dur2 = sig_settings2.get('ask_duration_on_partial', False)
             userbot_ok2 = userbot_instance is not None
             status_icon2 = "🟢" if is_active2 else "🔴"
             toggle_label2 = "🔴 Turn OFF" if is_active2 else "🟢 Turn ON"
@@ -1982,6 +2135,10 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
                 f"📺 Channel: `{channel_id2}`\n"
                 f"🤖 Userbot: **{'Running ✅' if userbot_ok2 else 'Not configured ❌'}**\n"
                 f"⏱ Delay Compensation: **Disabled**\n"
+                f"🔄 2min→5min Remap: **{'ON ✅' if dur_remap2 else 'OFF'}**\n"
+                f"⏱ Ask Duration on Partial: **{'ON ✅' if ask_dur2 else 'OFF'}**\n"
+                f"🕹 Manual Trade Mode: **{'ON ✅' if sig_settings2.get('manual_trade_mode', False) else 'OFF'}**\n"
+                f"🔁 Inverse Mode: **{'ON ✅' if sig_settings2.get('inverse_mode', False) else 'OFF'}**\n"
             )
             if pending2:
                 age_s2 = int(time.time() - pending2.get('timestamp', 0))
@@ -1993,11 +2150,17 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
                 )
             else:
                 text2 += "\nNo pending signal.\n"
+            _man2 = sig_settings2.get('manual_trade_mode', False)
+            _inv2 = sig_settings2.get('inverse_mode', False)
             kb2 = [
                 [InlineKeyboardButton(toggle_label2, callback_data="signal_toggle")],
                 [InlineKeyboardButton("📺 Set Channel", callback_data="sig_set_channel")],
                 [InlineKeyboardButton("✏️ Set Delay (0s)", callback_data="sig_delay_set"),
                  InlineKeyboardButton("🚫 Disable Delay", callback_data="sig_delay_off")],
+                [InlineKeyboardButton(f"🔄 2min→5min: {'ON ✅' if dur_remap2 else 'OFF'}", callback_data="sig_dur_remap_toggle"),
+                 InlineKeyboardButton(f"⏱ Ask Duration: {'ON ✅' if ask_dur2 else 'OFF'}", callback_data="sig_ask_dur_toggle")],
+                [InlineKeyboardButton(f"🕹 Manual Mode: {'ON ✅' if _man2 else 'OFF'}", callback_data="sig_manual_mode_toggle"),
+                 InlineKeyboardButton(f"🔁 Inverse: {'ON ✅' if _inv2 else 'OFF'}", callback_data="sig_inverse_toggle")],
                 [InlineKeyboardButton("🗑 Clear Pending Signal", callback_data="signal_clear_pending")],
                 [InlineKeyboardButton("📋 Signal Logs", callback_data="signal_logs_view")],
                 back_button("main_menu"),
@@ -2022,6 +2185,262 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
                 )
             except Exception:
                 pass
+
+    # ── Signal Duration Remap Toggle ──────────────────────────────────────────
+
+    elif data == "sig_dur_remap_toggle":
+        if user_id != OWNER_ID:
+            await callback_query.answer("⛔️ Owner only.", show_alert=True)
+            return
+        sig_settings = await get_signal_settings()
+        new_val = not sig_settings.get('duration_remap_enabled', False)
+        await update_signal_settings({'duration_remap_enabled': new_val})
+        await callback_query.answer(f"2min→5min remap {'enabled' if new_val else 'disabled'}.")
+        logger.info(f"[Signal] Duration remap (2min→5min) {'enabled' if new_val else 'disabled'} by user {user_id}")
+        # Re-render the signal monitor panel
+        callback_query.data = "signal_status_view"
+        sig_s = await get_signal_settings()
+        is_active_r = sig_s.get('is_active', False)
+        s_icon = "🟢" if is_active_r else "🔴"
+        t_label = "🔴 Turn OFF" if is_active_r else "🟢 Turn ON"
+        sd = int(sig_s.get('signal_delay', 0))
+        dr = sig_s.get('duration_remap_enabled', False)
+        ad = sig_s.get('ask_duration_on_partial', False)
+        pend_r = sig_s.get('pending_signal')
+        ch_r = sig_s.get('channel_id', 'Not set')
+        ub_r = userbot_instance is not None
+        txt_r = (
+            f"📡 **Signal Monitor**\n\n"
+            f"{s_icon} Status: **{'ON' if is_active_r else 'OFF'}**\n"
+            f"📺 Channel: `{ch_r}`\n"
+            f"🤖 Userbot: **{'Running ✅' if ub_r else 'Not configured ❌'}**\n"
+            f"⏱ Delay Compensation: **{f'{sd}s subtracted from duration' if sd > 0 else 'Disabled'}**\n"
+            f"🔄 2min→5min Remap: **{'ON ✅' if dr else 'OFF'}**\n"
+            f"⏱ Ask Duration on Partial: **{'ON ✅' if ad else 'OFF'}**\n"
+            f"🕹 Manual Trade Mode: **{'ON ✅' if sig_s.get('manual_trade_mode', False) else 'OFF'}**\n"
+            f"🔁 Inverse Mode: **{'ON ✅' if sig_s.get('inverse_mode', False) else 'OFF'}**\n"
+        )
+        if pend_r:
+            age_r = int(time.time() - pend_r.get('timestamp', 0))
+            txt_r += (
+                f"\n⏳ **Pending Signal** (awaiting direction):\n"
+                f"  `{pend_r.get('asset_display', pend_r.get('asset'))}` "
+                f"${pend_r.get('amount')} {pend_r.get('duration', 0) // 60}min "
+                f"— {age_r}s ago {'⚠️ expired' if age_r > 300 else ''}\n"
+            )
+        else:
+            txt_r += "\nNo pending signal.\n"
+        _man_r = sig_s.get('manual_trade_mode', False)
+        _inv_r = sig_s.get('inverse_mode', False)
+        kb_r = [
+            [InlineKeyboardButton(t_label, callback_data="signal_toggle")],
+            [InlineKeyboardButton("📺 Set Channel", callback_data="sig_set_channel")],
+            [InlineKeyboardButton(f"✏️ Set Delay ({sd}s)", callback_data="sig_delay_set"),
+             InlineKeyboardButton("🚫 Disable Delay", callback_data="sig_delay_off")],
+            [InlineKeyboardButton(f"🔄 2min→5min: {'ON ✅' if dr else 'OFF'}", callback_data="sig_dur_remap_toggle"),
+             InlineKeyboardButton(f"⏱ Ask Duration: {'ON ✅' if ad else 'OFF'}", callback_data="sig_ask_dur_toggle")],
+            [InlineKeyboardButton(f"🕹 Manual Mode: {'ON ✅' if _man_r else 'OFF'}", callback_data="sig_manual_mode_toggle"),
+             InlineKeyboardButton(f"🔁 Inverse: {'ON ✅' if _inv_r else 'OFF'}", callback_data="sig_inverse_toggle")],
+            [InlineKeyboardButton("🗑 Clear Pending Signal", callback_data="signal_clear_pending")],
+            [InlineKeyboardButton("📋 Signal Logs", callback_data="signal_logs_view")],
+            back_button("main_menu"),
+        ]
+        try:
+            await message.edit_text(txt_r, reply_markup=InlineKeyboardMarkup(kb_r))
+        except Exception as e:
+            if "MESSAGE_NOT_MODIFIED" not in str(e):
+                raise
+
+    # ── Ask Duration on Partial Toggle ────────────────────────────────────────
+
+    elif data == "sig_ask_dur_toggle":
+        if user_id != OWNER_ID:
+            await callback_query.answer("⛔️ Owner only.", show_alert=True)
+            return
+        sig_settings = await get_signal_settings()
+        new_val = not sig_settings.get('ask_duration_on_partial', False)
+        await update_signal_settings({'ask_duration_on_partial': new_val})
+        await callback_query.answer(f"Ask duration on partial {'enabled' if new_val else 'disabled'}.")
+        logger.info(f"[Signal] Ask duration on partial {'enabled' if new_val else 'disabled'} by user {user_id}")
+        # Re-render the signal monitor panel
+        callback_query.data = "signal_status_view"
+        sig_s = await get_signal_settings()
+        is_active_q = sig_s.get('is_active', False)
+        s_icon_q = "🟢" if is_active_q else "🔴"
+        t_label_q = "🔴 Turn OFF" if is_active_q else "🟢 Turn ON"
+        sd_q = int(sig_s.get('signal_delay', 0))
+        dr_q = sig_s.get('duration_remap_enabled', False)
+        ad_q = sig_s.get('ask_duration_on_partial', False)
+        pend_q = sig_s.get('pending_signal')
+        ch_q = sig_s.get('channel_id', 'Not set')
+        ub_q = userbot_instance is not None
+        txt_q = (
+            f"📡 **Signal Monitor**\n\n"
+            f"{s_icon_q} Status: **{'ON' if is_active_q else 'OFF'}**\n"
+            f"📺 Channel: `{ch_q}`\n"
+            f"🤖 Userbot: **{'Running ✅' if ub_q else 'Not configured ❌'}**\n"
+            f"⏱ Delay Compensation: **{f'{sd_q}s subtracted from duration' if sd_q > 0 else 'Disabled'}**\n"
+            f"🔄 2min→5min Remap: **{'ON ✅' if dr_q else 'OFF'}**\n"
+            f"⏱ Ask Duration on Partial: **{'ON ✅' if ad_q else 'OFF'}**\n"
+            f"🕹 Manual Trade Mode: **{'ON ✅' if sig_s.get('manual_trade_mode', False) else 'OFF'}**\n"
+            f"🔁 Inverse Mode: **{'ON ✅' if sig_s.get('inverse_mode', False) else 'OFF'}**\n"
+        )
+        if pend_q:
+            age_q = int(time.time() - pend_q.get('timestamp', 0))
+            txt_q += (
+                f"\n⏳ **Pending Signal** (awaiting direction):\n"
+                f"  `{pend_q.get('asset_display', pend_q.get('asset'))}` "
+                f"${pend_q.get('amount')} {pend_q.get('duration', 0) // 60}min "
+                f"— {age_q}s ago {'⚠️ expired' if age_q > 300 else ''}\n"
+            )
+        else:
+            txt_q += "\nNo pending signal.\n"
+        _man_q = sig_s.get('manual_trade_mode', False)
+        _inv_q = sig_s.get('inverse_mode', False)
+        kb_q = [
+            [InlineKeyboardButton(t_label_q, callback_data="signal_toggle")],
+            [InlineKeyboardButton("📺 Set Channel", callback_data="sig_set_channel")],
+            [InlineKeyboardButton(f"✏️ Set Delay ({sd_q}s)", callback_data="sig_delay_set"),
+             InlineKeyboardButton("🚫 Disable Delay", callback_data="sig_delay_off")],
+            [InlineKeyboardButton(f"🔄 2min→5min: {'ON ✅' if dr_q else 'OFF'}", callback_data="sig_dur_remap_toggle"),
+             InlineKeyboardButton(f"⏱ Ask Duration: {'ON ✅' if ad_q else 'OFF'}", callback_data="sig_ask_dur_toggle")],
+            [InlineKeyboardButton(f"🕹 Manual Mode: {'ON ✅' if _man_q else 'OFF'}", callback_data="sig_manual_mode_toggle"),
+             InlineKeyboardButton(f"🔁 Inverse: {'ON ✅' if _inv_q else 'OFF'}", callback_data="sig_inverse_toggle")],
+            [InlineKeyboardButton("🗑 Clear Pending Signal", callback_data="signal_clear_pending")],
+            [InlineKeyboardButton("📋 Signal Logs", callback_data="signal_logs_view")],
+            back_button("main_menu"),
+        ]
+        try:
+            await message.edit_text(txt_q, reply_markup=InlineKeyboardMarkup(kb_q))
+        except Exception as e:
+            if "MESSAGE_NOT_MODIFIED" not in str(e):
+                raise
+
+    # ── Manual Trade Mode Toggle ──────────────────────────────────────────────
+
+    elif data == "sig_manual_mode_toggle":
+        if user_id != OWNER_ID:
+            await callback_query.answer("⛔️ Owner only.", show_alert=True)
+            return
+        sig_settings = await get_signal_settings()
+        new_val = not sig_settings.get('manual_trade_mode', False)
+        await update_signal_settings({'manual_trade_mode': new_val})
+        await callback_query.answer(f"Manual trade mode {'enabled' if new_val else 'disabled'}.")
+        logger.info(f"[Signal] Manual trade mode {'enabled' if new_val else 'disabled'} by user {user_id}")
+        # Re-render the signal monitor panel by re-using the main view path
+        sig_sm = await get_signal_settings()
+        is_am = sig_sm.get('is_active', False)
+        ch_m = sig_sm.get('channel_id', 'Not set')
+        pend_m = sig_sm.get('pending_signal')
+        sd_m = int(sig_sm.get('signal_delay', 0))
+        dr_m = sig_sm.get('duration_remap_enabled', False)
+        ad_m = sig_sm.get('ask_duration_on_partial', False)
+        man_m = sig_sm.get('manual_trade_mode', False)
+        ub_m = userbot_instance is not None
+        s_icon_m = "🟢" if is_am else "🔴"
+        t_label_m = "🔴 Turn OFF" if is_am else "🟢 Turn ON"
+        txt_m = (
+            f"📡 **Signal Monitor**\n\n"
+            f"{s_icon_m} Status: **{'ON' if is_am else 'OFF'}**\n"
+            f"📺 Channel: `{ch_m}`\n"
+            f"🤖 Userbot: **{'Running ✅' if ub_m else 'Not configured ❌'}**\n"
+            f"⏱ Delay Compensation: **{f'{sd_m}s subtracted from duration' if sd_m > 0 else 'Disabled'}**\n"
+            f"🔄 2min→5min Remap: **{'ON ✅' if dr_m else 'OFF'}**\n"
+            f"⏱ Ask Duration on Partial: **{'ON ✅' if ad_m else 'OFF'}**\n"
+            f"🕹 Manual Trade Mode: **{'ON ✅' if man_m else 'OFF'}**\n"
+            f"🔁 Inverse Mode: **{'ON ✅' if sig_sm.get('inverse_mode', False) else 'OFF'}**\n"
+        )
+        if pend_m:
+            age_m = int(time.time() - pend_m.get('timestamp', 0))
+            txt_m += (
+                f"\n⏳ **Pending Signal** (awaiting direction):\n"
+                f"  `{pend_m.get('asset_display', pend_m.get('asset'))}` "
+                f"${pend_m.get('amount')} {pend_m.get('duration', 0) // 60}min "
+                f"— {age_m}s ago {'⚠️ expired' if age_m > 300 else ''}\n"
+            )
+        else:
+            txt_m += "\nNo pending signal.\n"
+        _inv_m = sig_sm.get('inverse_mode', False)
+        kb_m = [
+            [InlineKeyboardButton(t_label_m, callback_data="signal_toggle")],
+            [InlineKeyboardButton("📺 Set Channel", callback_data="sig_set_channel")],
+            [InlineKeyboardButton(f"✏️ Set Delay ({sd_m}s)", callback_data="sig_delay_set"),
+             InlineKeyboardButton("🚫 Disable Delay", callback_data="sig_delay_off")],
+            [InlineKeyboardButton(f"🔄 2min→5min: {'ON ✅' if dr_m else 'OFF'}", callback_data="sig_dur_remap_toggle"),
+             InlineKeyboardButton(f"⏱ Ask Duration: {'ON ✅' if ad_m else 'OFF'}", callback_data="sig_ask_dur_toggle")],
+            [InlineKeyboardButton(f"🕹 Manual Mode: {'ON ✅' if man_m else 'OFF'}", callback_data="sig_manual_mode_toggle"),
+             InlineKeyboardButton(f"🔁 Inverse: {'ON ✅' if _inv_m else 'OFF'}", callback_data="sig_inverse_toggle")],
+            [InlineKeyboardButton("🗑 Clear Pending Signal", callback_data="signal_clear_pending")],
+            [InlineKeyboardButton("📋 Signal Logs", callback_data="signal_logs_view")],
+            back_button("main_menu"),
+        ]
+        try:
+            await message.edit_text(txt_m, reply_markup=InlineKeyboardMarkup(kb_m))
+        except Exception as e:
+            if "MESSAGE_NOT_MODIFIED" not in str(e):
+                raise
+
+    elif data == "sig_inverse_toggle":
+        if user_id != OWNER_ID:
+            await callback_query.answer("⛔️ Owner only.", show_alert=True)
+            return
+        sig_settings = await get_signal_settings()
+        new_val = not sig_settings.get('inverse_mode', False)
+        await update_signal_settings({'inverse_mode': new_val})
+        await callback_query.answer(f"Inverse mode {'enabled' if new_val else 'disabled'}.")
+        logger.info(f"[Signal] Inverse mode {'enabled' if new_val else 'disabled'} by user {user_id}")
+        # Re-render the signal monitor panel
+        sig_si = await get_signal_settings()
+        is_ai = sig_si.get('is_active', False)
+        ch_i = sig_si.get('channel_id', 'Not set')
+        pend_i = sig_si.get('pending_signal')
+        sd_i = int(sig_si.get('signal_delay', 0))
+        dr_i = sig_si.get('duration_remap_enabled', False)
+        ad_i = sig_si.get('ask_duration_on_partial', False)
+        man_i = sig_si.get('manual_trade_mode', False)
+        inv_i = sig_si.get('inverse_mode', False)
+        ub_i = userbot_instance is not None
+        s_icon_i = "🟢" if is_ai else "🔴"
+        t_label_i = "🔴 Turn OFF" if is_ai else "🟢 Turn ON"
+        txt_i = (
+            f"📡 **Signal Monitor**\n\n"
+            f"{s_icon_i} Status: **{'ON' if is_ai else 'OFF'}**\n"
+            f"📺 Channel: `{ch_i}`\n"
+            f"🤖 Userbot: **{'Running ✅' if ub_i else 'Not configured ❌'}**\n"
+            f"⏱ Delay Compensation: **{f'{sd_i}s subtracted from duration' if sd_i > 0 else 'Disabled'}**\n"
+            f"🔄 2min→5min Remap: **{'ON ✅' if dr_i else 'OFF'}**\n"
+            f"⏱ Ask Duration on Partial: **{'ON ✅' if ad_i else 'OFF'}**\n"
+            f"🕹 Manual Trade Mode: **{'ON ✅' if man_i else 'OFF'}**\n"
+            f"🔀 Inverse Mode: **{'ON ✅' if inv_i else 'OFF'}**\n"
+        )
+        if pend_i:
+            age_i = int(time.time() - pend_i.get('timestamp', 0))
+            txt_i += (
+                f"\n⏳ **Pending Signal** (awaiting direction):\n"
+                f"  `{pend_i.get('asset_display', pend_i.get('asset'))}` "
+                f"${pend_i.get('amount')} {pend_i.get('duration', 0) // 60}min "
+                f"— {age_i}s ago {'⚠️ expired' if age_i > 300 else ''}\n"
+            )
+        else:
+            txt_i += "\nNo pending signal.\n"
+        kb_i = [
+            [InlineKeyboardButton(t_label_i, callback_data="signal_toggle")],
+            [InlineKeyboardButton("📺 Set Channel", callback_data="sig_set_channel")],
+            [InlineKeyboardButton(f"✏️ Set Delay ({sd_i}s)", callback_data="sig_delay_set"),
+             InlineKeyboardButton("🚫 Disable Delay", callback_data="sig_delay_off")],
+            [InlineKeyboardButton(f"🔄 2min→5min: {'ON ✅' if dr_i else 'OFF'}", callback_data="sig_dur_remap_toggle"),
+             InlineKeyboardButton(f"⏱ Ask Duration: {'ON ✅' if ad_i else 'OFF'}", callback_data="sig_ask_dur_toggle")],
+            [InlineKeyboardButton(f"🕹 Manual Mode: {'ON ✅' if man_i else 'OFF'}", callback_data="sig_manual_mode_toggle"),
+             InlineKeyboardButton(f"🔀 Inverse: {'ON ✅' if inv_i else 'OFF'}", callback_data="sig_inverse_toggle")],
+            [InlineKeyboardButton("🗑 Clear Pending Signal", callback_data="signal_clear_pending")],
+            [InlineKeyboardButton("📋 Signal Logs", callback_data="signal_logs_view")],
+            back_button("main_menu"),
+        ]
+        try:
+            await message.edit_text(txt_i, reply_markup=InlineKeyboardMarkup(kb_i))
+        except Exception as e:
+            if "MESSAGE_NOT_MODIFIED" not in str(e):
+                raise
 
     # ── Signal Amount Selection Callbacks ─────────────────────────────────────
 
@@ -2077,6 +2496,95 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
             )
         except Exception:
             pass
+
+    # ── Signal Duration Selection Callbacks ───────────────────────────────────
+
+    elif data.startswith("sig_dur:"):
+        if user_id != OWNER_ID:
+            return
+        sig_settings = await get_signal_settings()
+        pending = sig_settings.get('pending_signal')
+
+        if not pending:
+            try:
+                await message.edit_text("⚠️ No pending signal to set duration for.")
+            except Exception:
+                pass
+            return
+
+        try:
+            chosen_duration = int(data.split(":", 1)[1])
+        except (IndexError, ValueError):
+            return
+
+        pending['duration'] = chosen_duration
+        pending['duration_confirmed'] = True
+        await update_signal_settings({'pending_signal': pending})
+
+        dur_display = f"{chosen_duration // 60} min" if chosen_duration >= 60 else f"{chosen_duration} sec"
+        try:
+            await message.edit_text(
+                f"✅ **Duration set: {dur_display}**\n\n"
+                f"📊 Asset: `{pending.get('asset_display', pending.get('asset'))}`\n"
+                f"💵 Amount: `${pending.get('amount', 0):g}`\n\n"
+                f"⏳ Waiting for direction signal (UP/DOWN)..."
+            )
+        except Exception:
+            pass
+
+    # ── Manual Trade Direction Callbacks ──────────────────────────────────────
+
+    elif data in ("sig_manual_call", "sig_manual_put", "sig_manual_cancel"):
+        if user_id != OWNER_ID:
+            await callback_query.answer("⛔️ Owner only.", show_alert=True)
+            return
+
+        sig_settings = await get_signal_settings()
+        pending = sig_settings.get('pending_signal')
+
+        if not pending:
+            try:
+                await message.edit_text("⚠️ No pending signal found.")
+            except Exception:
+                pass
+            return
+
+        if data == "sig_manual_cancel":
+            await update_signal_settings({'pending_signal': None})
+            await callback_query.answer("Signal cancelled.")
+            try:
+                await message.edit_text("❌ Manual trade cancelled.")
+            except Exception:
+                pass
+            return
+
+        chosen_direction = 'call' if data == 'sig_manual_call' else 'put'
+
+        # Build the full signal using the pending data + chosen direction
+        full_manual_signal = {**pending, 'direction': chosen_direction}
+        await update_signal_settings({'pending_signal': None})
+
+        dir_icon = '🔼 UP (CALL)' if chosen_direction == 'call' else '🔽 DOWN (PUT)'
+        signal_dir = pending.get('signal_direction')
+        signal_agreed = (
+            f" _(matches signal ✅)_" if signal_dir == chosen_direction
+            else f" _(signal was {'🔼' if signal_dir == 'call' else '🔽'} — you chose opposite)_" if signal_dir
+            else ""
+        )
+
+        try:
+            await message.edit_text(
+                f"🚀 **Executing Manual Trade**\n\n"
+                f"📊 Asset: `{pending.get('asset_display', pending.get('asset'))}`\n"
+                f"📈 Direction: **{dir_icon}**{signal_agreed}\n"
+                f"💵 Amount: `${float(pending.get('amount', DEFAULT_TRADE_AMOUNT)):g}`\n\n"
+                f"⏳ Placing trade..."
+            )
+        except Exception:
+            pass
+
+        logger.info(f"[Manual Trade] User chose {chosen_direction.upper()} (signal was {signal_dir or 'N/A'})")
+        await execute_signal_trade(full_manual_signal)
 
     # ── Trading Journal ───────────────────────────────────────────────────────
 
@@ -2772,6 +3280,7 @@ async def message_handler(client: Client, message: Message):
             new_channel = raw if raw.startswith('@') else f'@{raw}'
 
         await update_signal_settings({'channel_id': new_channel})
+        logger.info(f"[Signal] Channel updated -> {new_channel} (set by user {user_id} via inline)")
 
         # Edit the prompt message
         if bot_instance and ch_msg_id:
@@ -2978,8 +3487,43 @@ def get_amount_tiers(balance: Optional[float]) -> list:
     return [15, 20, 25, 30, 35, 65, 125, 200, 300, 350]
 
 
+def build_manual_trade_keyboard(signal_direction: Optional[str] = None) -> InlineKeyboardMarkup:
+    """
+    Build the UP/DOWN inline keyboard for manual trade confirmation.
+    If signal_direction is provided, the matching button is highlighted with ⭐.
+    """
+    call_label = f"⭐ 🔼 UP (CALL)" if signal_direction == 'call' else "🔼 UP (CALL)"
+    put_label  = f"⭐ 🔽 DOWN (PUT)" if signal_direction == 'put'  else "🔽 DOWN (PUT)"
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(call_label, callback_data="sig_manual_call"),
+            InlineKeyboardButton(put_label,  callback_data="sig_manual_put"),
+        ],
+        [InlineKeyboardButton("❌ Skip / Cancel", callback_data="sig_manual_cancel")],
+    ])
+
+
+def build_duration_keyboard(signal_duration: int) -> InlineKeyboardMarkup:
+    """Build inline keyboard for duration selection before a signal trade."""
+    keyboard = [
+        [InlineKeyboardButton(
+            f"📊 Use Signal Duration ({signal_duration // 60}min{f' {signal_duration % 60}s' if signal_duration % 60 else ''})",
+            callback_data=f"sig_dur:{signal_duration}",
+        )]
+    ]
+    row: list = []
+    for d in [60, 120, 180, 300, 600]:  # 1, 2, 3, 5, 10 min
+        row.append(InlineKeyboardButton(f"{d // 60} min", callback_data=f"sig_dur:{d}"))
+        if len(row) == 3:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+    keyboard.append([InlineKeyboardButton("❌ Cancel Signal", callback_data="sig_amt_cancel")])
+    return InlineKeyboardMarkup(keyboard)
+
+
 def build_amount_keyboard(signal_amount: float, tiers: list) -> InlineKeyboardMarkup:
-    """Build inline keyboard for amount selection before a signal trade."""
     # First row: use signal amount
     keyboard = [
         [InlineKeyboardButton(f"📊 Use Signal Amount (${signal_amount:g})", callback_data=f"sig_amt:{signal_amount}")]
@@ -3025,8 +3569,26 @@ async def execute_signal_trade(signal: Dict[str, Any]):
         delay_note = ""
     # ─────────────────────────────────────────────────────────────────────────
 
+    # ── Duration remap (e.g. 2 min → 5 min) ──────────────────────────────────
+    _DURATION_REMAP = {120: 300}  # 2 min → 5 min
+    if sig_settings.get('duration_remap_enabled'):
+        _remapped = _DURATION_REMAP.get(duration)
+        if _remapped:
+            logger.info(f"[Signal Trade] Duration remapped {duration}s → {_remapped}s (remap rule active)")
+            duration = _remapped
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # ── Inverse mode (flip direction) ────────────────────────────────────────
+    original_direction = direction
+    if sig_settings.get('inverse_mode') and not sig_settings.get('manual_trade_mode'):
+        direction = 'put' if direction == 'call' else 'call'
+        logger.info(f"[Signal Trade] Inverse mode active — direction flipped {original_direction} → {direction}")
+    # ─────────────────────────────────────────────────────────────────────────
+
     dir_label = '🔼 BUY (CALL)' if direction == 'call' else '🔽 SELL (PUT)'
-    logger.info(f"[Signal Trade] {asset_display} | {dir_label} | ${amount} | {duration}s (signal: {raw_duration}s, delay: {signal_delay}s)")
+    inverse_note = f" _(inverted from {original_direction.upper()})_" if direction != original_direction else ""
+
+    logger.info(f"[Signal Trade] {asset_display} | {dir_label} | ${amount} | {duration}s (signal: {raw_duration}s, delay: {signal_delay}s){inverse_note}")
 
     if bot_instance:
         try:
@@ -3036,7 +3598,7 @@ async def execute_signal_trade(signal: Dict[str, Any]):
                 OWNER_ID,
                 f"🔔 **Signal Received — Executing Trades**\n\n"
                 f"📊 Asset: `{asset_display}`\n"
-                f"📈 Direction: **{dir_label}**\n"
+                f"📈 Direction: **{dir_label}**{inverse_note}\n"
                 f"💵 Amount: `${amount}`\n"
                 f"⏱ Duration: `{dur_display}`"
                 + (f" _(signal: {raw_dur_display}, −{signal_delay}s)_" if signal_delay > 0 else f" `({duration}s)`")
@@ -3339,7 +3901,51 @@ async def handle_channel_message(client: Client, message):
                             except Exception:
                                 pass
 
-                        await execute_signal_trade(full_signal)
+                        manual_mode = sig_settings.get('manual_trade_mode', False)
+                        if manual_mode:
+                            # Manual mode: update the pending signal with the arrived direction
+                            # and refresh/send the manual trade keyboard highlighting it
+                            full_signal['signal_direction'] = direction
+                            await update_signal_settings({'pending_signal': full_signal})
+                            logger.info(f"[Userbot] Manual mode — direction arrived ({direction}), awaiting user confirmation.")
+                            manual_msg_id = pending.get('manual_msg_id') or pending.get('amount_msg_id')
+                            if bot_instance:
+                                try:
+                                    dur_d = full_signal.get('duration', DEFAULT_TRADE_DURATION)
+                                    dur_disp_d = f"{dur_d // 60} min" if dur_d >= 60 else f"{dur_d} sec"
+                                    dir_icon_d = '🔼 UP (CALL)' if direction == 'call' else '🔽 DOWN (PUT)'
+                                    new_text = (
+                                        f"🖐 **Manual Trade — Direction Arrived**\n\n"
+                                        f"📊 Asset: `{full_signal.get('asset_display', full_signal.get('asset'))}`\n"
+                                        f"⏱ Duration: `{dur_disp_d}`\n"
+                                        f"💵 Amount: `${float(full_signal.get('amount', DEFAULT_TRADE_AMOUNT)):g}`\n\n"
+                                        f"📡 Signal says: **{dir_icon_d}**\n\n"
+                                        f"Choose your direction:"
+                                    )
+                                    if manual_msg_id:
+                                        try:
+                                            await bot_instance.edit_message_text(
+                                                chat_id=OWNER_ID,
+                                                message_id=manual_msg_id,
+                                                text=new_text,
+                                                reply_markup=build_manual_trade_keyboard(direction),
+                                            )
+                                        except Exception:
+                                            await bot_instance.send_message(
+                                                OWNER_ID, new_text,
+                                                reply_markup=build_manual_trade_keyboard(direction),
+                                            )
+                                    else:
+                                        sent = await bot_instance.send_message(
+                                            OWNER_ID, new_text,
+                                            reply_markup=build_manual_trade_keyboard(direction),
+                                        )
+                                        full_signal['manual_msg_id'] = sent.id
+                                        await update_signal_settings({'pending_signal': full_signal})
+                                except Exception as exc:
+                                    logger.warning(f"[Userbot] Could not update manual trade keyboard: {exc}")
+                        else:
+                            await execute_signal_trade(full_signal)
                     else:
                         logger.info("[Userbot] Pending signal expired (>5 min). Discarding.")
                         await update_signal_settings({'pending_signal': None})
@@ -3349,21 +3955,67 @@ async def handle_channel_message(client: Client, message):
             return
 
         if 'direction' in parsed:
-            # Full signal — execute immediately
+            # Full signal
             await log_signal_event('full', message, parsed)
-            await update_signal_settings({'pending_signal': None})
-            await execute_signal_trade(parsed)
+            manual_mode = sig_settings.get('manual_trade_mode', False)
+            if manual_mode:
+                # Manual mode: show UP/DOWN buttons with the signal direction pre-highlighted
+                sig_dir = parsed.get('direction')
+                sig_amt_f = float(parsed.get('amount', DEFAULT_TRADE_AMOUNT))
+                dur_f = int(parsed.get('duration', DEFAULT_TRADE_DURATION))
+                dur_disp_f = f"{dur_f // 60} min" if dur_f >= 60 else f"{dur_f} sec"
+                manual_pending = {
+                    'asset':              parsed['asset'],
+                    'asset_display':      parsed.get('asset_display', parsed['asset']),
+                    'duration':           dur_f,
+                    'amount':             sig_amt_f,
+                    'timestamp':          time.time(),
+                    'amount_confirmed':   True,
+                    'duration_confirmed': True,
+                    'amount_msg_id':      None,
+                    'duration_msg_id':    None,
+                    'signal_direction':   sig_dir,
+                    'manual_msg_id':      None,
+                }
+                await update_signal_settings({'pending_signal': manual_pending})
+                logger.info(f"[Userbot] Manual mode — full signal held for confirmation: {manual_pending}")
+                if bot_instance:
+                    try:
+                        dir_icon = '🔼 UP (CALL)' if sig_dir == 'call' else '🔽 DOWN (PUT)'
+                        manual_msg = await bot_instance.send_message(
+                            OWNER_ID,
+                            f"🖐 **Manual Trade — Confirm Direction**\n\n"
+                            f"📊 Asset: `{manual_pending['asset_display']}`\n"
+                            f"⏱ Duration: `{dur_disp_f}`\n"
+                            f"💵 Amount: `${sig_amt_f:g}`\n\n"
+                            f"📡 Signal says: **{dir_icon}**\n\n"
+                            f"Choose your direction:",
+                            reply_markup=build_manual_trade_keyboard(sig_dir),
+                        )
+                        manual_pending['manual_msg_id'] = manual_msg.id
+                        await update_signal_settings({'pending_signal': manual_pending})
+                    except Exception as exc:
+                        logger.warning(f"[Userbot] Could not send manual trade keyboard: {exc}")
+            else:
+                await update_signal_settings({'pending_signal': None})
+                await execute_signal_trade(parsed)
         else:
             # Partial signal — store and wait for direction follow-up
             sig_amount = float(parsed.get('amount', DEFAULT_TRADE_AMOUNT))
+            ask_dur = sig_settings.get('ask_duration_on_partial', False)
+            manual_mode = sig_settings.get('manual_trade_mode', False)
             pending = {
-                'asset':            parsed['asset'],
-                'asset_display':    parsed.get('asset_display', parsed['asset']),
-                'duration':         parsed.get('duration', DEFAULT_TRADE_DURATION),
-                'amount':           sig_amount,
-                'timestamp':        time.time(),
-                'amount_confirmed': False,
-                'amount_msg_id':    None,
+                'asset':              parsed['asset'],
+                'asset_display':      parsed.get('asset_display', parsed['asset']),
+                'duration':           parsed.get('duration', DEFAULT_TRADE_DURATION),
+                'amount':             sig_amount,
+                'timestamp':          time.time(),
+                'amount_confirmed':   False,
+                'amount_msg_id':      None,
+                'duration_confirmed': not ask_dur,  # pre-confirmed unless ask is enabled
+                'duration_msg_id':    None,
+                'signal_direction':   None,   # filled when direction arrives
+                'manual_msg_id':      None,
             }
             await update_signal_settings({'pending_signal': pending})
             await log_signal_event('partial', message, parsed)
@@ -3385,11 +4037,37 @@ async def handle_channel_message(client: Client, message):
                         f"_(Direction arriving soon — choose before it does)_",
                         reply_markup=build_amount_keyboard(sig_amount, tiers),
                     )
-                    # Store the message ID so we can edit it when amount is chosen
                     pending['amount_msg_id'] = amt_msg.id
                     await update_signal_settings({'pending_signal': pending})
+
+                    # Ask for duration override if the feature is enabled
+                    if ask_dur:
+                        dur_msg = await bot_instance.send_message(
+                            OWNER_ID,
+                            f"⏱ **Select Trade Duration**\n\n"
+                            f"📊 Asset: `{pending['asset_display']}`\n"
+                            f"Signal duration: `{dur_display}`\n\n"
+                            f"Choose the duration to use for this trade:",
+                            reply_markup=build_duration_keyboard(pending['duration']),
+                        )
+                        pending['duration_msg_id'] = dur_msg.id
+                        await update_signal_settings({'pending_signal': pending})
+
+                    # Manual mode: also show UP/DOWN keyboard immediately (no direction yet)
+                    if manual_mode:
+                        manual_msg = await bot_instance.send_message(
+                            OWNER_ID,
+                            f"🕹 **Manual Trade \u2014 Choose Direction**\n\n"
+                            f"📊 Asset: `{pending['asset_display']}`\n"
+                            f"⏱ Duration: `{dur_display}`\n\n"
+                            f"_(Direction signal not yet received \u2014 buttons will update when it arrives)_\n\n"
+                            f"Choose your direction:",
+                            reply_markup=build_manual_trade_keyboard(None),
+                        )
+                        pending['manual_msg_id'] = manual_msg.id
+                        await update_signal_settings({'pending_signal': pending})
                 except Exception as exc:
-                    logger.warning(f"[Userbot] Could not send amount keyboard: {exc}")
+                    logger.warning(f"[Userbot] Could not send amount/duration keyboard: {exc}")
 
     except Exception as e:
         logger.error(f"[Userbot] Error processing channel message: {e}", exc_info=True)
@@ -3476,6 +4154,7 @@ async def setchannel_command(client: Client, message: Message):
         new_channel = raw  # Store as username string
 
     await update_signal_settings({'channel_id': new_channel})
+    logger.info(f"[Signal] Channel updated -> {new_channel} (set by user {message.from_user.id} via /setchannel)")
     await message.reply_text(
         f"✅ Signal channel set to `{new_channel}`.\n\n"
         f"Use /signalmode to toggle monitoring ON/OFF.",
@@ -3614,6 +4293,66 @@ async def _quotex_keepalive():
                 logger.debug(f"[KeepAlive] {acct_id}: {exc}")
 
 
+async def preconnect_all_accounts():
+    """
+    At startup, Playwright-authenticate and pre-open WebSocket connections
+    for all owner Quotex accounts so signal execution is instant (0-3 s).
+    """
+    if quotex_accounts_db is None:
+        logger.warning("[Startup] DB not ready — skipping account pre-connect.")
+        return
+    accounts = await quotex_accounts_db.find({"user_id": OWNER_ID}).to_list(length=None)
+    if not accounts:
+        logger.info("[Startup] No Quotex accounts found for owner — nothing to pre-connect.")
+        return
+    logger.info(f"[Startup] Pre-connecting {len(accounts)} Quotex account(s) for owner {OWNER_ID} ...")
+    for acct in accounts:
+        account_doc_id = str(acct["_id"])
+        email = acct.get("email", "unknown")
+        try:
+            client, msg = await get_quotex_client(OWNER_ID, account_doc_id, "startup_preconnect")
+            if client:
+                logger.info(f"[Startup] Connected {email} — {msg}")
+            else:
+                logger.warning(f"[Startup] Could not connect {email} — {msg}")
+        except Exception as exc:
+            logger.error(f"[Startup] Error pre-connecting {email}: {exc}", exc_info=True)
+
+
+async def _userbot_watchdog(ubot: Client):
+    """
+    Periodically checks the userbot connection health and performs a clean
+    stop/start recovery if it has gone dead (e.g. after a Telegram DC dropped
+    the TCP connection and the concurrent-restart race corrupted the session).
+    """
+    global userbot_instance
+    INTERVAL = 45  # seconds between health checks
+    await asyncio.sleep(INTERVAL)  # initial grace period after startup
+    while True:
+        try:
+            # A lightweight API call — throws if the connection is broken.
+            await ubot.get_me()
+        except asyncio.CancelledError:
+            break
+        except Exception as probe_err:
+            logger.warning(f"[Userbot] Watchdog: health check failed ({probe_err}), attempting recovery...")
+            # Full stop → start cycle to get a clean connection
+            try:
+                await asyncio.wait_for(ubot.stop(), timeout=10)
+            except Exception:
+                pass
+            await asyncio.sleep(3)
+            try:
+                await ubot.start()
+                userbot_instance = ubot
+                logger.info("[Userbot] Watchdog: userbot recovered successfully.")
+            except Exception as start_err:
+                logger.error(f"[Userbot] Watchdog: recovery failed: {start_err}", exc_info=True)
+                # Back off before retrying
+                await asyncio.sleep(30)
+        await asyncio.sleep(INTERVAL)
+
+
 async def run_bot():
     global bot_instance, main_event_loop
     await setup_database()
@@ -3628,7 +4367,10 @@ async def run_bot():
     # Add handlers using the proper pyrogram.handlers classes
     from pyrogram.handlers import MessageHandler, CallbackQueryHandler
 
-    app.add_handler(MessageHandler(start_command, filters.command("start") & filters.private))
+    app.add_handler(MessageHandler(start_command,
+        (filters.command(["start", "hello", "menu"]) | filters.regex(r'^(hi|/)$', re.IGNORECASE))
+        & filters.private
+    ))
     app.add_handler(MessageHandler(help_command, filters.command("help") & filters.private))
     app.add_handler(MessageHandler(broadcast_command_handler, filters.command("broadcast") & filters.private))  # Has own perm check
     # Signal trading commands
@@ -3650,6 +4392,10 @@ async def run_bot():
         bot_info = await app.get_me()
         logger.info(f"Bot started as @{bot_info.username} (ID: {bot_info.id})")
 
+        # Pre-connect all owner accounts NOW that bot_instance is set.
+        # Sessions were already fetched via Playwright — this just opens the WebSocket.
+        asyncio.create_task(preconnect_all_accounts())
+
         # Start the userbot if configured
         if ubot:
             try:
@@ -3661,6 +4407,7 @@ async def run_bot():
                 )
                 await ubot.start()
                 logger.info("[Userbot] Userbot started and listening for signals.")
+                asyncio.create_task(_userbot_watchdog(ubot))
             except Exception as ub_err:
                 logger.error(f"[Userbot] Failed to start userbot: {ub_err}", exc_info=True)
 
