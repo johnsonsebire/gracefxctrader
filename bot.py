@@ -37,6 +37,41 @@ except ImportError:
     print("Error: Pyrofork not found. Install it: pip install pyrofork tgcrypto")
     sys.exit(1)
 
+# ── Monkey-patch pyrogram Session.restart ───────────────────────────────────
+# Pyrogram maintains multiple concurrent DC sessions.  When connectivity is
+# lost all of them try to restart() simultaneously on the same session object,
+# racing on recv_task and producing:
+#   RuntimeError: read() called while another coroutine is already waiting
+# Fix: serialise restart() per session instance; drop duplicate callers.
+try:
+    from pyrogram.session import Session as _PyrSession
+    _orig_session_restart = _PyrSession.restart
+
+    async def _patched_session_restart(self) -> None:  # type: ignore[override]
+        # Lazily create a per-session asyncio lock (asyncio is single-threaded,
+        # so the getattr/setattr sequence is race-free).
+        lock = getattr(self, '_restart_lock', None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._restart_lock = lock  # type: ignore[attr-defined]
+        if lock.locked():
+            # Another coroutine is already restarting this session — skip.
+            return
+        async with lock:
+            try:
+                await _orig_session_restart(self)
+            except RuntimeError as _e:
+                if 'read() called while another coroutine' in str(_e):
+                    pass  # silently swallow the known concurrent-read race
+                else:
+                    raise
+
+    _PyrSession.restart = _patched_session_restart  # type: ignore[method-assign]
+except Exception as _patch_err:
+    import warnings
+    warnings.warn(f"[Startup] Could not patch Session.restart: {_patch_err}")
+# ────────────────────────────────────────────────────────────────────────────
+
 try:
     import motor.motor_asyncio
 except ImportError:
@@ -172,6 +207,7 @@ except Exception as e:
 # --- Global Variables & Bot Initialization ---
 bot_instance: Optional[Client] = None
 userbot_instance: Optional[Client] = None  # MTProto user session for channel monitoring
+_ubot_restart_lock: asyncio.Lock = asyncio.Lock()  # serialises watchdog restarts
 db = None  # Database client
 main_event_loop = None # <<< ADD THIS GLOBAL VARIABLE
 users_db = None # Collection for users, roles, basic settings
@@ -679,18 +715,30 @@ async def get_signal_settings() -> Dict[str, Any]:
         return {}
     doc = await signal_settings_db.find_one({'owner_id': OWNER_ID})
     if not doc:
+        initial_channels = [{'id': str(SIGNAL_CHANNEL_ID), 'active': True}] if SIGNAL_CHANNEL_ID else []
         doc = {
             'owner_id': OWNER_ID,
-            'channel_id': SIGNAL_CHANNEL_ID,  # pre-seed from .env if set
+            'channel_id': SIGNAL_CHANNEL_ID,  # legacy field kept for compat
+            'channels': initial_channels,
             'is_active': False,
             'pending_signal': None,
-            'signal_delay': 15,          # seconds to subtract from duration at execution (0 = disabled)
-            'duration_remap_enabled': False,   # remap 2-min signals to 5-min
-            'ask_duration_on_partial': False,  # show duration selector when a partial signal arrives
-            'manual_trade_mode': False,        # require manual UP/DOWN confirmation before executing
-            'inverse_mode': False,             # flip direction: CALL→PUT, PUT→CALL
+            'signal_delay': 15,
+            'duration_remap_enabled': False,
+            'ask_duration_on_partial': False,
+            'manual_trade_mode': False,
+            'inverse_mode': False,
         }
         await signal_settings_db.insert_one(doc)
+    else:
+        # One-time migration: promote legacy channel_id → channels list
+        if 'channels' not in doc:
+            legacy_ch = doc.get('channel_id')
+            migrated = [{'id': str(legacy_ch), 'active': True}] if legacy_ch else []
+            await signal_settings_db.update_one(
+                {'owner_id': OWNER_ID},
+                {'$set': {'channels': migrated}}
+            )
+            doc['channels'] = migrated
     return doc
 
 async def update_signal_settings(data: dict):
@@ -703,6 +751,49 @@ async def update_signal_settings(data: dict):
         {'$set': data},
         upsert=True
     )
+
+
+def _channels_summary(sig_settings: dict) -> str:
+    """Short summary of channels for the Signal Monitor panel status line."""
+    channels = sig_settings.get('channels', [])
+    if not channels:
+        return 'None configured'
+    active = sum(1 for c in channels if c.get('active', True))
+    return f"{active}/{len(channels)} active"
+
+
+def _channels_panel_text(channels: list) -> str:
+    """Text body for the Manage Channels panel."""
+    text = "📺 **Signal Channels**\n\n"
+    if not channels:
+        text += "No channels configured yet.\n\nAdd a channel below to start monitoring signals."
+    else:
+        for idx, ch in enumerate(channels, 1):
+            ch_id = str(ch.get('id', ''))
+            active = ch.get('active', True)
+            icon = '🟢' if active else '🔴'
+            text += f"{idx}. `{ch_id}` — {icon} {'**Active**' if active else 'Inactive'}\n"
+        text += "\nTap a channel to toggle it ON/OFF. Tap 🗑 to remove."
+    return text
+
+
+def _channels_panel_keyboard(channels: list) -> list:
+    """Keyboard rows for the Manage Channels panel."""
+    rows = []
+    for idx, ch in enumerate(channels):
+        ch_id = str(ch.get('id', ''))
+        active = ch.get('active', True)
+        display = ch_id if len(ch_id) <= 22 else ch_id[:19] + '…'
+        rows.append([
+            InlineKeyboardButton(
+                f"{'🟢' if active else '🔴'} {display}",
+                callback_data=f"sig_ch_toggle:{idx}",
+            ),
+            InlineKeyboardButton("🗑", callback_data=f"sig_ch_remove:{idx}"),
+        ])
+    rows.append([InlineKeyboardButton("➕ Add Channel", callback_data="sig_channel_add")])
+    rows.append(back_button("signal_status_view"))
+    return rows
 
 # --- Permission Decorators ---
 def owner_only(func):
@@ -1993,8 +2084,9 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
         if data == "signal_toggle":
             sig_settings = await get_signal_settings()
             new_status = not sig_settings.get('is_active', False)
-            if new_status and not sig_settings.get('channel_id'):
-                await callback_query.answer("Set a channel first using the Set Channel button.", show_alert=True)
+            _active_chs = [c for c in sig_settings.get('channels', []) if c.get('active', True)]
+            if new_status and not _active_chs:
+                await callback_query.answer("Add and activate at least one channel first.", show_alert=True)
                 return
             if new_status and not userbot_instance:
                 await callback_query.answer("Userbot not configured (USERBOT_PHONE missing)", show_alert=True)
@@ -2023,7 +2115,7 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
         text = (
             f"📡 **Signal Monitor**\n\n"
             f"{status_icon} Status: **{'ON' if is_active else 'OFF'}**\n"
-            f"📺 Channel: `{channel_id}`\n"
+            f"📺 Channels: {_channels_summary(sig_settings)}\n"
             f"🤖 Userbot: **{'Running ✅' if userbot_ok else 'Not configured ❌'}**\n"
             f"⏱ Delay Compensation: **{f'{signal_delay}s subtracted from duration' if signal_delay > 0 else 'Disabled'}**\n"
             f"🔄 2min→5min Remap: **{'ON ✅' if dur_remap_on else 'OFF'}**\n"
@@ -2062,7 +2154,7 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
         )
         keyboard = [
             [InlineKeyboardButton(toggle_label, callback_data="signal_toggle")],
-            [InlineKeyboardButton("📺 Set Channel", callback_data="sig_set_channel")],
+            [InlineKeyboardButton("📺 Manage Channels", callback_data="sig_channels_view")],
             [delay_set_btn, delay_off_btn],
             [remap_btn, ask_dur_btn],
             [manual_btn, inverse_btn],
@@ -2086,27 +2178,101 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
             return
         await _send_signal_logs(message, edit=True)
 
-    # ── Signal Set Channel Callback ─────────────────────────────────────────────
+    # ── Signal Channels Management ────────────────────────────────────────────────
 
-    elif data == "sig_set_channel":
+    elif data in ("sig_channels_view", "sig_set_channel"):
+        # sig_set_channel retained as alias for any cached/old button presses
         if user_id != OWNER_ID:
             await callback_query.answer("⛔️ Owner only.", show_alert=True)
             return
-        user_states[user_id] = f"waiting_signal_channel:{message.id}"
         sig_settings = await get_signal_settings()
-        current_ch = sig_settings.get('channel_id', 'Not set')
+        channels = sig_settings.get('channels', [])
         try:
             await message.edit_text(
-                f"📺 **Set Signal Channel**\n\n"
-                f"Current channel: `{current_ch}`\n\n"
-                f"Send the **channel ID** or **@username** to monitor for signals.\n\n"
-                f"Examples:\n"
-                f"  • `-1001234567890` _(numeric ID — recommended)_\n"
-                f"  • `@mysignalchannel` _(public username)_\n\n"
-                f"Send /cancel to keep the current setting.",
+                _channels_panel_text(channels),
+                reply_markup=InlineKeyboardMarkup(_channels_panel_keyboard(channels)),
+            )
+        except Exception as _e:
+            if "MESSAGE_NOT_MODIFIED" not in str(_e):
+                raise
+
+    elif data == "sig_channel_add":
+        if user_id != OWNER_ID:
+            await callback_query.answer("⛔️ Owner only.", show_alert=True)
+            return
+        user_states[user_id] = f"waiting_signal_channel_add:{message.id}"
+        try:
+            await message.edit_text(
+                "📺 **Add Signal Channel**\n\n"
+                "Send the **channel ID** or **@username** to add.\n\n"
+                "Examples:\n"
+                "  • `-1001234567890` _(numeric ID — recommended)_\n"
+                "  • `@mysignalchannel` _(public username)_\n\n"
+                "Send /cancel to go back.",
             )
         except Exception:
             pass
+
+    elif data.startswith("sig_ch_toggle:"):
+        if user_id != OWNER_ID:
+            await callback_query.answer("⛔️ Owner only.", show_alert=True)
+            return
+        try:
+            ch_idx = int(data.split(":", 1)[1])
+        except (ValueError, IndexError):
+            await callback_query.answer("Invalid.", show_alert=True)
+            return
+        sig_settings = await get_signal_settings()
+        channels = list(sig_settings.get('channels', []))
+        if 0 <= ch_idx < len(channels):
+            channels[ch_idx]['active'] = not channels[ch_idx].get('active', True)
+            await update_signal_settings({'channels': channels})
+            state_str = 'activated' if channels[ch_idx]['active'] else 'paused'
+            await callback_query.answer(f"Channel {state_str}.")
+            logger.info(f"[Signal] Channel {channels[ch_idx]['id']} {state_str} by user {user_id}")
+        else:
+            await callback_query.answer("Channel not found.", show_alert=True)
+            return
+        sig_settings2 = await get_signal_settings()
+        chs2 = sig_settings2.get('channels', [])
+        try:
+            await message.edit_text(
+                _channels_panel_text(chs2),
+                reply_markup=InlineKeyboardMarkup(_channels_panel_keyboard(chs2)),
+            )
+        except Exception as _e:
+            if "MESSAGE_NOT_MODIFIED" not in str(_e):
+                raise
+
+    elif data.startswith("sig_ch_remove:"):
+        if user_id != OWNER_ID:
+            await callback_query.answer("⛔️ Owner only.", show_alert=True)
+            return
+        try:
+            ch_idx = int(data.split(":", 1)[1])
+        except (ValueError, IndexError):
+            await callback_query.answer("Invalid.", show_alert=True)
+            return
+        sig_settings = await get_signal_settings()
+        channels = list(sig_settings.get('channels', []))
+        if 0 <= ch_idx < len(channels):
+            removed = channels.pop(ch_idx)
+            await update_signal_settings({'channels': channels})
+            await callback_query.answer(f"Removed {removed.get('id', 'channel')}.")
+            logger.info(f"[Signal] Channel {removed.get('id')} removed by user {user_id}")
+        else:
+            await callback_query.answer("Channel not found.", show_alert=True)
+            return
+        sig_settings2 = await get_signal_settings()
+        chs2 = sig_settings2.get('channels', [])
+        try:
+            await message.edit_text(
+                _channels_panel_text(chs2),
+                reply_markup=InlineKeyboardMarkup(_channels_panel_keyboard(chs2)),
+            )
+        except Exception as _e:
+            if "MESSAGE_NOT_MODIFIED" not in str(_e):
+                raise
 
     # ── Signal Delay Callbacks ────────────────────────────────────────────────
 
@@ -2132,7 +2298,7 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
             text2 = (
                 f"📡 **Signal Monitor**\n\n"
                 f"{status_icon2} Status: **{'ON' if is_active2 else 'OFF'}**\n"
-                f"📺 Channel: `{channel_id2}`\n"
+                f"📺 Channels: {_channels_summary(sig_settings2)}\n"
                 f"🤖 Userbot: **{'Running ✅' if userbot_ok2 else 'Not configured ❌'}**\n"
                 f"⏱ Delay Compensation: **Disabled**\n"
                 f"🔄 2min→5min Remap: **{'ON ✅' if dur_remap2 else 'OFF'}**\n"
@@ -2154,7 +2320,7 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
             _inv2 = sig_settings2.get('inverse_mode', False)
             kb2 = [
                 [InlineKeyboardButton(toggle_label2, callback_data="signal_toggle")],
-                [InlineKeyboardButton("📺 Set Channel", callback_data="sig_set_channel")],
+                [InlineKeyboardButton("📺 Manage Channels", callback_data="sig_channels_view")],
                 [InlineKeyboardButton("✏️ Set Delay (0s)", callback_data="sig_delay_set"),
                  InlineKeyboardButton("🚫 Disable Delay", callback_data="sig_delay_off")],
                 [InlineKeyboardButton(f"🔄 2min→5min: {'ON ✅' if dur_remap2 else 'OFF'}", callback_data="sig_dur_remap_toggle"),
@@ -2212,7 +2378,7 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
         txt_r = (
             f"📡 **Signal Monitor**\n\n"
             f"{s_icon} Status: **{'ON' if is_active_r else 'OFF'}**\n"
-            f"📺 Channel: `{ch_r}`\n"
+            f"📺 Channels: {_channels_summary(sig_s)}\n"
             f"🤖 Userbot: **{'Running ✅' if ub_r else 'Not configured ❌'}**\n"
             f"⏱ Delay Compensation: **{f'{sd}s subtracted from duration' if sd > 0 else 'Disabled'}**\n"
             f"🔄 2min→5min Remap: **{'ON ✅' if dr else 'OFF'}**\n"
@@ -2234,7 +2400,7 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
         _inv_r = sig_s.get('inverse_mode', False)
         kb_r = [
             [InlineKeyboardButton(t_label, callback_data="signal_toggle")],
-            [InlineKeyboardButton("📺 Set Channel", callback_data="sig_set_channel")],
+            [InlineKeyboardButton("📺 Manage Channels", callback_data="sig_channels_view")],
             [InlineKeyboardButton(f"✏️ Set Delay ({sd}s)", callback_data="sig_delay_set"),
              InlineKeyboardButton("🚫 Disable Delay", callback_data="sig_delay_off")],
             [InlineKeyboardButton(f"🔄 2min→5min: {'ON ✅' if dr else 'OFF'}", callback_data="sig_dur_remap_toggle"),
@@ -2277,7 +2443,7 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
         txt_q = (
             f"📡 **Signal Monitor**\n\n"
             f"{s_icon_q} Status: **{'ON' if is_active_q else 'OFF'}**\n"
-            f"📺 Channel: `{ch_q}`\n"
+            f"📺 Channels: {_channels_summary(sig_s)}\n"
             f"🤖 Userbot: **{'Running ✅' if ub_q else 'Not configured ❌'}**\n"
             f"⏱ Delay Compensation: **{f'{sd_q}s subtracted from duration' if sd_q > 0 else 'Disabled'}**\n"
             f"🔄 2min→5min Remap: **{'ON ✅' if dr_q else 'OFF'}**\n"
@@ -2299,7 +2465,7 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
         _inv_q = sig_s.get('inverse_mode', False)
         kb_q = [
             [InlineKeyboardButton(t_label_q, callback_data="signal_toggle")],
-            [InlineKeyboardButton("📺 Set Channel", callback_data="sig_set_channel")],
+            [InlineKeyboardButton("📺 Manage Channels", callback_data="sig_channels_view")],
             [InlineKeyboardButton(f"✏️ Set Delay ({sd_q}s)", callback_data="sig_delay_set"),
              InlineKeyboardButton("🚫 Disable Delay", callback_data="sig_delay_off")],
             [InlineKeyboardButton(f"🔄 2min→5min: {'ON ✅' if dr_q else 'OFF'}", callback_data="sig_dur_remap_toggle"),
@@ -2342,7 +2508,7 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
         txt_m = (
             f"📡 **Signal Monitor**\n\n"
             f"{s_icon_m} Status: **{'ON' if is_am else 'OFF'}**\n"
-            f"📺 Channel: `{ch_m}`\n"
+            f"📺 Channels: {_channels_summary(sig_sm)}\n"
             f"🤖 Userbot: **{'Running ✅' if ub_m else 'Not configured ❌'}**\n"
             f"⏱ Delay Compensation: **{f'{sd_m}s subtracted from duration' if sd_m > 0 else 'Disabled'}**\n"
             f"🔄 2min→5min Remap: **{'ON ✅' if dr_m else 'OFF'}**\n"
@@ -2363,7 +2529,7 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
         _inv_m = sig_sm.get('inverse_mode', False)
         kb_m = [
             [InlineKeyboardButton(t_label_m, callback_data="signal_toggle")],
-            [InlineKeyboardButton("📺 Set Channel", callback_data="sig_set_channel")],
+            [InlineKeyboardButton("📺 Manage Channels", callback_data="sig_channels_view")],
             [InlineKeyboardButton(f"✏️ Set Delay ({sd_m}s)", callback_data="sig_delay_set"),
              InlineKeyboardButton("🚫 Disable Delay", callback_data="sig_delay_off")],
             [InlineKeyboardButton(f"🔄 2min→5min: {'ON ✅' if dr_m else 'OFF'}", callback_data="sig_dur_remap_toggle"),
@@ -2405,7 +2571,7 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
         txt_i = (
             f"📡 **Signal Monitor**\n\n"
             f"{s_icon_i} Status: **{'ON' if is_ai else 'OFF'}**\n"
-            f"📺 Channel: `{ch_i}`\n"
+            f"📺 Channels: {_channels_summary(sig_si)}\n"
             f"🤖 Userbot: **{'Running ✅' if ub_i else 'Not configured ❌'}**\n"
             f"⏱ Delay Compensation: **{f'{sd_i}s subtracted from duration' if sd_i > 0 else 'Disabled'}**\n"
             f"🔄 2min→5min Remap: **{'ON ✅' if dr_i else 'OFF'}**\n"
@@ -2425,7 +2591,7 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
             txt_i += "\nNo pending signal.\n"
         kb_i = [
             [InlineKeyboardButton(t_label_i, callback_data="signal_toggle")],
-            [InlineKeyboardButton("📺 Set Channel", callback_data="sig_set_channel")],
+            [InlineKeyboardButton("📺 Manage Channels", callback_data="sig_channels_view")],
             [InlineKeyboardButton(f"✏️ Set Delay ({sd_i}s)", callback_data="sig_delay_set"),
              InlineKeyboardButton("🚫 Disable Delay", callback_data="sig_delay_off")],
             [InlineKeyboardButton(f"🔄 2min→5min: {'ON ✅' if dr_i else 'OFF'}", callback_data="sig_dur_remap_toggle"),
@@ -3252,7 +3418,7 @@ async def message_handler(client: Client, message: Message):
 
     # --- Placeholder for other states if needed ---
 
-    elif state and state.startswith("waiting_signal_channel:"):
+    elif state and (state.startswith("waiting_signal_channel:") or state.startswith("waiting_signal_channel_add:")):
         del user_states[user_id]
         try:
             ch_msg_id = int(state.split(":", 1)[1])
@@ -3261,7 +3427,7 @@ async def message_handler(client: Client, message: Message):
 
         raw = text.strip()
         if raw.lower() == "/cancel":
-            await message.reply_text("❌ Cancelled — channel unchanged.", quote=True)
+            await message.reply_text("❌ Cancelled.", quote=True)
             return
 
         # Accept numeric IDs (negative or positive) and @usernames
@@ -3273,32 +3439,39 @@ async def message_handler(client: Client, message: Message):
             )
             return
 
-        # Normalise: convert numeric strings to int, keep @usernames as-is
         if re.match(r'^-?\d+$', raw):
             new_channel: Any = int(raw)
         else:
             new_channel = raw if raw.startswith('@') else f'@{raw}'
 
-        await update_signal_settings({'channel_id': new_channel})
-        logger.info(f"[Signal] Channel updated -> {new_channel} (set by user {user_id} via inline)")
+        # Add to channels list (dedup)
+        sig_settings_cur = await get_signal_settings()
+        channels = list(sig_settings_cur.get('channels', []))
+        ch_id_str = str(new_channel)
+        if not any(str(c.get('id', '')) == ch_id_str for c in channels):
+            channels.append({'id': ch_id_str, 'active': True})
+            await update_signal_settings({'channels': channels, 'channel_id': new_channel})
+            action = "added"
+        else:
+            action = "already in list"
+        logger.info(f"[Signal] Channel {new_channel} {action} (set by user {user_id})")
 
-        # Edit the prompt message
+        # Edit the prompt message back to channels panel
         if bot_instance and ch_msg_id:
             try:
+                sig_settings_updated = await get_signal_settings()
+                chs_updated = sig_settings_updated.get('channels', [])
                 await bot_instance.edit_message_text(
                     chat_id=user_id,
                     message_id=ch_msg_id,
-                    text=(
-                        f"✅ **Signal channel updated!**\n\n"
-                        f"Now monitoring: `{new_channel}`\n\n"
-                        f"Go back to Signal Monitor to turn monitoring ON."
-                    ),
+                    text=_channels_panel_text(chs_updated),
+                    reply_markup=InlineKeyboardMarkup(_channels_panel_keyboard(chs_updated)),
                 )
             except Exception:
                 pass
 
         await message.reply_text(
-            f"✅ Signal channel set to `{new_channel}`.",
+            f"✅ Signal channel `{new_channel}` {action}.",
             quote=True,
         )
 
@@ -3817,6 +3990,7 @@ def build_userbot() -> Optional[Client]:
         api_id=API_ID,
         api_hash=API_HASH,
         phone_number=USERBOT_PHONE,
+        sleep_threshold=60,  # wait up to 60 s on FloodWait instead of raising
     )
     return userbot_instance
 
@@ -3825,41 +3999,82 @@ async def handle_channel_message(client: Client, message):
     """Processes every incoming message on the userbot and applies signal logic."""
     global bot_instance
     try:
-        sig_settings = await get_signal_settings()
-        if not sig_settings or not sig_settings.get('is_active'):
+        # ── Safety guard ──────────────────────────────────────────────────────
+        if not message or not message.chat:
             return
 
-        channel_id = sig_settings.get('channel_id')
-        if not channel_id:
-            return
-
-        # Match by numeric id or @username — normalize both sides to avoid
-        # int vs str mismatches when the value was stored differently in DB.
         msg_chat_id = message.chat.id
         chat_username = (getattr(message.chat, 'username', None) or '').lower()
-        channel_str = str(channel_id).strip()
+        chat_type = str(getattr(message.chat, 'type', '')).lower()
 
-        # Try numeric comparison first (most reliable for channels)
-        try:
-            channel_int = int(channel_str)
-            id_match = (msg_chat_id == channel_int)
-        except (ValueError, TypeError):
-            id_match = False
+        # ── Only log channel-type messages at this stage (avoids DM/group spam) ──
+        is_channel_msg = 'channel' in chat_type
 
-        # Fall back to @username comparison
-        username_match = (
-            chat_username
-            and channel_str.lstrip('@').lower() == chat_username
-        )
+        sig_settings = await get_signal_settings()
 
-        if not id_match and not username_match:
+        if not sig_settings:
+            if is_channel_msg:
+                logger.warning(f"[Userbot] get_signal_settings() returned empty (DB issue?), chat_id={msg_chat_id}")
+            return
+
+        is_active = sig_settings.get('is_active', False)
+        if not is_active:
+            if is_channel_msg:
+                logger.info(f"[Userbot] Signal monitor is OFF — ignoring channel msg from chat_id={msg_chat_id}")
+            return
+
+        channels = sig_settings.get('channels', [])
+        # Fallback to legacy channel_id if channels list is absent
+        if not channels and sig_settings.get('channel_id'):
+            channels = [{'id': str(sig_settings['channel_id']), 'active': True}]
+        active_channels = [c for c in channels if c.get('active', True)]
+        if not active_channels:
+            if is_channel_msg:
+                logger.warning(
+                    f"[Userbot] No active channels configured — ignoring msg from chat_id={msg_chat_id}. "
+                    f"channels in DB: {channels}"
+                )
+            return
+
+        # ── Also try the channel a message was forwarded from (linked groups etc.) ──
+        fwd_chat_id = None
+        fwd_username = ''
+        if hasattr(message, 'forward_from_chat') and message.forward_from_chat:
+            fwd_chat_id = message.forward_from_chat.id
+            fwd_username = (getattr(message.forward_from_chat, 'username', None) or '').lower()
+
+        matched_channel = None
+        for ch in active_channels:
+            ch_str = str(ch.get('id', '')).strip()
+            # Numeric ID match — direct chat
+            try:
+                ch_int = int(ch_str)
+                if msg_chat_id == ch_int or (fwd_chat_id is not None and fwd_chat_id == ch_int):
+                    matched_channel = ch_str
+                    break
+            except (ValueError, TypeError):
+                pass
+            # Username match — direct chat or forwarded chat
+            ch_bare = ch_str.lstrip('@').lower()
+            if (chat_username and ch_bare == chat_username) or \
+               (fwd_username and ch_bare == fwd_username):
+                matched_channel = ch_str
+                break
+
+        if not matched_channel:
+            # Only log channel-type messages so logs stay readable
+            if is_channel_msg:
+                logger.info(
+                    f"[Userbot] Channel msg not matched: chat_id={msg_chat_id} username={chat_username!r} "
+                    f"fwd_chat_id={fwd_chat_id} — active_channels={[c.get('id') for c in active_channels]}"
+                )
             return
 
         text = message.text or message.caption or ''
         if not text or not is_signal_message(text):
             return
 
-        logger.info(f"[Userbot] Signal-like message from channel {channel_id}: {text[:120]!r}")
+        logger.info(f"[Userbot] Signal-like message from channel {matched_channel}: {text[:120]!r}")
 
         parsed = parse_signal(text)
 
@@ -4153,10 +4368,18 @@ async def setchannel_command(client: Client, message: Message):
     else:
         new_channel = raw  # Store as username string
 
-    await update_signal_settings({'channel_id': new_channel})
-    logger.info(f"[Signal] Channel updated -> {new_channel} (set by user {message.from_user.id} via /setchannel)")
+    sig_s = await get_signal_settings()
+    chs = list(sig_s.get('channels', []))
+    ch_id_str = str(new_channel)
+    if not any(str(c.get('id', '')) == ch_id_str for c in chs):
+        chs.append({'id': ch_id_str, 'active': True})
+        action_word = "added"
+    else:
+        action_word = "already configured"
+    await update_signal_settings({'channel_id': new_channel, 'channels': chs})
+    logger.info(f"[Signal] Channel {new_channel} {action_word} via /setchannel by user {message.from_user.id}")
     await message.reply_text(
-        f"✅ Signal channel set to `{new_channel}`.\n\n"
+        f"✅ Signal channel `{new_channel}` {action_word}.\n\n"
         f"Use /signalmode to toggle monitoring ON/OFF.",
         quote=True,
     )
@@ -4170,9 +4393,10 @@ async def signalmode_command(client: Client, message: Message):
     current = sig_settings.get('is_active', False)
     new_status = not current
 
-    if new_status and not sig_settings.get('channel_id'):
+    _chs_active = [c for c in sig_settings.get('channels', []) if c.get('active', True)]
+    if new_status and not _chs_active:
         await message.reply_text(
-            "⚠️ No signal channel configured. Set one first with `/setchannel <channel_id>`.",
+            "⚠️ No active signal channel configured. Add one via the Channels panel or with `/setchannel <channel_id>`.",
             quote=True,
         )
         return
@@ -4212,7 +4436,7 @@ async def signalstatus_command(client: Client, message: Message):
     text = (
         f"📡 **Signal Monitor Status**\n\n"
         f"{status_icon} Monitoring: **{'ON' if is_active else 'OFF'}**\n"
-        f"📺 Channel: `{channel_id}`\n"
+        f"📺 Channels: {_channels_summary(sig_settings)}\n"
         f"{userbot_icon} Userbot: **{'Running' if userbot_ok else 'Not configured'}**\n"
     )
     if pending:
@@ -4326,30 +4550,49 @@ async def _userbot_watchdog(ubot: Client):
     the TCP connection and the concurrent-restart race corrupted the session).
     """
     global userbot_instance
-    INTERVAL = 45  # seconds between health checks
+    INTERVAL = 60        # seconds between health checks
+    PROBE_TIMEOUT = 20   # seconds to wait for get_me() before declaring dead
     await asyncio.sleep(INTERVAL)  # initial grace period after startup
     while True:
         try:
             # A lightweight API call — throws if the connection is broken.
-            await ubot.get_me()
+            await asyncio.wait_for(ubot.get_me(), timeout=PROBE_TIMEOUT)
         except asyncio.CancelledError:
             break
         except Exception as probe_err:
             logger.warning(f"[Userbot] Watchdog: health check failed ({probe_err}), attempting recovery...")
-            # Full stop → start cycle to get a clean connection
-            try:
-                await asyncio.wait_for(ubot.stop(), timeout=10)
-            except Exception:
-                pass
-            await asyncio.sleep(3)
-            try:
-                await ubot.start()
-                userbot_instance = ubot
-                logger.info("[Userbot] Watchdog: userbot recovered successfully.")
-            except Exception as start_err:
-                logger.error(f"[Userbot] Watchdog: recovery failed: {start_err}", exc_info=True)
-                # Back off before retrying
-                await asyncio.sleep(30)
+
+            # If a restart is already underway (from a previous watchdog cycle
+            # or from pyrogram internals), don't pile on.
+            if _ubot_restart_lock.locked():
+                logger.info("[Userbot] Watchdog: restart already in progress, skipping cycle.")
+                await asyncio.sleep(INTERVAL)
+                continue
+
+            async with _ubot_restart_lock:
+                # Re-check connection after acquiring the lock — it may have
+                # been restored by the time we got here.
+                try:
+                    await asyncio.wait_for(ubot.get_me(), timeout=10)
+                    logger.info("[Userbot] Watchdog: connection restored on its own, skipping restart.")
+                    await asyncio.sleep(INTERVAL)
+                    continue
+                except Exception:
+                    pass
+
+                # Full stop → start cycle to get a clean connection.
+                try:
+                    await asyncio.wait_for(ubot.stop(), timeout=10)
+                except Exception:
+                    pass
+                await asyncio.sleep(3)
+                try:
+                    await ubot.start()
+                    userbot_instance = ubot
+                    logger.info("[Userbot] Watchdog: userbot recovered successfully.")
+                except Exception as start_err:
+                    logger.error(f"[Userbot] Watchdog: recovery failed: {start_err}", exc_info=True)
+                    await asyncio.sleep(30)
         await asyncio.sleep(INTERVAL)
 
 
