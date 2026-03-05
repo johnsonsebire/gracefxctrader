@@ -3902,14 +3902,94 @@ async def _execute_single_account_signal_trade(
             buy_info.get('openPrice') or buy_info.get('open_price')
             or buy_info.get('price') or buy_info.get('open')
         )
-        logger.info(f"[Signal Trade] [{email}] Trade ID {trade_id} placed. Waiting {duration + 2}s...")
+        dur_display_r = f"{duration // 60}m {duration % 60}s" if duration % 60 else f"{duration // 60} min"
+        dir_label_r = '🔼 BUY (CALL)' if direction == 'call' else '🔽 SELL (PUT)'
+        entry_price_str = f"`{entry_price}`" if entry_price else "_unknown_"
+        logger.info(f"[Signal Trade] [{email}] Trade ID {trade_id} placed. Waiting {duration + 2}s for result...")
+        if bot_instance:
+            try:
+                await bot_instance.send_message(
+                    OWNER_ID,
+                    f"✅ **Trade Placed** — `{email}`\n\n"
+                    f"📊 Asset: `{asset_display}` → `{asset_open}`\n"
+                    f"📈 Direction: **{dir_label_r}**\n"
+                    f"💵 Amount: `${amount}`\n"
+                    f"⏱ Duration: `{dur_display_r}`\n"
+                    f"🏷 Trade ID: `{trade_id}`\n"
+                    f"📌 Entry Price: {entry_price_str}\n\n"
+                    f"⏳ Waiting for result...",
+                )
+            except Exception as notify_err:
+                logger.warning(f"[Signal Trade] [{email}] Could not send placement notification: {notify_err}")
         await asyncio.sleep(duration + 2)
 
-        win_result = await qx_client.check_win(buy_info["id"])
-        profit = qx_client.get_profit()
+        # check_win polls listinfodata (populated via WebSocket).
+        # If the result packet is lost (e.g. after a reconnect), it loops forever.
+        # Wrap with a generous timeout and fall back to get_result() (history API).
+        _CHECK_TIMEOUT = 45  # seconds after the trade should already be settled
+        win_result = None
+        profit = 0.0
+        try:
+            win_result = await asyncio.wait_for(
+                qx_client.check_win(buy_info["id"]), timeout=_CHECK_TIMEOUT
+            )
+            profit = qx_client.get_profit()
+            logger.info(f"[Signal Trade] [{email}] check_win={win_result}, profit={profit}")
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"[Signal Trade] [{email}] check_win timed out after {_CHECK_TIMEOUT}s "
+                f"(trade_id={trade_id}). Trying get_result() fallback..."
+            )
+            try:
+                fb_status, fb_data = await qx_client.get_result(str(trade_id))
+                if fb_status in ("win", "loss") and isinstance(fb_data, dict):
+                    profit = float(fb_data.get("profitAmount", 0))
+                    win_result = profit > 0
+                    logger.info(
+                        f"[Signal Trade] [{email}] get_result fallback: "
+                        f"status={fb_status}, profit={profit}"
+                    )
+                else:
+                    logger.warning(
+                        f"[Signal Trade] [{email}] get_result fallback: not found "
+                        f"({fb_status!r}: {fb_data!r}). Reporting as unavailable."
+                    )
+                    if bot_instance:
+                        await bot_instance.send_message(
+                            OWNER_ID,
+                            f"⏳ **{email}** — Trade result could not be retrieved.\n"
+                            f"Trade ID: `{trade_id}`\n"
+                            f"_Check your Quotex account directly._",
+                        )
+                    return
+            except Exception as fb_err:
+                logger.error(
+                    f"[Signal Trade] [{email}] get_result fallback also failed: {fb_err}",
+                    exc_info=True,
+                )
+                if bot_instance:
+                    await bot_instance.send_message(
+                        OWNER_ID,
+                        f"⏳ **{email}** — Trade result unavailable (timed out + fallback failed).\n"
+                        f"Trade ID: `{trade_id}`\n"
+                        f"_Check your Quotex account directly._",
+                    )
+                return
+        except KeyError:
+            logger.error(
+                f"[Signal Trade] [{email}] buy_info missing 'id' key — buy_info={buy_info!r}",
+                exc_info=True,
+            )
+            if bot_instance:
+                await bot_instance.send_message(
+                    OWNER_ID,
+                    f"⚠️ **{email}** — Trade placed but result check failed (no trade ID in buy response).",
+                )
+            return
+
         closing_time = datetime.datetime.now(datetime.timezone.utc)
         closing_price = (
-            (win_result.get('closePrice') if isinstance(win_result, dict) else None)
+            (win_result if isinstance(win_result, dict) and win_result.get('closePrice') else None)
             or buy_info.get('closePrice') or buy_info.get('close_price') or buy_info.get('close')
         )
 
