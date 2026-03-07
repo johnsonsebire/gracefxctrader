@@ -1,4 +1,49 @@
+# ── Environment & secrets ────────────────────────────────────────────────────
 .env
+*.env
+.env.*
+secrets.json
+config.local.*
+
+# ── Python ───────────────────────────────────────────────────────────────────
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
+*.pdb
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Virtual environment ───────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+.env/
+
+# ── Telegram / Pyrogram session files ────────────────────────────────────────
+*.session
+*.session-journal
+sessions/
+
+# ── Quotex / broker auth ─────────────────────────────────────────────────────
+session.json
+quotex_auth.json
+cookies*.json
+*.cookies
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── IDE / editor ─────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── OS ───────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini

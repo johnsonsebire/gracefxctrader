@@ -50,6 +50,9 @@ def _make_driver(profile_dir: Path, headless: bool):
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--lang=en-US,en;q=0.9")
+    # Suppress additional automation signals that Cloudflare checks
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument(f"--user-agent={_UA}")
     if headless:
         options.add_argument("--headless=new")
     else:
@@ -60,6 +63,31 @@ def _make_driver(profile_dir: Path, headless: bool):
         user_data_dir=str(profile_dir),
         use_subprocess=True,
     )
+
+
+def _make_plain_driver():
+    """Last-resort fallback: plain Selenium Chrome with automation signals suppressed."""
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options as ChromeOptions
+
+    options = ChromeOptions()
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--lang=en-US,en;q=0.9")
+    options.add_argument("--start-maximized")
+    options.add_argument(f"--user-agent={_UA}")
+    # Remove the 'Chrome is controlled by automated software' banner and
+    # suppress navigator.webdriver / automation fingerprints that Cloudflare detects.
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option("useAutomationExtension", False)
+    driver = webdriver.Chrome(options=options)
+    # Patch navigator.webdriver to undefined at the JS level
+    driver.execute_cdp_cmd(
+        "Page.addScriptToEvaluateOnNewDocument",
+        {"source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"},
+    )
+    return driver
 
 
 def _extract_and_save_session(driver, session_dir: Path) -> dict:
@@ -128,6 +156,22 @@ def _do_login_sync(
     profile_dir.mkdir(parents=True, exist_ok=True)
 
     if not headless:
+        # Wipe the browser profile before every visible-mode session.
+        # A stale/fingerprinted profile makes Cloudflare loop the challenge
+        # endlessly even when a human solves it. Starting clean guarantees
+        # a single successful solve and a fresh __cf_clearance cookie.
+        import shutil as _shutil
+        if profile_dir.exists():
+            try:
+                _shutil.rmtree(profile_dir)
+                logger.info(
+                    f"[Selenium] Cleared stale browser_profile for {email} "
+                    "(fresh fingerprint for Cloudflare challenge)."
+                )
+            except Exception as _rm_err:
+                logger.warning(f"[Selenium] Could not clear browser_profile: {_rm_err}")
+        profile_dir.mkdir(parents=True, exist_ok=True)
+
         print(
             f"\n{'='*62}\n"
             f"[Quotex Auth] Opening VISIBLE browser for {email}.\n"
@@ -139,7 +183,25 @@ def _do_login_sync(
         )
         logger.warning(f"[Selenium] Visible browser opened for {email}.")
 
-    driver = _make_driver(profile_dir, headless)
+    try:
+        driver = _make_driver(profile_dir, headless)
+    except Exception as uc_err:
+        if headless:
+            raise  # propagate so ensure_session falls through to visible mode
+        # UC Chrome failed in visible mode — try plain Selenium Chrome as a last resort
+        logger.warning(
+            f"[Selenium] UC Chrome failed ({str(uc_err)[:120]}); retrying with plain Chrome ..."
+        )
+        print(
+            f"\n{'='*62}\n"
+            f"[Quotex Auth] undetected-chromedriver failed for {email}.\n"
+            f"  Opening plain Chrome instead.\n"
+            f"  A browser window should appear — complete the Cloudflare\n"
+            f"  challenge, then log in manually if credentials weren't filled.\n"
+            f"  You have {manual_timeout} seconds.\n"
+            f"{'='*62}\n"
+        )
+        driver = _make_plain_driver()
     try:
         logger.info(f"[Selenium] Navigating to login page (headless={headless}) ...")
         driver.get(_LOGIN_URL)
@@ -238,13 +300,36 @@ async def ensure_session(
     3. Visible browser fallback - user solves challenge once; __cf_clearance
        is persisted so subsequent headless runs pass automatically.
     """
+    _MAX_SESSION_AGE_HOURS = 6  # re-auth if session file is older than this
+
     session_file = Path(session_path) / "session.json"
     if not force and session_file.exists():
         try:
-            token = json.loads(session_file.read_text()).get("token")
-            if token:
-                logger.info(f"[Selenium] Valid session on disk for {email} - skipping refresh.")
+            import time as _time
+            session_data = json.loads(session_file.read_text())
+            token = session_data.get("token")
+            cookies = session_data.get("cookies", "")
+            # Check both token presence AND session file age.
+            # __cf_clearance cookies on qxbroker.com expire in a few hours, so we
+            # force a refresh when the session is older than _MAX_SESSION_AGE_HOURS.
+            age_hours = (_time.time() - session_file.stat().st_mtime) / 3600
+            has_cf_clearance = "__cf_clearance" in cookies
+            if token and has_cf_clearance and age_hours < _MAX_SESSION_AGE_HOURS:
+                logger.info(
+                    f"[Selenium] Session on disk for {email} is "
+                    f"{age_hours:.1f}h old — reusing."
+                )
                 return True
+            elif token and age_hours >= _MAX_SESSION_AGE_HOURS:
+                logger.warning(
+                    f"[Selenium] Session for {email} is {age_hours:.1f}h old "
+                    f"(> {_MAX_SESSION_AGE_HOURS}h) — forcing refresh."
+                )
+            elif token and not has_cf_clearance:
+                logger.warning(
+                    f"[Selenium] Session for {email} has no __cf_clearance cookie "
+                    "— forcing refresh."
+                )
         except Exception:
             pass
 

@@ -5,15 +5,26 @@ signal_parser.py
 Parses Quotex signal messages from Telegram and converts them into structured
 trade arguments understood by the pyquotex API.
 
-Expected message formats (single or multi-part):
+Supported formats (with or without emojis):
 
-  NEXT SIGNAL 🔜
+  Complete signal (direction included):
+    📊 USDMXN-OTCq
+    ⏰ 01:35
+    ⌛ 1 Minutes
+    🔴 PUT DOWN ⬇️
 
-  👉 USD/ARS (OTC)
-  ⏱ 2 MINUTE
-  💵Use 200 $ from balance
+  Partial — asset + duration + optional amount:
+    👉 USD/BRL (OTC)
+    ⏱ 2 MINUTE
+    💵Use 200 $ from balance
 
-  📈THE RISE BEGINS! ENTERING UP! 🔼🔼
+  Partial — asset + duration only (direction arrives later):
+    👉 USD/BRL (OTC)
+    ⏱ 2 MINUTE
+
+  Seconds duration:
+    👉 EURUSD
+    ⌛ 30 SECONDS
 
 Direction may arrive in a *separate* follow-up message (2-part signal flow).
 """
@@ -21,20 +32,36 @@ Direction may arrive in a *separate* follow-up message (2-part signal flow).
 import re
 from typing import Optional, Dict, Any
 
+# ── Referral link replacement ──────────────────────────────────────────────────
+# Any broker-qx.pro sign-up URL found in non-signal channel messages will be
+# replaced with the configured affiliate link.
+MY_REFERRAL_LINK = "https://broker-qx.pro/sign-up/?lid=2024742"
+_BROKER_URL_RE = re.compile(
+    r'https?://(?:[\w.-]+\.)?broker-qx\.pro/sign-up[^\s)]*',
+    re.IGNORECASE,
+)
+
+
+def replace_referral_links(text: str) -> str:
+    """Replace any broker-qx.pro sign-up URLs in *text* with MY_REFERRAL_LINK."""
+    return _BROKER_URL_RE.sub(MY_REFERRAL_LINK, text)
+
 
 def normalize_asset(raw: str) -> str:
     """
     Convert a Quotex display asset name to the pyquotex API format.
 
-    Examples:
-        'USD/ARS (OTC)' → 'USDARS_otc'
-        'NZD/JPY'       → 'NZDJPY'
-        'EUR/USD (OTC)' → 'EURUSD_otc'
-        'Bitcoin (OTC)' → 'BITCOIN_otc'
+    Handles:
+        'USD/ARS (OTC)'     → 'USDARS_otc'
+        'NZD/JPY'           → 'NZDJPY'
+        'USDMXN-OTCq'       → 'USDMXN_otc'  (dash-OTC or OTCq suffix variants)
+        'EURUSD_otc'        → 'EURUSD_otc'
+        'Bitcoin (OTC)'     → 'BITCOIN_otc'
     """
-    is_otc = bool(re.search(r'\(OTC\)', raw, re.IGNORECASE))
-    # Strip (OTC), parentheses, slashes, spaces, dashes — keep only letters
-    base = re.sub(r'\s*\(OTC\)\s*', '', raw, flags=re.IGNORECASE)
+    # Detect OTC by any of: (OTC), -OTC, _otc, OTCq (case-insensitive)
+    is_otc = bool(re.search(r'[\s\-_(]?otc\w*', raw, re.IGNORECASE))
+    # Strip OTC markers, parentheses, slashes, spaces, dashes — keep only letters
+    base = re.sub(r'[\s\-_(]?otc\w*', '', raw, flags=re.IGNORECASE)
     base = re.sub(r'[^A-Za-z]', '', base)
     base = base.upper()
     return (base + '_otc') if is_otc else base
@@ -44,25 +71,19 @@ def parse_direction(text: str) -> Optional[str]:
     """
     Detect trade direction from message text.
 
-    Accepted examples (case-insensitive, with or without emoji):
+    Accepted (case-insensitive, with or without emoji):
         BUY / UP / CALL / ENTERING UP / THE RISE / GOING UP / BULLISH
-        📈  🔼  ↑
+        📈  🔼  ↑  🟢  ⬆️
         SELL / DOWN / PUT / ENTERING DOWN / FALLING / GOING DOWN / BEARISH
-        📉  🔽  ↓
+        📉  🔽  ↓  🔴  ⬇️
 
-    Returns:
-        'call'  – BUY / UP direction
-        'put'   – SELL / DOWN direction
-        None    – not detected
+    Returns: 'call', 'put', or None.
     """
     if not text:
         return None
 
     t = text.upper()
 
-    # ── CALL / BUY / UP ────────────────────────────────────────────────────
-    # Word-boundary patterns catch standalone words (BUY, UP, CALL) as well
-    # as longer phrases (ENTERING UP, THE RISE BEGINS, etc.)
     UP_PATTERNS = [
         r'\bENTERING\s+UP\b',
         r'\bTHE\s+RISE\b',
@@ -73,9 +94,8 @@ def parse_direction(text: str) -> Optional[str]:
         r'\bBULLISH\b',
         r'\bLONG\b',
     ]
-    UP_CHARS = ['🔼', '📈', '↑']
+    UP_CHARS = ['🔼', '📈', '↑', '🟢', '⬆']
 
-    # ── PUT / SELL / DOWN ──────────────────────────────────────────────────
     DOWN_PATTERNS = [
         r'\bENTERING\s+DOWN\b',
         r'\bFALLING\b',
@@ -86,9 +106,9 @@ def parse_direction(text: str) -> Optional[str]:
         r'\bBEARISH\b',
         r'\bSHORT\b',
     ]
-    DOWN_CHARS = ['🔽', '📉', '↓']
+    DOWN_CHARS = ['🔽', '📉', '↓', '🔴', '⬇']
 
-    # Check emoji/char indicators first (unambiguous)
+    # Emoji/char indicators (unambiguous — check first)
     for ch in UP_CHARS:
         if ch in text:
             return 'call'
@@ -96,7 +116,6 @@ def parse_direction(text: str) -> Optional[str]:
         if ch in text:
             return 'put'
 
-    # Then word-boundary patterns on the uppercased text
     for pattern in UP_PATTERNS:
         if re.search(pattern, t):
             return 'call'
@@ -107,18 +126,92 @@ def parse_direction(text: str) -> Optional[str]:
     return None
 
 
+# ── Asset extraction helpers ───────────────────────────────────────────────────
+
+# Emojis that commonly precede the asset symbol line
+_ASSET_EMOJI_RE = re.compile(
+    r'(?:👉|📊|📈|📉|💹|🎯|⚡|🔔|🔸|🔹|➡|▶|•|\*)\s*(.+?)(?:\n|$)'
+)
+
+# Standalone forex-pair line: "USD/BRL (OTC)", "USDMXN-OTCq", "EURUSD_otc", "NZD/JPY"
+_PAIR_LINE_RE = re.compile(
+    r'(?:^|\n)\s*([A-Za-z]{2,8}(?:/[A-Za-z]{2,8})?(?:[\s\-_]?\(?OTC\w*\)?)?)\s*(?:\n|$)',
+    re.IGNORECASE,
+)
+
+# A raw all-caps word pair like "USDBRL" or "EURUSD" that looks like a forex symbol
+_RAW_PAIR_RE = re.compile(r'\b([A-Z]{6,8}(?:_otc)?)\b')
+
+
+# Words that must never be treated as an asset name even if they appear on
+# their own line or after an emoji.
+_NON_ASSET_WORDS = frozenset([
+    'UP', 'DOWN', 'CALL', 'PUT', 'BUY', 'SELL',
+    'BULLISH', 'BEARISH', 'LONG', 'SHORT',
+    'ENTERING', 'RISE', 'FALLING', 'GOING',
+    'SIGNAL', 'NEXT', 'MINUTE', 'SECOND', 'USE', 'FROM', 'BALANCE',
+    'THE', 'AND', 'FOR', 'NOT',
+])
+
+
+def _is_valid_asset_raw(raw: str) -> bool:
+    """Return False if *raw* looks like a direction word or a generic keyword."""
+    words = re.split(r'[\s/()]+', raw.strip())
+    # Reject if ALL words are in the non-asset list (e.g. "down", "put DOWN")
+    significant = [w.upper() for w in words if w]
+    if not significant:
+        return False
+    if all(w in _NON_ASSET_WORDS for w in significant):
+        return False
+    return True
+
+
+def _extract_asset(text: str) -> Optional[tuple]:
+    """
+    Try to extract (asset_display, asset_api) from *text*.
+    Returns (raw_display, normalized) or None.
+    """
+    # 1. Emoji-prefixed line  e.g.  👉 USD/BRL (OTC)  or  📊 USDMXN-OTCq
+    m = _ASSET_EMOJI_RE.search(text)
+    if m:
+        raw = m.group(1).strip()
+        # Signal lines often have separators: "USDMXN-OTCq / ⏰ 01:35 / ..."
+        # Strip everything from the first separator to isolate the asset token
+        raw_clean = re.split(r'\s+/\s+|\s*\|\s*|\t', raw)[0].strip()
+        # Discard if the "asset" part looks like a direction word or generic phrase
+        if not re.match(r'^[A-Za-z0-9/\-_()\s]+$', raw_clean):
+            pass  # contains emojis / unexpected chars — fall through
+        elif re.search(r'\b(?:SIGNAL|NEXT|MINUTE|SECOND|USE|FROM|BALANCE|ENTERING|RISE|FALL)\b',
+                       raw_clean.upper()):
+            pass
+        elif not _is_valid_asset_raw(raw_clean):
+            pass
+        else:
+            return raw_clean, normalize_asset(raw_clean)
+
+    # 2. Plain pair line (with or without (OTC) suffix)
+    m = _PAIR_LINE_RE.search(text)
+    if m:
+        raw = m.group(1).strip()
+        # Must contain at least one letter pair (not just numbers/time) and not be a direction word
+        if re.search(r'[A-Za-z]{3}', raw) and _is_valid_asset_raw(raw):
+            return raw, normalize_asset(raw)
+
+    return None
+
+
 def parse_signal(text: str) -> Optional[Dict[str, Any]]:
     """
     Parse a signal message — full or partial.
 
     Returns a dict with some or all of:
-        asset         (str)  – pyquotex API asset name, e.g. 'USDARS_otc'
-        asset_display (str)  – raw display name from the signal, e.g. 'USD/ARS (OTC)'
-        duration      (int)  – expiry in seconds (minutes × 60)
-        amount        (float)– trade amount in USD
-        direction     (str)  – 'call' or 'put' (absent if not yet posted)
+        asset         (str)   – pyquotex API asset name, e.g. 'USDARS_otc'
+        asset_display (str)   – raw display name from the signal
+        duration      (int)   – expiry in **seconds**
+        amount        (float) – trade amount in USD (absent if not specified)
+        direction     (str)   – 'call' or 'put' (absent if not yet posted)
 
-    Returns None if no signal-like content detected.
+    Returns None if no signal-like content is detected.
     """
     if not text:
         return None
@@ -126,42 +219,58 @@ def parse_signal(text: str) -> Optional[Dict[str, Any]]:
     result: Dict[str, Any] = {}
 
     # ── Asset ──────────────────────────────────────────────────────────────
-    # Primary:  👉 USD/ARS (OTC)
-    m = re.search(r'👉\s*(.+?)(?:\n|$)', text)
-    if m:
-        raw = m.group(1).strip()
-        result['asset_display'] = raw
-        result['asset'] = normalize_asset(raw)
-    else:
-        # Fallback: plain line like "NZD/USD (OTC)" or "EURUSD_otc" (no emoji)
-        m = re.search(
-            r'(?:^|\n)\s*([A-Za-z]{2,6}/[A-Za-z]{2,6}(?:\s*\(OTC\))?)\s*(?:\n|$)',
-            text, re.IGNORECASE
-        )
-        if m:
-            raw = m.group(1).strip()
-            result['asset_display'] = raw
-            result['asset'] = normalize_asset(raw)
+    asset_info = _extract_asset(text)
+    if asset_info:
+        result['asset_display'], result['asset'] = asset_info
 
     # ── Duration ───────────────────────────────────────────────────────────
-    # Matches:  ⏱ 2 MINUTE  |  ⏱️ 5 MINUTES  |  ⏰ 3 MINUTE  |  5 MINUTE (no emoji)
-    # '️' (U+FE0F) is a variation selector that may trail the clock emoji — consume it.
-    m = re.search(r'[⏱⏰]\ufe0f?[\s\ufe0f]*([\d]+)\s*MINUTES?', text, re.IGNORECASE)
-    if not m:
-        # Plain-text fallback: "5 MINUTE" or "2 MINUTES" on its own segment
-        m = re.search(r'(?:^|\n|\s)([\d]+)\s*MINUTES?(?:\s|$)', text, re.IGNORECASE)
-    if m:
-        result['duration'] = int(m.group(1)) * 60  # convert minutes → seconds
+    # Minutes: ⏱ 2 MINUTE | ⌛ 1 Minutes | ⏰ 3 MINUTE | plain "5 MINUTES"
+    # Seconds: ⌛ 30 SECONDS | ⏱ 30s | "30 SEC" | "30 SECOND"
+    # Variation selector U+FE0F may trail clock emojis — consume it.
 
-    # ── Amount ─────────────────────────────────────────────────────────────
-    # Matches:  💵Use 200 $ from balance  |  Use 125$  |  Use 1,000 $  |  plain "Use 5 $"
+    # Try minutes first
+    m = re.search(
+        r'[⏱⏰⌛]\ufe0f?[\s\ufe0f]*(\d+)\s*(?:MINUTES?|MINS?|MIN\b)',
+        text, re.IGNORECASE,
+    )
+    if not m:
+        m = re.search(r'(?:^|\n|\s)(\d+)\s*(?:MINUTES?|MINS?|MIN\b)(?:\s|$)', text, re.IGNORECASE)
+    if m:
+        result['duration'] = int(m.group(1)) * 60
+
+    # Try seconds if no minutes found
+    if 'duration' not in result:
+        m = re.search(
+            r'[⏱⏰⌛]\ufe0f?[\s\ufe0f]*([\d]+)\s*(?:SECONDS?|SECS?|S\b)',
+            text, re.IGNORECASE,
+        )
+        if not m:
+            m = re.search(
+                r'(?:^|\n|\s)([\d]+)\s*(?:SECONDS?|SECS?)(?:\s|$)',
+                text, re.IGNORECASE,
+            )
+        if not m:
+            # Shorthand: "30s" — digit(s) immediately followed by 's' at a word boundary
+            m = re.search(r'(?:^|\n|\s)(\d+)s\b', text)
+        if m:
+            result['duration'] = int(m.group(1))  # already in seconds
+
+    # ── Amount (optional) ──────────────────────────────────────────────────
+    # Matches:  💵Use 200 $ from balance | Use 125$ | Use 1,000 $ | "Use 5 $"
     m = re.search(r'Use\s+([\d,]+(?:\.\d+)?)\s*\$', text, re.IGNORECASE)
     if m:
         result['amount'] = float(m.group(1).replace(',', ''))
 
-    # If no asset was found, this is probably not a signal message at all
+    # ── Require at least asset + duration to be a valid partial signal ─────
+    # (A message with only an asset and no duration is probably not a signal)
     if 'asset' not in result:
         return None
+    if 'duration' not in result and 'direction' not in result:
+        # Still accept if there's a direction — it may be a complete signal
+        # with no explicit duration (rely on default)
+        direction_only = parse_direction(text)
+        if not direction_only:
+            return None
 
     # ── Direction (optional — may arrive in a separate follow-up message) ──
     direction = parse_direction(text)
@@ -172,23 +281,46 @@ def parse_signal(text: str) -> Optional[Dict[str, Any]]:
 
 
 def is_signal_message(text: str) -> bool:
-    """Quick pre-filter: does this message look at all like a signal?"""
+    """
+    Quick pre-filter: does this message look at all like a signal?
+
+    Returns True if the message could plausibly be a signal or a standalone
+    direction follow-up for a pending partial signal.  The full parse_signal /
+    parse_direction calls will decide more precisely.
+    """
     if not text:
         return False
-    emoji_indicators = ['👉', '⏱', '⏰', '💵', '🔼', '🔽', '📈', '📉']
-    text_indicators  = [
-        'SIGNAL', 'ENTERING UP', 'ENTERING DOWN', 'MINUTE', 'FROM BALANCE',
-        'THE RISE', 'FALLING', 'GOING UP', 'GOING DOWN',
-    ]
-    # Standalone direction words (word-boundary aware)
-    direction_words  = [r'\bBUY\b', r'\bSELL\b', r'\bUP\b', r'\bDOWN\b',
-                        r'\bCALL\b', r'\bPUT\b']
-    # Forex pair lines like "NZD/USD" or "EUR/USD (OTC)"
-    has_pair = bool(re.search(r'[A-Za-z]{2,6}/[A-Za-z]{2,6}', text))
+
     text_upper = text.upper()
+
+    # Has a forex/crypto pair  (e.g. USD/BRL, USDMXN, EURUSD-OTCq)
+    # Strip URLs first so e.g. "https://broker-qx.pro/sign-up/" doesn't match
+    text_no_urls = re.sub(r'https?://\S+', '', text, flags=re.IGNORECASE)
+    has_pair = bool(re.search(
+        r'[A-Za-z]{2,8}/[A-Za-z]{2,8}'          # slash-separated pair: USD/BRL
+        r'|[A-Z]{6,8}[\s\-_]?\(?OTC\w*\)?'      # USDMXN-OTCq  (OTC marker required)
+        r'|[A-Z]{3,8}_otc',                       # EURUSD_otc explicit
+        text_no_urls,
+    ))
+
+    # Emoji hints that strongly suggest a signal
+    signal_emojis = ['👉', '⏱', '⏰', '⌛', '💵', '🔼', '🔽', '📈', '📉', '⬆', '⬇', '🟢', '🔴']
+
+    # Text keywords
+    text_kws = [
+        'SIGNAL', 'ENTERING UP', 'ENTERING DOWN', 'MINUTE', 'SECOND',
+        'FROM BALANCE', 'THE RISE', 'FALLING', 'GOING UP', 'GOING DOWN',
+    ]
+
+    # Standalone direction words (strip URLs first so e.g. "sign-up" doesn't
+    # trigger \bUP\b) — use IGNORECASE so HTTPS:// is also stripped
+    text_no_urls = re.sub(r'https?://\S+', '', text_upper, flags=re.IGNORECASE)
+    dir_words = [r'\bBUY\b', r'\bSELL\b', r'\bCALL\b', r'\bPUT\b',
+                 r'\bUP\b', r'\bDOWN\b']
+
     return (
         has_pair
-        or any(ind in text for ind in emoji_indicators)
-        or any(ind in text_upper for ind in text_indicators)
-        or any(re.search(p, text_upper) for p in direction_words)
+        or any(e in text for e in signal_emojis)
+        or any(kw in text_upper for kw in text_kws)
+        or any(re.search(p, text_no_urls) for p in dir_words)
     )

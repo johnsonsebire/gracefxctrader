@@ -125,6 +125,7 @@ except ImportError:
 try:
     from pyquotex.stable_api import Quotex
     from pyquotex.utils.processor import get_color # Optional
+    import pyquotex.global_value as _qx_global_value
     # Monkey patch target detection function (safer approach)
     # --- Inside your script, replace the existing function ---
     
@@ -139,7 +140,7 @@ except Exception as e:
 
 # --- Signal Parser ---
 try:
-    from signal_parser import parse_signal, parse_direction, is_signal_message
+    from signal_parser import parse_signal, parse_direction, is_signal_message, replace_referral_links
 except ImportError:
     print("Error: signal_parser.py not found. Place it in the same directory as bot.py.")
     sys.exit(1)
@@ -208,6 +209,7 @@ except Exception as e:
 bot_instance: Optional[Client] = None
 userbot_instance: Optional[Client] = None  # MTProto user session for channel monitoring
 _ubot_restart_lock: asyncio.Lock = asyncio.Lock()  # serialises watchdog restarts
+_manual_trade_lock: asyncio.Lock = asyncio.Lock()  # prevents double-execution on rapid button taps
 db = None  # Database client
 main_event_loop = None # <<< ADD THIS GLOBAL VARIABLE
 users_db = None # Collection for users, roles, basic settings
@@ -229,6 +231,11 @@ user_states: Dict[int, str] = {} # e.g., {user_id: "waiting_broadcast_message"}
 DEFAULT_TRADE_AMOUNT = 5
 DEFAULT_TRADE_DURATION = 60 # For Timer/Time mode number
 
+# Maximum seconds allowed between signal receipt and the actual buy() call.
+# If setup (auth, asset check, price feed) takes longer than this, the trade
+# is skipped — a late entry is worse than no entry.
+MAX_ENTRY_DELAY_SECONDS = 5.0
+
 # UTC+5:30 (IST) timezone for signal timing logs
 IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 DEFAULT_TRADE_MODE = "TIMER" # 'TIMER' or 'TIME'
@@ -238,6 +245,26 @@ DEFAULT_SERVICE_STATUS = True # Accounts Active (participate in signal trades) b
 MARTINGALE_MULTIPLIER = 2.0
 MAX_CONSECUTIVE_LOSSES = 3
 COOLDOWN_MINUTES = 3
+
+# ── Strategy Mode ─────────────────────────────────────────────────────────────
+# Each strategy is a sequence of 10 trade amounts.
+# On WIN  → step resets to 0 (start of sequence).
+# On LOSS → step advances by 1 (next higher amount to recover).
+# If step reaches end of sequence → resets to 0 (fresh cycle).
+# Minimum balance required = first step amount.
+STRATEGIES: Dict[int, Dict[str, Any]] = {
+    1: {
+        "name":        "Strategy 1 ($25 min balance)",
+        "min_balance": 25.0,
+        "steps":       [5, 10, 15, 20, 25, 30, 75, 100, 125, 175],
+    },
+    2: {
+        "name":        "Strategy 2 ($50 min balance)",
+        "min_balance": 50.0,
+        "steps":       [15, 20, 25, 30, 35, 65, 125, 200, 300, 350],
+    },
+}
+# ─────────────────────────────────────────────────────────────────────────────
 
 # --- Database Setup ---
 async def setup_database():
@@ -588,7 +615,10 @@ def _build_journal_text(summary: dict, view_date: str) -> str:
         def _fmt_bal(v: Optional[float]) -> str:
             return f"${v:,.2f}" if v is not None else "N/A"
 
-        for acct_email, trades in by_account.items():
+        acct_sections = list(by_account.items())
+        for sec_idx, (acct_email, trades) in enumerate(acct_sections):
+            if sec_idx > 0:
+                journal_text += "━━━━━━━━━━━━━━━━━━━━━\n"
             acct_doc_id = trades[0].get("account_doc_id", "")
             bal_rec = daily_bals.get(acct_doc_id, {})
             opening_bal = bal_rec.get("opening_balance")
@@ -625,6 +655,8 @@ def _build_journal_text(summary: dict, view_date: str) -> str:
                     f"      🏁 Close: {close_ts} UTC @ {c_price}\n"
                     f"      📌 Result: **{t['result']}**  {pl_str}\n"
                 )
+                if i < len(trades):
+                    journal_text += "      ─ ─ ─ ─ ─ ─ ─ ─ ─ ─\n"
 
             if wds:
                 for w in wds:
@@ -727,6 +759,9 @@ async def get_signal_settings() -> Dict[str, Any]:
             'ask_duration_on_partial': False,
             'manual_trade_mode': False,
             'inverse_mode': False,
+            'strategy_mode': False,        # bool — strategy mode on/off
+            'strategy_id': 1,              # int — which strategy (1 or 2)
+            'strategy_step': 0,            # int — current step index (0-9)
         }
         await signal_settings_db.insert_one(doc)
     else:
@@ -753,13 +788,106 @@ async def update_signal_settings(data: dict):
     )
 
 
+# ── Strategy Mode helpers ────────────────────────────────────────────────────
+
+def _strategy_summary(sig_settings: dict) -> str:
+    """One-line summary for display in panels."""
+    if not sig_settings.get('strategy_mode'):
+        return 'Disabled'
+    sid = sig_settings.get('strategy_id', 1)
+    step = sig_settings.get('strategy_step', 0)
+    strat = STRATEGIES.get(sid)
+    if not strat:
+        return f'Strategy {sid} (unknown)'
+    steps = strat['steps']
+    current_amt = steps[min(step, len(steps) - 1)]
+    return f"Strategy {sid} — Step {step + 1}/10 (${current_amt})"
+
+
+def _strategy_panel_text(sig_settings: dict) -> str:
+    """Text body for the Strategy Mode settings panel."""
+    enabled = sig_settings.get('strategy_mode', False)
+    active_sid = sig_settings.get('strategy_id', 1)
+    step = sig_settings.get('strategy_step', 0)
+
+    lines = ["🎯 **Strategy Mode**\n"]
+    lines.append(f"Status: {'🟢 **Enabled**' if enabled else '🔴 Disabled'}\n")
+    if enabled:
+        strat = STRATEGIES.get(active_sid, {})
+        steps = strat.get('steps', [])
+        current_amt = steps[min(step, len(steps) - 1)] if steps else '?'
+        lines.append(f"Active: **{strat.get('name', f'Strategy {active_sid}')}**")
+        lines.append(f"Progress: Step **{step + 1}/10** — Next trade amount: **${current_amt}**\n")
+        lines.append("_WIN → resets to step 1 | LOSS → advances to next step_\n")
+    lines.append("\n**Available Strategies:**")
+    for sid, strat in STRATEGIES.items():
+        marker = '✅' if (enabled and sid == active_sid) else '○'
+        lines.append(f"{marker} **{strat['name']}**")
+        lines.append("  Steps: " + " → ".join(f"${s}" for s in strat['steps']))
+    return '\n'.join(lines)
+
+
+def _strategy_panel_keyboard(sig_settings: dict) -> list:
+    """Keyboard for the Strategy Mode panel."""
+    enabled = sig_settings.get('strategy_mode', False)
+    active_sid = sig_settings.get('strategy_id', 1)
+    rows = []
+    toggle_label = '🔴 Disable Strategy Mode' if enabled else '🟢 Enable Strategy Mode'
+    rows.append([InlineKeyboardButton(toggle_label, callback_data='strat_toggle')])
+    rows.append([InlineKeyboardButton('🔄 Reset Step Counter', callback_data='strat_reset_step')])
+    rows.append([InlineKeyboardButton('— Select Strategy —', callback_data='noop')])
+    for sid, strat in STRATEGIES.items():
+        selected = '✅ ' if sid == active_sid else ''
+        rows.append([InlineKeyboardButton(
+            f"{selected}{strat['name']}",
+            callback_data=f'strat_select:{sid}',
+        )])
+    rows.append(back_button('settings_main'))
+    return rows
+
+
+def _build_step_selector_keyboard(
+    strategy_id: int,
+    current_step: int,
+) -> Optional[InlineKeyboardMarkup]:
+    """Compact 2-row step selector keyboard embedded in trade/result messages."""
+    strat = STRATEGIES.get(strategy_id)
+    if not strat:
+        return None
+    steps = strat['steps']
+    rows: list = []
+    row: list = []
+    for i, amt in enumerate(steps):
+        star = '⭐' if i == current_step else ''
+        row.append(InlineKeyboardButton(
+            f"{star}{i + 1}·${amt}",
+            callback_data=f"strat_step_set:{i}",
+        ))
+        if len(row) == 5:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("🎯 Strategy Panel", callback_data="strategy_view")])
+    return InlineKeyboardMarkup(rows)
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _ch_display(ch: dict) -> str:
+    """Human-friendly display string for a channel: nickname if set, else the ID."""
+    nick = ch.get('nickname', '').strip()
+    return nick if nick else str(ch.get('id', ''))
+
+
 def _channels_summary(sig_settings: dict) -> str:
     """Short summary of channels for the Signal Monitor panel status line."""
     channels = sig_settings.get('channels', [])
     if not channels:
         return 'None configured'
     active = sum(1 for c in channels if c.get('active', True))
-    return f"{active}/{len(channels)} active"
+    names = ', '.join(_ch_display(c) for c in channels[:3])
+    suffix = ', …' if len(channels) > 3 else ''
+    return f"{active}/{len(channels)} active ({names}{suffix})"
 
 
 def _channels_panel_text(channels: list) -> str:
@@ -770,10 +898,12 @@ def _channels_panel_text(channels: list) -> str:
     else:
         for idx, ch in enumerate(channels, 1):
             ch_id = str(ch.get('id', ''))
+            nick = ch.get('nickname', '').strip()
             active = ch.get('active', True)
             icon = '🟢' if active else '🔴'
-            text += f"{idx}. `{ch_id}` — {icon} {'**Active**' if active else 'Inactive'}\n"
-        text += "\nTap a channel to toggle it ON/OFF. Tap 🗑 to remove."
+            name_line = f"**{nick}** (`{ch_id}`)" if nick else f"`{ch_id}`"
+            text += f"{idx}. {name_line} — {icon} {'**Active**' if active else 'Inactive'}\n"
+        text += "\nTap a channel to toggle ON/OFF · ✏️ rename · 🗑 remove."
     return text
 
 
@@ -781,14 +911,16 @@ def _channels_panel_keyboard(channels: list) -> list:
     """Keyboard rows for the Manage Channels panel."""
     rows = []
     for idx, ch in enumerate(channels):
-        ch_id = str(ch.get('id', ''))
         active = ch.get('active', True)
-        display = ch_id if len(ch_id) <= 22 else ch_id[:19] + '…'
+        display = _ch_display(ch)
+        if len(display) > 18:
+            display = display[:15] + '…'
         rows.append([
             InlineKeyboardButton(
                 f"{'🟢' if active else '🔴'} {display}",
                 callback_data=f"sig_ch_toggle:{idx}",
             ),
+            InlineKeyboardButton("✏️", callback_data=f"sig_ch_rename:{idx}"),
             InlineKeyboardButton("🗑", callback_data=f"sig_ch_remove:{idx}"),
         ])
     rows.append([InlineKeyboardButton("➕ Add Channel", callback_data="sig_channel_add")])
@@ -1015,14 +1147,17 @@ async def get_quotex_client(user_id: int, account_doc_id: str, interaction_type:
     # Per-account isolated session directory so multiple accounts don't share tokens
     session_path = f"sessions/{account_doc_id}"
 
-    # --- Playwright pre-auth: populate session.json before pyquotex touches it ---
+    # --- Selenium pre-auth: ensure a valid __cf_clearance is in session.json ---
+    # pyquotex cannot solve Cloudflare's managed challenge on its own.
+    # ensure_session() checks whether the saved session is still fresh; if not it
+    # runs a headless or visible Selenium login to obtain a new __cf_clearance cookie.
     if _quotex_auth:
         try:
             await _quotex_auth.ensure_session(email, password, session_path=session_path)
-        except Exception as _pw_err:
-            logger.warning(f"[Auth] Playwright pre-auth for {email} failed: {_pw_err}")
+        except Exception as _auth_err:
+            logger.warning(f"[Auth] Selenium pre-auth for {email} failed: {_auth_err}")
     else:
-        logger.warning("[Auth] quotex_auth not available; skipping Playwright pre-auth.")
+        logger.warning("[Auth] quotex_auth not available; skipping Selenium pre-auth.")
 
     qx_client: Optional[Quotex] = None
     connection_check = False
@@ -1088,19 +1223,27 @@ async def get_quotex_client(user_id: int, account_doc_id: str, interaction_type:
             """Wrapper to run the connect method in a thread."""
             return asyncio.run(qx_client.connect())
 
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            future = executor.submit(connect_in_thread)
-            try:
-                connection_check, connection_reason = await asyncio.wait_for(
-                    asyncio.wrap_future(future),  # Wrap the thread future for asyncio compatibility
-                    timeout=180.0
-                )
-            except asyncio.TimeoutError:
-                logger.error("Connection attempt timed out.")
-                connection_check, connection_reason = False, "Timeout during connection"
-            except Exception as e:
-                logger.error(f"Error during connection in thread: {e}", exc_info=True)
-                connection_check, connection_reason = False, str(e)
+        # Use an explicit executor (not a context-manager `with`) so that
+        # asyncio.CancelledError / KeyboardInterrupt during bot shutdown does
+        # NOT block on shutdown(wait=True) while the thread is still running.
+        _executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = _executor.submit(connect_in_thread)
+        try:
+            connection_check, connection_reason = await asyncio.wait_for(
+                asyncio.wrap_future(future),
+                timeout=180.0
+            )
+        except asyncio.TimeoutError:
+            logger.error("Connection attempt timed out.")
+            connection_check, connection_reason = False, "Timeout during connection"
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            _executor.shutdown(wait=False, cancel_futures=True)
+            raise
+        except Exception as e:
+            logger.error(f"Error during connection in thread: {e}", exc_info=True)
+            connection_check, connection_reason = False, str(e)
+        finally:
+            _executor.shutdown(wait=False, cancel_futures=True)
         # Deactivate patch state immediately after
         patch_state['expecting_pin'] = False
         logger.info("Patch state set to NOT expect PIN.")
@@ -1146,11 +1289,22 @@ async def get_quotex_client(user_id: int, account_doc_id: str, interaction_type:
                 or "cf-mitigated" in reason_str.lower()
                 or "just a moment" in reason_str.lower()
                 or "cloudflare" in reason_str.lower()
+                or "websocket connection closed" in reason_str.lower()
             ):
+                # Delete the stale session so the next restart forces a fresh Selenium login
+                _stale_sess = Path(f"{session_path}/session.json")
+                if _stale_sess.exists():
+                    try:
+                        _stale_sess.unlink()
+                        logger.warning(
+                            f"[Auth] Deleted stale session.json for {email} "
+                            "(Cloudflare 403 on WebSocket connect)."
+                        )
+                    except Exception as _del_err:
+                        logger.warning(f"[Auth] Could not delete stale session: {_del_err}")
                 return None, (
-                    "Connection blocked by Quotex/Cloudflare anti-bot challenge. "
-                    "Use a valid Quotex session token/cookies (QUOTEX_SSID/QUOTEX_COOKIES) "
-                    "or run from an environment/IP that can pass browser challenge."
+                    "Connection blocked by Cloudflare — stale session deleted. "
+                    "Restart the bot; a browser window will open for you to log in."
                 )
             else:
                  return None, f"Connection Failed: {reason_str}"
@@ -2026,6 +2180,7 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
         keyboard_rows = []
         if user_id == OWNER_ID:
             keyboard_rows.append([InlineKeyboardButton("📡 Signal Mode", callback_data="signal_status_view")])
+            keyboard_rows.append([InlineKeyboardButton("🎯 Strategy Mode", callback_data="strategy_view")])
 
         keyboard_rows.append(back_button("main_menu")) # Always provide a way back
 
@@ -2034,6 +2189,114 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
             reply_markup=InlineKeyboardMarkup(keyboard_rows),
             parse_mode=enums.ParseMode.DEFAULT
         )
+
+    # ── Strategy Mode ─────────────────────────────────────────────────────────
+
+    elif data == "strategy_view":
+        if user_id != OWNER_ID:
+            await callback_query.answer("⛔️ Owner only.", show_alert=True)
+            return
+        sig_settings = await get_signal_settings()
+        await message.edit_text(
+            _strategy_panel_text(sig_settings),
+            reply_markup=InlineKeyboardMarkup(_strategy_panel_keyboard(sig_settings)),
+        )
+
+    elif data == "strat_toggle":
+        if user_id != OWNER_ID:
+            await callback_query.answer("⛔️ Owner only.", show_alert=True)
+            return
+        sig_settings = await get_signal_settings()
+        new_val = not sig_settings.get('strategy_mode', False)
+        await update_signal_settings({'strategy_mode': new_val})
+        await callback_query.answer(f"Strategy Mode {'enabled ✅' if new_val else 'disabled 🔴'}")
+        sig_settings = await get_signal_settings()
+        try:
+            await message.edit_text(
+                _strategy_panel_text(sig_settings),
+                reply_markup=InlineKeyboardMarkup(_strategy_panel_keyboard(sig_settings)),
+            )
+        except Exception as _e:
+            if "MESSAGE_NOT_MODIFIED" not in str(_e):
+                raise
+
+    elif data == "strat_reset_step":
+        if user_id != OWNER_ID:
+            await callback_query.answer("⛔️ Owner only.", show_alert=True)
+            return
+        await update_signal_settings({'strategy_step': 0})
+        await callback_query.answer("Step counter reset to 1.")
+        sig_settings = await get_signal_settings()
+        try:
+            await message.edit_text(
+                _strategy_panel_text(sig_settings),
+                reply_markup=InlineKeyboardMarkup(_strategy_panel_keyboard(sig_settings)),
+            )
+        except Exception as _e:
+            if "MESSAGE_NOT_MODIFIED" not in str(_e):
+                raise
+
+    elif data.startswith("strat_select:"):
+        if user_id != OWNER_ID:
+            await callback_query.answer("⛔️ Owner only.", show_alert=True)
+            return
+        try:
+            new_sid = int(data.split(":", 1)[1])
+        except (ValueError, IndexError):
+            await callback_query.answer("Invalid.", show_alert=True)
+            return
+        if new_sid not in STRATEGIES:
+            await callback_query.answer("Unknown strategy.", show_alert=True)
+            return
+        await update_signal_settings({'strategy_id': new_sid, 'strategy_step': 0})
+        await callback_query.answer(f"Switched to {STRATEGIES[new_sid]['name']} — step reset.")
+        sig_settings = await get_signal_settings()
+        try:
+            await message.edit_text(
+                _strategy_panel_text(sig_settings),
+                reply_markup=InlineKeyboardMarkup(_strategy_panel_keyboard(sig_settings)),
+            )
+        except Exception as _e:
+            if "MESSAGE_NOT_MODIFIED" not in str(_e):
+                raise
+
+    elif data == "noop":
+        await callback_query.answer()
+
+    elif data.startswith("strat_step_set:"):
+        if user_id != OWNER_ID:
+            await callback_query.answer("⛔️ Owner only.", show_alert=True)
+            return
+        try:
+            new_step_idx = int(data.split(":", 1)[1])
+        except (ValueError, IndexError):
+            await callback_query.answer("Invalid.", show_alert=True)
+            return
+        sig_settings = await get_signal_settings()
+        strat = STRATEGIES.get(sig_settings.get('strategy_id', 1))
+        if not strat or new_step_idx < 0 or new_step_idx >= len(strat['steps']):
+            await callback_query.answer("Invalid step.", show_alert=True)
+            return
+        await update_signal_settings({'strategy_step': new_step_idx})
+        amt = strat['steps'][new_step_idx]
+        await callback_query.answer(f"✅ Step {new_step_idx + 1} active — ${amt}")
+        # Refresh the keyboard on the current message to highlight the new step
+        sig_settings = await get_signal_settings()
+        try:
+            pending = sig_settings.get('pending_signal')
+            if pending:
+                direction = pending.get('signal_direction')
+                await message.edit_reply_markup(
+                    reply_markup=build_manual_trade_keyboard(direction, sig_settings)
+                )
+            else:
+                kbd = _build_step_selector_keyboard(sig_settings.get('strategy_id', 1), new_step_idx)
+                if kbd:
+                    await message.edit_reply_markup(reply_markup=kbd)
+        except Exception:
+            pass
+
+    # ── End Strategy Mode ──────────────────────────────────────────────────────
 
     # --- Role Management Navigation ---
     elif data == "admin_manage_sudo":
@@ -2244,6 +2507,33 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
             if "MESSAGE_NOT_MODIFIED" not in str(_e):
                 raise
 
+    elif data.startswith("sig_ch_rename:"):
+        if user_id != OWNER_ID:
+            await callback_query.answer("⛔️ Owner only.", show_alert=True)
+            return
+        try:
+            ch_idx = int(data.split(":", 1)[1])
+        except (ValueError, IndexError):
+            await callback_query.answer("Invalid.", show_alert=True)
+            return
+        sig_settings = await get_signal_settings()
+        channels = sig_settings.get('channels', [])
+        if ch_idx < 0 or ch_idx >= len(channels):
+            await callback_query.answer("Channel not found.", show_alert=True)
+            return
+        ch = channels[ch_idx]
+        user_states[user_id] = f"waiting_channel_rename:{ch_idx}:{message.id}"
+        try:
+            await message.edit_text(
+                f"✏️ **Rename Channel**\n\n"
+                f"Channel: `{ch.get('id','')}` "
+                f"(current name: **{ch.get('nickname','') or 'none'}**)\n\n"
+                "Send a new nickname for this channel, or /skip to clear it.\n"
+                "Send /cancel to go back."
+            )
+        except Exception:
+            pass
+
     elif data.startswith("sig_ch_remove:"):
         if user_id != OWNER_ID:
             await callback_query.answer("⛔️ Owner only.", show_alert=True)
@@ -2258,7 +2548,7 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
         if 0 <= ch_idx < len(channels):
             removed = channels.pop(ch_idx)
             await update_signal_settings({'channels': channels})
-            await callback_query.answer(f"Removed {removed.get('id', 'channel')}.")
+            await callback_query.answer(f"Removed {_ch_display(removed)}.")
             logger.info(f"[Signal] Channel {removed.get('id')} removed by user {user_id}")
         else:
             await callback_query.answer("Channel not found.", show_alert=True)
@@ -2705,30 +2995,33 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
             await callback_query.answer("⛔️ Owner only.", show_alert=True)
             return
 
-        sig_settings = await get_signal_settings()
-        pending = sig_settings.get('pending_signal')
+        # Use a lock to prevent double-execution from rapid double-taps.
+        # The critical section is the DB read→check→clear of pending_signal.
+        async with _manual_trade_lock:
+            sig_settings = await get_signal_settings()
+            pending = sig_settings.get('pending_signal')
 
-        if not pending:
-            try:
-                await message.edit_text("⚠️ No pending signal found.")
-            except Exception:
-                pass
-            return
+            if not pending:
+                try:
+                    await message.edit_text("⚠️ No pending signal found.")
+                except Exception:
+                    pass
+                return
 
-        if data == "sig_manual_cancel":
+            if data == "sig_manual_cancel":
+                await update_signal_settings({'pending_signal': None})
+                await callback_query.answer("Signal cancelled.")
+                try:
+                    await message.edit_text("❌ Manual trade cancelled.")
+                except Exception:
+                    pass
+                return
+
+            # Atomically claim and clear the pending signal before any awaitable work
+            chosen_direction = 'call' if data == 'sig_manual_call' else 'put'
+            full_manual_signal = {**pending, 'direction': chosen_direction}
             await update_signal_settings({'pending_signal': None})
-            await callback_query.answer("Signal cancelled.")
-            try:
-                await message.edit_text("❌ Manual trade cancelled.")
-            except Exception:
-                pass
-            return
-
-        chosen_direction = 'call' if data == 'sig_manual_call' else 'put'
-
-        # Build the full signal using the pending data + chosen direction
-        full_manual_signal = {**pending, 'direction': chosen_direction}
-        await update_signal_settings({'pending_signal': None})
+        # Lock released — UI update and trade execution outside the lock
 
         dir_icon = '🔼 UP (CALL)' if chosen_direction == 'call' else '🔽 DOWN (PUT)'
         signal_dir = pending.get('signal_direction')
@@ -2749,7 +3042,8 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
         except Exception:
             pass
 
-        logger.info(f"[Manual Trade] User chose {chosen_direction.upper()} (signal was {signal_dir or 'N/A'})")
+        logger.info(f"[Manual Trade] User chose {chosen_direction.upper()} (signal was {signal_dir or 'N/A'})")        
+        full_manual_signal['received_at'] = time.time()  # deadline starts when user taps
         await execute_signal_trade(full_manual_signal)
 
     # ── Trading Journal ───────────────────────────────────────────────────────
@@ -2954,7 +3248,12 @@ async def message_handler(client: Client, message: Message):
          if text == "/cancel":
              if user_id in user_states:
                  state = user_states.pop(user_id)
-                 await message.reply_text(f"Action ({state.split(':')[0]}) cancelled.", quote=True)
+                 _cancel_labels = {
+                     "waiting_qx_email": "Adding New Account Action Canceled",
+                     "waiting_qx_password": "Adding New Account Action Canceled",
+                 }
+                 _cancel_msg = _cancel_labels.get(state.split(':')[0], f"Action ({state.split(':')[0]}) cancelled.")
+                 await message.reply_text(_cancel_msg, quote=True)
              else:
                  await message.reply_text("Nothing to cancel.", quote=True)
          # Potentially handle other non-command text if needed
@@ -3456,7 +3755,41 @@ async def message_handler(client: Client, message: Message):
             action = "already in list"
         logger.info(f"[Signal] Channel {new_channel} {action} (set by user {user_id})")
 
-        # Edit the prompt message back to channels panel
+        # Prompt for a nickname
+        _sent = await message.reply_text(
+            f"✅ Signal channel `{new_channel}` {action}.\n\n"
+            "✏️ **Nickname** (optional): Reply with a short name for this channel "
+            "(e.g. _Pro Signals_), or /skip to leave it unnamed.",
+            quote=True,
+        )
+        user_states[user_id] = f"waiting_channel_nickname:{ch_id_str}:{ch_msg_id}"
+
+    elif state and state.startswith("waiting_channel_nickname:"):
+        del user_states[user_id]
+        parts_s = state.split(":", 2)
+        ch_id_target = parts_s[1] if len(parts_s) > 1 else ''
+        try:
+            ch_msg_id = int(parts_s[2]) if len(parts_s) > 2 else None
+        except (ValueError, TypeError):
+            ch_msg_id = None
+
+        raw = text.strip()
+        if raw.lower() in ("/cancel", "/skip"):
+            nickname = ''
+        else:
+            nickname = raw[:40]  # cap at 40 chars
+
+        sig_settings_cur = await get_signal_settings()
+        channels = list(sig_settings_cur.get('channels', []))
+        for ch in channels:
+            if str(ch.get('id', '')) == ch_id_target:
+                ch['nickname'] = nickname
+                break
+        await update_signal_settings({'channels': channels})
+        if nickname:
+            await message.reply_text(f"✅ Nickname set to **{nickname}**.", quote=True)
+
+        # Refresh the channels panel
         if bot_instance and ch_msg_id:
             try:
                 sig_settings_updated = await get_signal_settings()
@@ -3470,10 +3803,46 @@ async def message_handler(client: Client, message: Message):
             except Exception:
                 pass
 
-        await message.reply_text(
-            f"✅ Signal channel `{new_channel}` {action}.",
-            quote=True,
-        )
+    elif state and state.startswith("waiting_channel_rename:"):
+        del user_states[user_id]
+        parts_s = state.split(":", 2)
+        try:
+            ch_idx = int(parts_s[1]) if len(parts_s) > 1 else -1
+        except (ValueError, TypeError):
+            ch_idx = -1
+        try:
+            ch_msg_id = int(parts_s[2]) if len(parts_s) > 2 else None
+        except (ValueError, TypeError):
+            ch_msg_id = None
+
+        raw = text.strip()
+        if raw.lower() == "/cancel":
+            await message.reply_text("❌ Cancelled.", quote=True)
+        else:
+            nickname = '' if raw.lower() == "/skip" else raw[:40]
+            sig_settings_cur = await get_signal_settings()
+            channels = list(sig_settings_cur.get('channels', []))
+            if 0 <= ch_idx < len(channels):
+                channels[ch_idx]['nickname'] = nickname
+                await update_signal_settings({'channels': channels})
+                label = f"**{nickname}**" if nickname else "cleared"
+                await message.reply_text(f"✅ Channel nickname {label}.", quote=True)
+            else:
+                await message.reply_text("❌ Channel not found.", quote=True)
+
+        # Refresh the channels panel
+        if bot_instance and ch_msg_id:
+            try:
+                sig_settings_updated = await get_signal_settings()
+                chs_updated = sig_settings_updated.get('channels', [])
+                await bot_instance.edit_message_text(
+                    chat_id=user_id,
+                    message_id=ch_msg_id,
+                    text=_channels_panel_text(chs_updated),
+                    reply_markup=InlineKeyboardMarkup(_channels_panel_keyboard(chs_updated)),
+                )
+            except Exception:
+                pass
 
     elif state and state.startswith("waiting_signal_delay:"):
         del user_states[user_id]
@@ -3605,15 +3974,20 @@ async def _check_asset_open_and_get_name(qx_client: Quotex, asset_name_original:
             return None
 
         else:
-            # 1. Asset name is already OTC — must use force_open=True
-            checked_name, data = await qx_client.get_available_asset(asset_name_original, force_open=True)
-            if checked_name and data:
-                logger.info(f"[{asset_name_original}] OTC asset is open (force_open=True).")
-                return checked_name
+            # 1. Asset name is already OTC.
+            # Do NOT use get_available_asset(force_open=True) here — when the OTC
+            # instrument's i[14] flag is 0, it silently strips "_otc" and returns
+            # the base non-OTC name, causing orders on the wrong asset and not_price_.
+            # OTC pairs on Quotex are available 24/7, so we only need to confirm the
+            # symbol exists in the instruments list (i[0] != None), ignoring i[14].
+            _, otc_data = await qx_client.check_asset_open(asset_name_original)
+            if otc_data and otc_data[0] is not None:
+                logger.info(f"[{asset_name_original}] OTC asset found in instruments.")
+                return asset_name_original
 
-            # 2. OTC unavailable — try the non-OTC base asset as fallback
+            # 2. OTC symbol not in instruments list — try the non-OTC base as fallback
             base_asset = asset_name_original[:-4]  # strip "_otc"
-            logger.info(f"[{asset_name_original}] OTC unavailable. Trying base asset {base_asset}...")
+            logger.info(f"[{asset_name_original}] OTC not in instruments. Trying base asset {base_asset}...")
             checked_name_base, data_base = await qx_client.get_available_asset(base_asset, force_open=False)
             if checked_name_base and data_base and data_base[2]:
                 logger.info(f"[{base_asset}] Base asset is open (fallback from OTC).")
@@ -3660,20 +4034,47 @@ def get_amount_tiers(balance: Optional[float]) -> list:
     return [15, 20, 25, 30, 35, 65, 125, 200, 300, 350]
 
 
-def build_manual_trade_keyboard(signal_direction: Optional[str] = None) -> InlineKeyboardMarkup:
+def build_manual_trade_keyboard(
+    signal_direction: Optional[str] = None,
+    sig_settings: Optional[dict] = None,
+) -> InlineKeyboardMarkup:
     """
     Build the UP/DOWN inline keyboard for manual trade confirmation.
-    If signal_direction is provided, the matching button is highlighted with ⭐.
+    signal_direction: highlights the matching button with ⭐.
+    sig_settings: when strategy mode is on, prepends a compact step selector.
     """
     call_label = f"⭐ 🔼 UP (CALL)" if signal_direction == 'call' else "🔼 UP (CALL)"
     put_label  = f"⭐ 🔽 DOWN (PUT)" if signal_direction == 'put'  else "🔽 DOWN (PUT)"
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(call_label, callback_data="sig_manual_call"),
-            InlineKeyboardButton(put_label,  callback_data="sig_manual_put"),
-        ],
-        [InlineKeyboardButton("❌ Skip / Cancel", callback_data="sig_manual_cancel")],
+    keyboard: list = []
+    if sig_settings and sig_settings.get('strategy_mode'):
+        sid = sig_settings.get('strategy_id', 1)
+        current_step = sig_settings.get('strategy_step', 0)
+        strat = STRATEGIES.get(sid)
+        if strat:
+            steps = strat['steps']
+            amt_now = steps[min(current_step, len(steps) - 1)]
+            keyboard.append([InlineKeyboardButton(
+                f"🎯 Strategy: Step {current_step + 1}/10 — ${amt_now}  (tap to change)",
+                callback_data="noop",
+            )])
+            row: list = []
+            for i, amt in enumerate(steps):
+                star = '⭐' if i == current_step else ''
+                row.append(InlineKeyboardButton(
+                    f"{star}{i + 1}·${amt}",
+                    callback_data=f"strat_step_set:{i}",
+                ))
+                if len(row) == 5:
+                    keyboard.append(row)
+                    row = []
+            if row:
+                keyboard.append(row)
+    keyboard.append([
+        InlineKeyboardButton(call_label, callback_data="sig_manual_call"),
+        InlineKeyboardButton(put_label,  callback_data="sig_manual_put"),
     ])
+    keyboard.append([InlineKeyboardButton("❌ Skip / Cancel", callback_data="sig_manual_cancel")])
+    return InlineKeyboardMarkup(keyboard)
 
 
 def build_duration_keyboard(signal_duration: int) -> InlineKeyboardMarkup:
@@ -3721,6 +4122,10 @@ async def execute_signal_trade(signal: Dict[str, Any]):
     Execute a signal trade on ALL owner Quotex accounts simultaneously.
     Notifies the owner with per-account trade results.
     """
+    # Capture the moment we start — used to enforce MAX_ENTRY_DELAY_SECONDS.
+    # Callers may supply their own timestamp (e.g. exact moment direction arrived).
+    received_at: float = signal.get('received_at') or time.time()
+
     asset = signal.get('asset')
     direction = signal.get('direction')
     amount = float(signal.get('amount', DEFAULT_TRADE_AMOUNT))
@@ -3734,6 +4139,47 @@ async def execute_signal_trade(signal: Dict[str, Any]):
     # ── Apply signal-delay compensation ──────────────────────────────────────
     sig_settings = await get_signal_settings()
     signal_delay = int(sig_settings.get('signal_delay', 0))
+
+    # ── Strategy Mode: override trade amount ──────────────────────────────────
+    # ── Strategy Mode: override trade amount ──────────────────────────────────
+    # If the user manually confirmed a specific amount (amount_confirmed=True on
+    # the signal dict), that choice takes priority over the strategy step amount.
+    user_confirmed_amount: Optional[float] = (
+        float(signal['amount'])
+        if signal.get('amount_confirmed') and signal.get('amount') is not None
+        else None
+    )
+
+    strategy_override: Optional[dict] = None  # passed down to per-account handler
+    if sig_settings.get('strategy_mode') and user_confirmed_amount is None:
+        sid   = sig_settings.get('strategy_id', 1)
+        step  = sig_settings.get('strategy_step', 0)
+        strat = STRATEGIES.get(sid)
+        if strat:
+            steps = strat['steps']
+            step  = min(step, len(steps) - 1)
+            strategy_amount = float(steps[step])
+            strategy_override = {
+                'strategy_id':     sid,
+                'strategy_step':   step,
+                'strategy_amount': strategy_amount,
+                'strategy_steps':  steps,
+                'strategy_name':   strat['name'],
+                'min_balance':     strat['min_balance'],
+            }
+            amount = strategy_amount  # use for the initial notification
+            logger.info(
+                f"[Signal Trade] Strategy Mode — {strat['name']} "
+                f"step {step + 1}/10 amount=${strategy_amount}"
+            )
+        else:
+            logger.warning(f"[Signal Trade] Unknown strategy_id={sid}, proceeding with signal amount.")
+    elif sig_settings.get('strategy_mode') and user_confirmed_amount is not None:
+        logger.info(
+            f"[Signal Trade] Strategy Mode active but user manually confirmed "
+            f"amount=${user_confirmed_amount:g} — strategy amount bypassed."
+        )
+
     if signal_delay > 0:
         duration = max(raw_duration - signal_delay, 5)  # floor at 5s
         delay_note = f" _(−{signal_delay}s delay compensation)_"
@@ -3789,7 +4235,9 @@ async def execute_signal_trade(signal: Dict[str, Any]):
 
     trade_tasks = [
         _execute_single_account_signal_trade(
-            str(acc['_id']), acc['email'], asset, asset_display, direction, amount, duration
+            str(acc['_id']), acc['email'], asset, asset_display, direction, amount, duration,
+            strategy_override=strategy_override,
+            received_at=received_at,
         )
         for acc in accounts
     ]
@@ -3803,6 +4251,8 @@ async def _execute_single_account_signal_trade(
     account_doc_id: str, email: str,
     asset: str, asset_display: str,
     direction: str, amount: float, duration: int,
+    strategy_override: Optional[dict] = None,
+    received_at: Optional[float] = None,
 ):
     """Execute a signal-based trade on one Quotex account and report result to owner."""
     try:
@@ -3849,6 +4299,43 @@ async def _execute_single_account_signal_trade(
                 )
             return
 
+        # ── Strategy Mode: balance check + override amount ────────────────────
+        if strategy_override:
+            try:
+                current_balance = await qx_client.get_balance()
+            except Exception:
+                current_balance = None
+
+            strategy_amount = strategy_override['strategy_amount']
+            min_balance     = strategy_override['min_balance']
+            strat_name      = strategy_override['strategy_name']
+            strat_step      = strategy_override['strategy_step']
+
+            if current_balance is not None and current_balance < strategy_amount:
+                logger.warning(
+                    f"[Signal Trade] [{email}] Strategy balance check failed: "
+                    f"balance=${current_balance:.2f} < step amount=${strategy_amount} "
+                    f"(step {strat_step + 1}/10, {strat_name})"
+                )
+                if bot_instance:
+                    await bot_instance.send_message(
+                        OWNER_ID,
+                        f"⚠️ **{email}** — Strategy trade skipped\n\n"
+                        f"🎯 {strat_name}\n"
+                        f"📍 Step {strat_step + 1}/10 requires **${strategy_amount:g}**\n"
+                        f"💰 Current balance: **${current_balance:.2f}**\n\n"
+                        f"_Insufficient balance for this strategy step. "
+                        f"Deposit funds or reset the step counter._",
+                    )
+                return
+            # Override signal amount with strategy amount
+            amount = strategy_amount
+            logger.info(
+                f"[Signal Trade] [{email}] Strategy override: amount=${amount} "
+                f"(step {strat_step + 1}/10, {strat_name})"
+            )
+        # ─────────────────────────────────────────────────────────────────────
+
         logger.info(f"[Signal Trade] [{email}] {direction.upper()} {asset_open} ${amount} {duration}s {trade_mode}")
 
         # Capture opening balance (only persisted on first trade of the calendar day)
@@ -3860,6 +4347,57 @@ async def _execute_single_account_signal_trade(
         except Exception as bal_err:
             logger.warning(f"[Signal Trade] [{email}] Could not fetch pre-trade balance: {bal_err}")
             balance_before = None
+
+        # Prime the price feed before placing the order.
+        # Quotex rejects orders with "not_price_" when no price data is actively
+        # streaming for the asset. start_realtime_price() subscribes AND waits
+        # until the server sends at least one tick, preventing the race condition
+        # that buy() has (it calls start_candles_stream but doesn't wait for data).
+        try:
+            await asyncio.wait_for(
+                qx_client.start_realtime_price(asset_open),
+                timeout=8,
+            )
+            logger.info(f"[Signal Trade] [{email}] Price feed ready for {asset_open}.")
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"[Signal Trade] [{email}] Price feed for {asset_open} not ready after 8s — "
+                "proceeding anyway."
+            )
+        except Exception as pf_err:
+            logger.warning(f"[Signal Trade] [{email}] Price feed priming error: {pf_err} — proceeding anyway.")
+
+        # Clear any stale WebSocket error flag from a previous trade or session.
+        # global_value.check_websocket_if_error is never reset by pyquotex — once it
+        # is set (e.g. from a prior not_price_ response) every subsequent buy() call
+        # exits the wait loop immediately with the old error reason.
+        _qx_global_value.check_websocket_if_error = False
+        _qx_global_value.websocket_error_reason = None
+
+        # ── Deadline check ────────────────────────────────────────────────────
+        # All setup is done. If more than MAX_ENTRY_DELAY_SECONDS have elapsed
+        # since the signal arrived, skip the trade — a late entry is worse than
+        # no entry. This catches slow re-auth, slow WS reconnects, etc.
+        if received_at is not None:
+            elapsed = time.time() - received_at
+            if elapsed > MAX_ENTRY_DELAY_SECONDS:
+                logger.warning(
+                    f"[Signal Trade] [{email}] Trade SKIPPED — {elapsed:.1f}s elapsed since signal "
+                    f"(limit: {MAX_ENTRY_DELAY_SECONDS}s). Late entry risk too high."
+                )
+                if bot_instance:
+                    try:
+                        await bot_instance.send_message(
+                            OWNER_ID,
+                            f"⏱ **{email}**\n"
+                            f"Trade skipped — setup took **{elapsed:.1f}s** "
+                            f"(limit: {MAX_ENTRY_DELAY_SECONDS:.0f}s).\n"
+                            "_A late entry was avoided. Check your session health._",
+                        )
+                    except Exception:
+                        pass
+                return
+        # ─────────────────────────────────────────────────────────────────────
 
         # Attempt buy with one automatic reconnect on connection-reset errors
         entry_time = datetime.datetime.now(datetime.timezone.utc)
@@ -3890,6 +4428,11 @@ async def _execute_single_account_signal_trade(
 
         if not status:
             err = buy_info if isinstance(buy_info, str) else str(buy_info)
+            logger.warning(
+                f"[Signal Trade] [{email}] buy() returned status=False "
+                f"(buy_info={err!r}). Trade was not placed — "
+                f"likely a WebSocket timeout (no buy_id received from Quotex)."
+            )
             if bot_instance:
                 await bot_instance.send_message(
                     OWNER_ID,
@@ -4000,6 +4543,48 @@ async def _execute_single_account_signal_trade(
         else:
             icon, outcome, result_str = "❌", f"LOSS!  Lost: -${abs(profit):.2f}", "LOSS"
 
+        # ── Strategy step advance / reset ─────────────────────────────────────
+        strategy_note = ""
+        result_keyboard = None
+        if strategy_override:
+            strat_step  = strategy_override['strategy_step']
+            strat_steps = strategy_override['strategy_steps']
+            strat_name  = strategy_override['strategy_name']
+            if result_str == "WIN":
+                new_step = 0
+                strategy_note = f"\n🎯 Strategy: WIN — step reset to **1** ✅"
+            elif result_str == "TIE":
+                # Treat tie as no change — stay on same step
+                new_step = strat_step
+                strategy_note = f"\n🎯 Strategy: TIE — step unchanged (**{strat_step + 1}/10**)"
+            else:  # LOSS
+                new_step = strat_step + 1
+                if new_step >= len(strat_steps):
+                    new_step = 0
+                    strategy_note = (
+                        f"\n🎯 Strategy: LOSS — full cycle complete, resetting to step **1** 🔄"
+                    )
+                else:
+                    next_amt = strat_steps[new_step]
+                    strategy_note = (
+                        f"\n🎯 Strategy: LOSS — advancing to step **{new_step + 1}/10** "
+                        f"(next amount: **${next_amt}**) 📈"
+                    )
+            # Persist the new step unconditionally — we always want the step to
+            # reflect the latest trade result. For single-account setups this is
+            # correct; for concurrent multi-account the last writer wins, which is
+            # acceptable since all accounts trade the same signal at the same step.
+            try:
+                await update_signal_settings({'strategy_step': new_step})
+                logger.info(
+                    f"[Signal Trade] [{email}] Strategy step "
+                    f"{strat_step + 1} → {new_step + 1} ({result_str})"
+                )
+            except Exception as step_err:
+                logger.warning(f"[Signal Trade] [{email}] Could not update strategy step: {step_err}")
+            result_keyboard = _build_step_selector_keyboard(strategy_override['strategy_id'], new_step)
+        # ─────────────────────────────────────────────────────────────────────
+
         # Capture closing balance after trade settlement
         try:
             balance_after = await qx_client.get_balance()
@@ -4039,17 +4624,52 @@ async def _execute_single_account_signal_trade(
                 f"📈 Direction: `{direction.upper()}`\n"
                 f"💵 Amount: `${amount}`\n"
                 f"🏷 Trade ID: `{trade_id}`\n"
-                f"📌 Result: **{outcome}**",
+                f"📌 Result: **{outcome}**"
+                + strategy_note,
+                reply_markup=result_keyboard,
             )
 
     except Exception as e:
         logger.error(f"[Signal Trade] Error on account {account_doc_id}: {e}", exc_info=True)
+
+        # Detect stale-session: server returns no profile data (expired token)
+        _stale_auth = (
+            isinstance(e, (TypeError, RuntimeError))
+            and "NoneType" in str(e) or "session token" in str(e).lower()
+        )
+        if _stale_auth:
+            logger.warning(
+                f"[Signal Trade] {account_doc_id}: stale auth detected — evicting client "
+                "and deleting session.json so next trade triggers a fresh login."
+            )
+            # Evict the cached client
+            try:
+                _stale_client = active_quotex_clients.pop(account_doc_id, None)
+                if _stale_client:
+                    await _stale_client.close()
+            except Exception:
+                pass
+            # Delete the stale session file
+            _session_file = Path(f"sessions/{account_doc_id}/session.json")
+            if _session_file.exists():
+                try:
+                    _session_file.unlink()
+                    logger.warning(
+                        f"[Signal Trade] {account_doc_id}: deleted stale session.json."
+                    )
+                except Exception as _del_err:
+                    logger.warning(f"[Signal Trade] Could not delete session.json: {_del_err}")
+
         if bot_instance:
             try:
-                await bot_instance.send_message(
-                    OWNER_ID,
-                    f"❌ **{email}**\nUnexpected error during signal trade.\n`{type(e).__name__}: {e}`",
+                _msg = (
+                    f"⚠️ **{email}**\n"
+                    "Session expired mid-trade — stale session cleared.\n"
+                    "The next signal will re-authenticate automatically."
+                    if _stale_auth else
+                    f"❌ **{email}**\nUnexpected error during signal trade.\n`{type(e).__name__}: {e}`"
                 )
+                await bot_instance.send_message(OWNER_ID, _msg)
             except Exception:
                 pass
 
@@ -4119,9 +4739,15 @@ async def handle_channel_message(client: Client, message):
         # ── Also try the channel a message was forwarded from (linked groups etc.) ──
         fwd_chat_id = None
         fwd_username = ''
-        if hasattr(message, 'forward_from_chat') and message.forward_from_chat:
-            fwd_chat_id = message.forward_from_chat.id
-            fwd_username = (getattr(message.forward_from_chat, 'username', None) or '').lower()
+        try:
+            fwd_origin = getattr(message, 'forward_origin', None)
+            if fwd_origin is not None:
+                fwd_chat = getattr(fwd_origin, 'chat', None)
+                if fwd_chat is not None:
+                    fwd_chat_id = fwd_chat.id
+                    fwd_username = (getattr(fwd_chat, 'username', None) or '').lower()
+        except Exception:
+            pass
 
         matched_channel = None
         for ch in active_channels:
@@ -4151,7 +4777,24 @@ async def handle_channel_message(client: Client, message):
             return
 
         text = message.text or message.caption or ''
-        if not text or not is_signal_message(text):
+
+        if not text:
+            return
+
+        if not is_signal_message(text):
+            # ── Non-signal channel message → forward as CHANNEL UPDATE ──────
+            try:
+                update_text = replace_referral_links(text)
+                # Use channel nickname if available, fall back to raw ID
+                _ch_obj = next((c for c in active_channels if str(c.get('id','')) == matched_channel), {})
+                _ch_label = _ch_obj.get('nickname', '').strip() or matched_channel
+                await bot_instance.send_message(
+                    OWNER_ID,
+                    f"📢 **Channel Update** — **{_ch_label}**\n\n{update_text}",
+                    disable_web_page_preview=False,
+                )
+            except Exception as fwd_err:
+                logger.warning(f"[Userbot] Could not forward channel update: {fwd_err}")
             return
 
         logger.info(f"[Userbot] Signal-like message from channel {matched_channel}: {text[:120]!r}")
@@ -4223,23 +4866,24 @@ async def handle_channel_message(client: Client, message):
                                                 chat_id=OWNER_ID,
                                                 message_id=manual_msg_id,
                                                 text=new_text,
-                                                reply_markup=build_manual_trade_keyboard(direction),
+                                                reply_markup=build_manual_trade_keyboard(direction, sig_settings),
                                             )
                                         except Exception:
                                             await bot_instance.send_message(
                                                 OWNER_ID, new_text,
-                                                reply_markup=build_manual_trade_keyboard(direction),
+                                                reply_markup=build_manual_trade_keyboard(direction, sig_settings),
                                             )
                                     else:
                                         sent = await bot_instance.send_message(
                                             OWNER_ID, new_text,
-                                            reply_markup=build_manual_trade_keyboard(direction),
+                                            reply_markup=build_manual_trade_keyboard(direction, sig_settings),
                                         )
                                         full_signal['manual_msg_id'] = sent.id
                                         await update_signal_settings({'pending_signal': full_signal})
                                 except Exception as exc:
                                     logger.warning(f"[Userbot] Could not update manual trade keyboard: {exc}")
                         else:
+                            full_signal['received_at'] = time.time()  # direction just arrived
                             await execute_signal_trade(full_signal)
                     else:
                         logger.info("[Userbot] Pending signal expired (>5 min). Discarding.")
@@ -4285,7 +4929,7 @@ async def handle_channel_message(client: Client, message):
                             f"💵 Amount: `${sig_amt_f:g}`\n\n"
                             f"📡 Signal says: **{dir_icon}**\n\n"
                             f"Choose your direction:",
-                            reply_markup=build_manual_trade_keyboard(sig_dir),
+                            reply_markup=build_manual_trade_keyboard(sig_dir, sig_settings),
                         )
                         manual_pending['manual_msg_id'] = manual_msg.id
                         await update_signal_settings({'pending_signal': manual_pending})
@@ -4293,6 +4937,7 @@ async def handle_channel_message(client: Client, message):
                         logger.warning(f"[Userbot] Could not send manual trade keyboard: {exc}")
             else:
                 await update_signal_settings({'pending_signal': None})
+                parsed['received_at'] = time.time()  # full signal — timer starts now
                 await execute_signal_trade(parsed)
         else:
             # Partial signal — store and wait for direction follow-up
@@ -4357,7 +5002,7 @@ async def handle_channel_message(client: Client, message):
                             f"⏱ Duration: `{dur_display}`\n\n"
                             f"_(Direction signal not yet received \u2014 buttons will update when it arrives)_\n\n"
                             f"Choose your direction:",
-                            reply_markup=build_manual_trade_keyboard(None),
+                            reply_markup=build_manual_trade_keyboard(None, sig_settings),
                         )
                         pending['manual_msg_id'] = manual_msg.id
                         await update_signal_settings({'pending_signal': pending})
@@ -4597,6 +5242,98 @@ async def _quotex_keepalive():
                 logger.debug(f"[KeepAlive] {acct_id}: {exc}")
 
 
+# Track consecutive failed connection cycles per account for the health monitor
+_ws_fail_ticks: dict = {}
+
+
+async def _quotex_ws_health_monitor():
+    """
+    Detect when a Quotex WebSocket is stuck in a Cloudflare 403 reconnect loop
+    and automatically re-authenticate to get fresh cookies.
+
+    Every 30 s it checks each cached client.  If the websocket thread is alive
+    but the connection flag shows disconnected for 2+ consecutive checks
+    (~60 s), it tears down the old WebSocket, runs ensure_session() for fresh
+    __cf_clearance cookies, then reconnects.
+    """
+    await asyncio.sleep(60)  # let the bot settle before first check
+    while True:
+        await asyncio.sleep(30)
+        for acct_id, qx_client in list(active_quotex_clients.items()):
+            try:
+                from pyquotex import global_value as _gv
+
+                ws_thread_alive = (
+                    hasattr(qx_client, 'websocket_thread') and
+                    qx_client.websocket_thread is not None and
+                    qx_client.websocket_thread.is_alive()
+                )
+                ws_connected = _gv.check_websocket_if_connect == 1
+
+                if ws_thread_alive and not ws_connected:
+                    # Thread is alive but no active connection → likely in a
+                    # Cloudflare 403 reconnect loop.
+                    _ws_fail_ticks[acct_id] = _ws_fail_ticks.get(acct_id, 0) + 1
+                    logger.warning(
+                        f"[WSHealth] {acct_id}: WS thread alive but disconnected "
+                        f"(tick {_ws_fail_ticks[acct_id]})."
+                    )
+
+                    if _ws_fail_ticks[acct_id] >= 2:
+                        # Stuck for ~60 s → attempt full re-auth + reconnect
+                        logger.warning(
+                            f"[WSHealth] {acct_id}: stuck for multiple cycles — "
+                            "re-authenticating and reconnecting ..."
+                        )
+                        _ws_fail_ticks[acct_id] = 0
+
+                        # Fetch account creds from DB
+                        account_details = await get_quotex_account_details(acct_id)
+                        if not account_details:
+                            logger.error(f"[WSHealth] {acct_id}: could not fetch account details.")
+                            continue
+
+                        email = account_details["email"]
+                        password = account_details["password"]
+                        session_path = f"sessions/{acct_id}"
+
+                        # Delete the stale session.json so pyquotex does a
+                        # clean native HTTP login on the next connect attempt.
+                        _stale_p = Path(f"{session_path}/session.json")
+                        if _stale_p.exists():
+                            try:
+                                _stale_p.unlink()
+                                logger.warning(
+                                    f"[WSHealth] {acct_id}: deleted stale session.json "
+                                    "(WS stuck in 403 loop — will re-auth via pyquotex native login)."
+                                )
+                            except Exception as _del_err:
+                                logger.warning(
+                                    f"[WSHealth] {acct_id}: could not delete stale "
+                                    f"session.json: {_del_err}"
+                                )
+
+                        # Evict cache — next trade signal or keepalive will
+                        # fully reconnect using pyquotex's own HTTP auth.
+                        try:
+                            await qx_client.close()
+                        except Exception:
+                            pass
+                        active_quotex_clients.pop(acct_id, None)
+                        logger.info(
+                            f"[WSHealth] {acct_id}: evicted stale client. "
+                            "Will reconnect (native re-auth) on next signal."
+                        )
+                else:
+                    # Connection looks healthy — reset counter
+                    _ws_fail_ticks[acct_id] = 0
+
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                logger.debug(f"[WSHealth] {acct_id}: monitor error: {exc}")
+
+
 async def preconnect_all_accounts():
     """
     At startup, Playwright-authenticate and pre-open WebSocket connections
@@ -4737,6 +5474,8 @@ async def run_bot():
         logger.info("Bot is running... Press CTRL+C to stop.")
         # Start Quotex WebSocket keep-alive heartbeat task
         asyncio.create_task(_quotex_keepalive())
+        # Start Quotex WebSocket health monitor (detects + recovers from 403 loops)
+        asyncio.create_task(_quotex_ws_health_monitor())
         # Keep the main thread alive (Pyrogram handles the event loop)
         await asyncio.Event().wait() # Keeps running until interrupted
 
