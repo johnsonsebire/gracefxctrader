@@ -38,7 +38,7 @@ _TRADE_PATH = "/trade"
 
 
 def _profile_dir(session_path: str) -> Path:
-    return Path(session_path) / "browser_profile"
+    return (Path(session_path) / "browser_profile").resolve()
 
 
 def _make_driver(profile_dir: Path, headless: bool):
@@ -155,6 +155,22 @@ def _do_login_sync(
     profile_dir = _profile_dir(session_path)
     profile_dir.mkdir(parents=True, exist_ok=True)
 
+    # Kill any lingering Chrome/ChromeDriver processes before launching.
+    # On a server this bot is the only Chrome user, so this is safe.
+    # Leftover processes hold file locks on the profile directory and cause
+    # "Chrome cannot read or write to its directory" errors on startup.
+    import subprocess as _sp
+    import time as _time
+    for _proc in ("chrome.exe", "chromedriver.exe"):
+        try:
+            _sp.run(
+                ["taskkill", "/F", "/IM", _proc],
+                stdout=_sp.DEVNULL, stderr=_sp.DEVNULL, check=False
+            )
+        except Exception:
+            pass
+    _time.sleep(1)  # give Windows a moment to release file handles
+
     if not headless:
         # Wipe the browser profile before every visible-mode session.
         # A stale/fingerprinted profile makes Cloudflare loop the challenge
@@ -182,6 +198,28 @@ def _do_login_sync(
             f"{'='*62}\n"
         )
         logger.warning(f"[Selenium] Visible browser opened for {email}.")
+    else:
+        # In headless mode, only remove Chrome's lock files left behind by a
+        # previous unclean exit. Deleting these preserves the saved
+        # __cf_clearance cookie while letting Chrome open the profile cleanly.
+        for _lock_name in ("SingletonLock", "SingletonCookie", "SingletonSocket",
+                           "lockfile", ".parentlock"):
+            _lock_path = profile_dir / _lock_name
+            if _lock_path.exists() or _lock_path.is_symlink():
+                try:
+                    _lock_path.unlink()
+                    logger.info(f"[Selenium] Removed stale lock file: {_lock_path}")
+                except Exception as _le:
+                    logger.warning(f"[Selenium] Could not remove lock file {_lock_path}: {_le}")
+        # Also clear lock files inside the Default sub-profile
+        for _sub in ("Default", "Default/Network"):
+            _sub_lock = profile_dir / _sub / "LOCK"
+            if _sub_lock.exists():
+                try:
+                    _sub_lock.unlink()
+                    logger.info(f"[Selenium] Removed sub-profile lock: {_sub_lock}")
+                except Exception as _le:
+                    logger.warning(f"[Selenium] Could not remove {_sub_lock}: {_le}")
 
     try:
         driver = _make_driver(profile_dir, headless)

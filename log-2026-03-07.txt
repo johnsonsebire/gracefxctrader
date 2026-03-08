@@ -1,0 +1,95 @@
+2026-03-07 22:35:52.531 | WARNING  | api_quotex.config:_load_config:105 - config.json not found, using default configuration
+2026-03-07 22:35:52.531 | WARNING  | api_quotex.config:_load_session:141 - session.json not found, using default session data
+2026-03-07 22:35:52.531 | INFO     | api_quotex.config:__init__:78 - Config instance initialized successfully
+2026-03-07 22:36:05.042 | WARNING  | api_quotex.config:_load_config:105 - config.json not found, using default configuration
+2026-03-07 22:36:05.043 | WARNING  | api_quotex.config:_load_session:141 - session.json not found, using default session data
+2026-03-07 22:36:05.043 | INFO     | api_quotex.config:__init__:78 - Config instance initialized successfully
+2026-03-07 22:36:40.282 | WARNING  | api_quotex.config:_load_config:105 - config.json not found, using default configuration
+2026-03-07 22:36:40.282 | WARNING  | api_quotex.config:_load_session:141 - session.json not found, using default session data
+2026-03-07 22:36:40.282 | INFO     | api_quotex.config:__init__:78 - Config instance initialized successfully
+2026-03-07 22:37:35.763 | WARNING  | api_quotex.config:_load_config:105 - config.json not found, using default configuration
+2026-03-07 22:37:35.764 | WARNING  | api_quotex.config:_load_session:141 - session.json not found, using default session data
+2026-03-07 22:37:35.764 | INFO     | api_quotex.config:__init__:78 - Config instance initialized successfully
+2026-03-07 22:39:02.340 | WARNING  | api_quotex.config:_load_config:105 - config.json not found, using default configuration
+2026-03-07 22:39:02.340 | WARNING  | api_quotex.config:_load_session:141 - session.json not found, using default session data
+2026-03-07 22:39:02.340 | INFO     | api_quotex.config:__init__:78 - Config instance initialized successfully
+2026-03-07 22:39:07.346 | INFO     | api_quotex.config:save_config:168 - Configuration saved to config.json
+2026-03-07 22:39:07.601 | WARNING  | api_quotex.login:get_ssid:379 - Cloudscraper GET /sign-in failed with status 403; switching to Playwright
+2026-03-07 22:39:10.545 | INFO     | api_quotex.login:_playwright_login_and_capture:154 - Playwright: opening login page...
+2026-03-07 22:39:43.733 | INFO     | api_quotex.login:_playwright_login_and_capture:210 - Demo SSID captured via Playwright (token)
+2026-03-07 22:39:43.734 | INFO     | api_quotex.config:save_session:181 - Session data saved to session.json
+2026-03-07 22:39:43.734 | INFO     | api_quotex.login:_playwright_login_and_capture:214 - Playwright: session data saved successfully
+2026-03-07 22:39:44.053 | INFO     | api_quotex.websocket_client:connect:154 - Attempting to connect to wss://ws2.qxbroker.com/socket.io/?EIO=3&transport=websocket
+2026-03-07 22:39:44.077 | WARNING  | api_quotex.websocket_client:connect:196 - Failed to connect to wss://ws2.qxbroker.com/socket.io/?EIO=3&transport=websocket: BaseEventLoop.create_connection() got an unexpected keyword argument 'extra_headers'
+2026-03-07 22:39:44.078 | ERROR    | api_quotex.monitoring:record_error:175 - [HIGH] connection: Failed to connect to wss://ws2.qxbroker.com/socket.io/?EIO=3&transport=websocket: BaseEventLoop.create_connection() got an unexpected keyword argument 'extra_headers'
+2026-03-07 22:39:44.078 | ERROR    | api_quotex.exceptions:__init__:14 - QuotexError: Failed to connect to any WebSocket endpoint (Code: None)
+2026-03-07 22:39:44.078 | WARNING  | api_quotex.login:validate_ssid:127 - SSID validation failed for wss://ws2.qxbroker.com/socket.io/?EIO=3&transport=websocket: Failed to connect to any WebSocket endpoint
+2026-03-07 22:39:44.078 | ERROR    | api_quotex.monitoring:record_error:175 - [MEDIUM] authentication: SSID validation failed for wss://ws2.qxbroker.com/socket.io/?EIO=3&transport=websocket: Failed to connect to any WebSocket endpoint
+2026-03-07 22:39:44.078 | ERROR    | api_quotex.login:validate_ssid:135 - SSID validation failed for all regions
+2026-03-07 22:39:44.078 | INFO     | api_quotex.client:__init__:151 - Initialized Quotex client (demo=True, persistent=False) with enhanced monitoring
+2026-03-07 22:39:44.078 | INFO     | api_quotex.client:connect:181 - Connecting to Quotex...
+2026-03-07 22:39:44.078 | INFO     | api_quotex.client:_start_regular_connection:206 - Starting regular connection...
+2026-03-07 22:39:44.078 | INFO     | api_quotex.client:_start_regular_connection:212 - Demo mode: Using demo regions: ['DEMO', 'LIVE']
+2026-03-07 22:39:44.079 | INFO     | api_quotex.client:_start_regular_connection:235 - Trying region: DEMO with URL: wss://ws2.qxbroker.com/socket.io/?EIO=3&transport=websocket
+2026-03-07 22:39:44.079 | INFO     | api_quotex.websocket_client:connect:154 - Attempting to connect to wss://ws2.qxbroker.com/socket.io/?EIO=3&transport=websocket
+2026-03-07 22:39:44.081 | WARNING  | api_quotex.websocket_client:connect:196 - Failed to connect to wss://ws2.qxbroker.com/socket.io/?EIO=3&transport=websocket: BaseEventLoop.create_connection() got an unexpected keyword argument 'extra_headers'
+2026-03-07 22:39:44.081 | ERROR    | api_quotex.monitoring:record_error:175 - [HIGH] connection: Failed to connect to wss://ws2.qxbroker.com/socket.io/?EIO=3&transport=websocket: BaseEventLoop.create_connection() got an unexpected keyword argument 'extra_headers'
+2026-03-07 22:39:44.081 | ERROR    | api_quotex.exceptions:__init__:14 - QuotexError: Failed to connect to any WebSocket endpoint (Code: None)
+2026-03-07 22:39:44.081 | WARNING  | api_quotex.client:_start_regular_connection:265 - Failed to connect to region DEMO: Failed to connect to any WebSocket endpoint
+2026-03-07 22:39:44.081 | ERROR    | api_quotex.monitoring:record_error:175 - [HIGH] connection: Failed to connect to DEMO: Failed to connect to any WebSocket endpoint
+2026-03-07 22:39:44.081 | INFO     | api_quotex.client:_start_regular_connection:279 - Waiting 1.80 seconds before next reconnect attempt
+2026-03-07 22:39:45.882 | INFO     | api_quotex.client:_start_regular_connection:235 - Trying region: LIVE with URL: wss://ws2.qxbroker.com/socket.io/?EIO=3&transport=websocket
+2026-03-07 22:39:45.883 | INFO     | api_quotex.websocket_client:connect:154 - Attempting to connect to wss://ws2.qxbroker.com/socket.io/?EIO=3&transport=websocket
+2026-03-07 22:39:45.885 | WARNING  | api_quotex.websocket_client:connect:196 - Failed to connect to wss://ws2.qxbroker.com/socket.io/?EIO=3&transport=websocket: BaseEventLoop.create_connection() got an unexpected keyword argument 'extra_headers'
+2026-03-07 22:39:45.885 | ERROR    | api_quotex.monitoring:record_error:175 - [HIGH] connection: Failed to connect to wss://ws2.qxbroker.com/socket.io/?EIO=3&transport=websocket: BaseEventLoop.create_connection() got an unexpected keyword argument 'extra_headers'
+2026-03-07 22:39:45.885 | ERROR    | api_quotex.exceptions:__init__:14 - QuotexError: Failed to connect to any WebSocket endpoint (Code: None)
+2026-03-07 22:39:45.885 | WARNING  | api_quotex.client:_start_regular_connection:265 - Failed to connect to region LIVE: Failed to connect to any WebSocket endpoint
+2026-03-07 22:39:45.885 | ERROR    | api_quotex.monitoring:record_error:175 - [HIGH] connection: Failed to connect to LIVE: Failed to connect to any WebSocket endpoint
+2026-03-07 22:39:45.885 | INFO     | api_quotex.client:_start_regular_connection:279 - Waiting 3.24 seconds before next reconnect attempt
+2026-03-07 22:39:49.126 | ERROR    | api_quotex.exceptions:__init__:14 - QuotexError: Failed to connect to any region after 2 attempts (Code: None)
+2026-03-07 22:39:49.126 | ERROR    | api_quotex.client:connect:195 - Connection failed: Failed to connect to any region after 2 attempts
+2026-03-07 22:39:49.126 | ERROR    | api_quotex.monitoring:record_error:175 - [HIGH] connection: Connection failed: Failed to connect to any region after 2 attempts
+2026-03-07 22:41:54.762 | INFO     | api_quotex.login:get_ssid:284 - Checking existing saved session...
+2026-03-07 22:41:54.764 | INFO     | api_quotex.websocket_client:connect:154 - Attempting to connect to wss://ws2.qxbroker.com/socket.io/?EIO=3&transport=websocket
+2026-03-07 22:41:54.766 | WARNING  | api_quotex.websocket_client:connect:196 - Failed to connect to wss://ws2.qxbroker.com/socket.io/?EIO=3&transport=websocket: BaseEventLoop.create_connection() got an unexpected keyword argument 'extra_headers'
+2026-03-07 22:41:54.767 | ERROR    | api_quotex.monitoring:record_error:175 - [HIGH] connection: Failed to connect to wss://ws2.qxbroker.com/socket.io/?EIO=3&transport=websocket: BaseEventLoop.create_connection() got an unexpected keyword argument 'extra_headers'
+2026-03-07 22:41:54.767 | ERROR    | api_quotex.exceptions:__init__:14 - QuotexError: Failed to connect to any WebSocket endpoint (Code: None)
+2026-03-07 22:41:54.767 | WARNING  | api_quotex.login:validate_ssid:127 - SSID validation failed for wss://ws2.qxbroker.com/socket.io/?EIO=3&transport=websocket: Failed to connect to any WebSocket endpoint
+2026-03-07 22:41:54.767 | ERROR    | api_quotex.monitoring:record_error:175 - [MEDIUM] authentication: SSID validation failed for wss://ws2.qxbroker.com/socket.io/?EIO=3&transport=websocket: Failed to connect to any WebSocket endpoint
+2026-03-07 22:41:54.767 | ERROR    | api_quotex.login:validate_ssid:135 - SSID validation failed for all regions
+2026-03-07 22:41:54.767 | WARNING  | api_quotex.login:get_ssid:297 - Existing session is invalid or expired; removing session.json
+2026-03-07 22:41:55.006 | WARNING  | api_quotex.login:get_ssid:379 - Cloudscraper GET /sign-in failed with status 403; switching to Playwright
+2026-03-07 22:41:56.239 | INFO     | api_quotex.login:_playwright_login_and_capture:154 - Playwright: opening login page...
+2026-03-07 22:42:28.453 | INFO     | api_quotex.login:_playwright_login_and_capture:210 - Demo SSID captured via Playwright (token)
+2026-03-07 22:42:28.454 | INFO     | api_quotex.config:save_session:181 - Session data saved to session.json
+2026-03-07 22:42:28.454 | INFO     | api_quotex.login:_playwright_login_and_capture:214 - Playwright: session data saved successfully
+2026-03-07 22:42:28.690 | INFO     | api_quotex.websocket_client:connect:154 - Attempting to connect to wss://ws2.qxbroker.com/socket.io/?EIO=3&transport=websocket
+2026-03-07 22:42:28.693 | WARNING  | api_quotex.websocket_client:connect:196 - Failed to connect to wss://ws2.qxbroker.com/socket.io/?EIO=3&transport=websocket: BaseEventLoop.create_connection() got an unexpected keyword argument 'extra_headers'
+2026-03-07 22:42:28.693 | ERROR    | api_quotex.monitoring:record_error:175 - [HIGH] connection: Failed to connect to wss://ws2.qxbroker.com/socket.io/?EIO=3&transport=websocket: BaseEventLoop.create_connection() got an unexpected keyword argument 'extra_headers'
+2026-03-07 22:42:28.693 | ERROR    | api_quotex.exceptions:__init__:14 - QuotexError: Failed to connect to any WebSocket endpoint (Code: None)
+2026-03-07 22:42:28.693 | WARNING  | api_quotex.login:validate_ssid:127 - SSID validation failed for wss://ws2.qxbroker.com/socket.io/?EIO=3&transport=websocket: Failed to connect to any WebSocket endpoint
+2026-03-07 22:42:28.693 | ERROR    | api_quotex.monitoring:record_error:175 - [MEDIUM] authentication: SSID validation failed for wss://ws2.qxbroker.com/socket.io/?EIO=3&transport=websocket: Failed to connect to any WebSocket endpoint
+2026-03-07 22:42:28.694 | ERROR    | api_quotex.login:validate_ssid:135 - SSID validation failed for all regions
+2026-03-07 22:42:28.694 | INFO     | api_quotex.client:__init__:151 - Initialized Quotex client (demo=True, persistent=False) with enhanced monitoring
+2026-03-07 22:42:28.694 | INFO     | api_quotex.client:connect:181 - Connecting to Quotex...
+2026-03-07 22:42:28.694 | INFO     | api_quotex.client:_start_regular_connection:206 - Starting regular connection...
+2026-03-07 22:42:28.694 | INFO     | api_quotex.client:_start_regular_connection:212 - Demo mode: Using demo regions: ['DEMO', 'LIVE']
+2026-03-07 22:42:28.695 | INFO     | api_quotex.client:_start_regular_connection:235 - Trying region: DEMO with URL: wss://ws2.qxbroker.com/socket.io/?EIO=3&transport=websocket
+2026-03-07 22:42:28.695 | INFO     | api_quotex.websocket_client:connect:154 - Attempting to connect to wss://ws2.qxbroker.com/socket.io/?EIO=3&transport=websocket
+2026-03-07 22:42:28.696 | WARNING  | api_quotex.websocket_client:connect:196 - Failed to connect to wss://ws2.qxbroker.com/socket.io/?EIO=3&transport=websocket: BaseEventLoop.create_connection() got an unexpected keyword argument 'extra_headers'
+2026-03-07 22:42:28.697 | ERROR    | api_quotex.monitoring:record_error:175 - [HIGH] connection: Failed to connect to wss://ws2.qxbroker.com/socket.io/?EIO=3&transport=websocket: BaseEventLoop.create_connection() got an unexpected keyword argument 'extra_headers'
+2026-03-07 22:42:28.697 | ERROR    | api_quotex.exceptions:__init__:14 - QuotexError: Failed to connect to any WebSocket endpoint (Code: None)
+2026-03-07 22:42:28.697 | WARNING  | api_quotex.client:_start_regular_connection:265 - Failed to connect to region DEMO: Failed to connect to any WebSocket endpoint
+2026-03-07 22:42:28.697 | ERROR    | api_quotex.monitoring:record_error:175 - [HIGH] connection: Failed to connect to DEMO: Failed to connect to any WebSocket endpoint
+2026-03-07 22:42:28.697 | INFO     | api_quotex.client:_start_regular_connection:279 - Waiting 1.80 seconds before next reconnect attempt
+2026-03-07 22:42:30.498 | INFO     | api_quotex.client:_start_regular_connection:235 - Trying region: LIVE with URL: wss://ws2.qxbroker.com/socket.io/?EIO=3&transport=websocket
+2026-03-07 22:42:30.498 | INFO     | api_quotex.websocket_client:connect:154 - Attempting to connect to wss://ws2.qxbroker.com/socket.io/?EIO=3&transport=websocket
+2026-03-07 22:42:30.501 | WARNING  | api_quotex.websocket_client:connect:196 - Failed to connect to wss://ws2.qxbroker.com/socket.io/?EIO=3&transport=websocket: BaseEventLoop.create_connection() got an unexpected keyword argument 'extra_headers'
+2026-03-07 22:42:30.502 | ERROR    | api_quotex.monitoring:record_error:175 - [HIGH] connection: Failed to connect to wss://ws2.qxbroker.com/socket.io/?EIO=3&transport=websocket: BaseEventLoop.create_connection() got an unexpected keyword argument 'extra_headers'
+2026-03-07 22:42:30.502 | ERROR    | api_quotex.exceptions:__init__:14 - QuotexError: Failed to connect to any WebSocket endpoint (Code: None)
+2026-03-07 22:42:30.502 | WARNING  | api_quotex.client:_start_regular_connection:265 - Failed to connect to region LIVE: Failed to connect to any WebSocket endpoint
+2026-03-07 22:42:30.502 | ERROR    | api_quotex.monitoring:record_error:175 - [HIGH] connection: Failed to connect to LIVE: Failed to connect to any WebSocket endpoint
+2026-03-07 22:42:30.502 | INFO     | api_quotex.client:_start_regular_connection:279 - Waiting 3.24 seconds before next reconnect attempt
+2026-03-07 22:42:33.742 | ERROR    | api_quotex.exceptions:__init__:14 - QuotexError: Failed to connect to any region after 2 attempts (Code: None)
+2026-03-07 22:42:33.742 | ERROR    | api_quotex.client:connect:195 - Connection failed: Failed to connect to any region after 2 attempts
+2026-03-07 22:42:33.743 | ERROR    | api_quotex.monitoring:record_error:175 - [HIGH] connection: Connection failed: Failed to connect to any region after 2 attempts

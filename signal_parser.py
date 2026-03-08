@@ -255,6 +255,32 @@ def parse_signal(text: str) -> Optional[Dict[str, Any]]:
         if m:
             result['duration'] = int(m.group(1))  # already in seconds
 
+    # ── Entry Time (optional — ⏰ HH:MM or standalone HH:MM line) ─────────
+    # Supports 24-hour (23:41) and 12-hour (11:41 PM / 11:41PM) formats.
+    # Must NOT fire on duration lines like "⏰ 3 MINUTES".
+    # Strategy: match HH:MM only when NOT followed by a time-unit word.
+    m_et = re.search(
+        r'[⏰]\ufe0f?\s*(\d{1,2}):(\d{2})[^\S\n]*(AM|PM)?[^\S\n]*(?!\S*(?:MINUTE|SECOND|MIN|SEC)\b)',
+        text, re.IGNORECASE,
+    )
+    if not m_et:
+        # Fallback: standalone HH:MM on its own line — optional AM/PM on same line
+        m_et = re.search(
+            r'(?:^|\n)\s*(\d{1,2}):(\d{2})[^\S\n]*(AM|PM)?[^\S\n]*(?:\n|$)',
+            text, re.MULTILINE | re.IGNORECASE,
+        )
+    if m_et:
+        hh_v = int(m_et.group(1))
+        mm_v = int(m_et.group(2))
+        ampm = (m_et.group(3) or '').upper()
+        # Convert 12-hour to 24-hour
+        if ampm == 'PM' and hh_v != 12:
+            hh_v += 12
+        elif ampm == 'AM' and hh_v == 12:
+            hh_v = 0
+        if 0 <= hh_v <= 23 and 0 <= mm_v <= 59:
+            result['entry_time'] = f"{hh_v:02d}:{mm_v:02d}"
+
     # ── Amount (optional) ──────────────────────────────────────────────────
     # Matches:  💵Use 200 $ from balance | Use 125$ | Use 1,000 $ | "Use 5 $"
     m = re.search(r'Use\s+([\d,]+(?:\.\d+)?)\s*\$', text, re.IGNORECASE)

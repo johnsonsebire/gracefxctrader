@@ -9,22 +9,6 @@ import datetime
 import re # For PIN detection
 import json
 from pathlib import Path
-import builtins
-from unittest.mock import patch
-
-# Timezone support (Python 3.9+; tzdata package needed on Windows)
-try:
-    from zoneinfo import ZoneInfo as _ZoneInfo
-    _ZONEINFO_AVAILABLE = True
-except ImportError:  # Python < 3.9 or missing tzdata
-    _ZoneInfo = None
-    _ZONEINFO_AVAILABLE = False
-
-try:
-    import quotex_auth as _quotex_auth
-except ImportError:
-    _quotex_auth = None
-import asyncio # Ensure asyncio is imported if not already globally
 from functools import wraps
 from typing import Optional, Dict, Any, Tuple, List
 from dotenv import load_dotenv
@@ -129,21 +113,13 @@ except ImportError:
     Fore = DummyStyle()
     Style = DummyStyle()
 
-# --- pyquotex Imports ---
+# --- api_quotex Imports ---
 try:
-    from pyquotex.stable_api import Quotex
-    from pyquotex.utils.processor import get_color # Optional
-    import pyquotex.global_value as _qx_global_value
-    # Monkey patch target detection function (safer approach)
-    # --- Inside your script, replace the existing function ---
-    
+    from api_quotex import AsyncQuotexClient, OrderDirection, get_ssid
 except ImportError:
-    print(f"{Fore.RED}Error: pyquotex library not found or import failed.")
+    print(f"{Fore.RED}Error: api_quotex library not found or import failed.")
     print(f"{Fore.YELLOW}Please install it via pip:")
-    print(f"{Fore.CYAN}pip install git+https://github.com/cleitonleonel/pyquotex.git")
-    sys.exit(1)
-except Exception as e:
-    print(f"{Fore.RED}Error during pyquotex import or patching setup: {e}")
+    print(f"{Fore.CYAN}pip install git+https://github.com/A11ksa/API-Quotex.git")
     sys.exit(1)
 
 # --- Signal Parser ---
@@ -170,11 +146,7 @@ USERBOT_PHONE: str = os.getenv("USERBOT_PHONE", "").strip()
 _raw_channel = os.getenv("SIGNAL_CHANNEL_ID", "").strip()
 SIGNAL_CHANNEL_ID: Optional[int] = int(_raw_channel) if _raw_channel.lstrip('-').isdigit() else None
 
-# Quotex session overrides (optional). Useful when anti-bot protection blocks
-# raw credential login from server environments.
-QUOTEX_USER_AGENT = os.getenv("QUOTEX_USER_AGENT", USER_AGENT).strip() or USER_AGENT
-QUOTEX_SSID = os.getenv("QUOTEX_SSID", "").strip()
-QUOTEX_COOKIES = os.getenv("QUOTEX_COOKIES", "").strip()
+# Quotex session overrides are handled internally by api_quotex via Playwright.
 
 # Basic Logging
 _LOG_FMT = '%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s'
@@ -196,8 +168,7 @@ except Exception as _e:
 
 logger = logging.getLogger(__name__)
 logging.getLogger("pyrofork").setLevel(logging.WARNING) # Reduce pyrogram verbosity
-logging.getLogger("undetected_chromedriver").setLevel(logging.WARNING)
-logging.getLogger("selenium").setLevel(logging.WARNING)
+logging.getLogger("playwright").setLevel(logging.WARNING)
 
 try:
     import dns.resolver
@@ -228,11 +199,6 @@ signal_logs_db = None       # Collection for per-signal timing/event log
 trade_journal_db = None  # Collection for per-account daily trade journal
 trade_journal_balances_db = None  # Collection for daily opening/closing account balances
 trade_journal_withdrawals_db = None  # Collection for withdrawal records
-
-# Timed-entry cancellation — set to True to abort the current sleeping timed entry
-_timed_entry_cancel: bool = False
-# Info about the active timed entry shown to the user (None when idle)
-_timed_entry_info: Optional[Dict[str, Any]] = None
 
 # Temporary storage for OTP requests: {user_id: {'qx_client': qx_client_instance, 'event': asyncio.Event()}}
 active_otp_requests: Dict[int, Dict[str, Any]] = {}
@@ -768,7 +734,6 @@ async def get_signal_settings() -> Dict[str, Any]:
             'is_active': False,
             'pending_signal': None,
             'signal_delay': 15,
-            'entry_delay': 0,              # seconds to hold entry after signal receipt
             'duration_remap_enabled': False,
             'ask_duration_on_partial': False,
             'manual_trade_mode': False,
@@ -914,12 +879,10 @@ def _channels_panel_text(channels: list) -> str:
             ch_id = str(ch.get('id', ''))
             nick = ch.get('nickname', '').strip()
             active = ch.get('active', True)
-            tz = ch.get('timezone', '').strip()
             icon = '🟢' if active else '🔴'
             name_line = f"**{nick}** (`{ch_id}`)" if nick else f"`{ch_id}`"
-            tz_line = f" — 🌐 `{tz}`" if tz else ""
-            text += f"{idx}. {name_line} — {icon} {'**Active**' if active else 'Inactive'}{tz_line}\n"
-        text += "\nTap a channel to toggle ON/OFF · ✏️ rename · 🌐 timezone · 🗑 remove."
+            text += f"{idx}. {name_line} — {icon} {'**Active**' if active else 'Inactive'}\n"
+        text += "\nTap a channel to toggle ON/OFF · ✏️ rename · 🗑 remove."
     return text
 
 
@@ -929,171 +892,19 @@ def _channels_panel_keyboard(channels: list) -> list:
     for idx, ch in enumerate(channels):
         active = ch.get('active', True)
         display = _ch_display(ch)
-        if len(display) > 15:
-            display = display[:12] + '…'
+        if len(display) > 18:
+            display = display[:15] + '…'
         rows.append([
             InlineKeyboardButton(
                 f"{'🟢' if active else '🔴'} {display}",
                 callback_data=f"sig_ch_toggle:{idx}",
             ),
             InlineKeyboardButton("✏️", callback_data=f"sig_ch_rename:{idx}"),
-            InlineKeyboardButton("🌐", callback_data=f"sig_ch_tz:{idx}"),
             InlineKeyboardButton("🗑", callback_data=f"sig_ch_remove:{idx}"),
         ])
     rows.append([InlineKeyboardButton("➕ Add Channel", callback_data="sig_channel_add")])
     rows.append(back_button("signal_status_view"))
     return rows
-
-
-# ── Timezone helpers ──────────────────────────────────────────────────────────
-
-def _resolve_tz(tz_str: str):
-    """
-    Return a datetime.timezone (or zoneinfo.ZoneInfo) object for *tz_str*.
-
-    Accepts:
-      • IANA names  e.g. "Asia/Karachi", "America/New_York"
-      • UTC offset  e.g. "UTC+5", "UTC+5:30", "+05:30", "UTC-4"
-
-    Returns None if *tz_str* is empty or cannot be parsed (caller should then
-    fall back to system local time).
-    """
-    if not tz_str:
-        return None
-    s = tz_str.strip()
-
-    # Try IANA name via zoneinfo (Python 3.9+, requires tzdata on Windows)
-    if _ZONEINFO_AVAILABLE and _ZoneInfo is not None:
-        try:
-            return _ZoneInfo(s)
-        except Exception:
-            pass
-
-    # Try UTC offset pattern: "UTC+5", "UTC+5:30", "+05:00", "-04:00"
-    m = re.match(r'^(?:UTC)?([+-])(\d{1,2})(?::(\d{2}))?$', s)
-    if m:
-        sign = 1 if m.group(1) == '+' else -1
-        h = int(m.group(2))
-        mins = int(m.group(3) or '0')
-        offset = datetime.timedelta(hours=h, minutes=mins) * sign
-        return datetime.timezone(offset, name=s)
-
-    return None  # unrecognised — caller uses local time
-
-
-def _compute_timed_entry_wait(entry_time_str: str) -> float:
-    """
-    Return seconds until the system clock's minute hand reaches the minute
-    specified in *entry_time_str*. Only the MM component is used.
-
-    e.g. "00:27" → wait until the system clock reads HH:27:00.
-    The signal hour is intentionally ignored — only the minute matters,
-    since the signal and server share the same clock.
-
-    # ── Future: full HH:MM + per-channel timezone resolution ────────────────
-    # When per-channel timezone support is re-enabled, this function should:
-    #   • Accept an optional tz_obj parameter
-    #   • Use now = datetime.datetime.now(tz_obj) when tz_obj is not None
-    #   • Compare the full HH:MM target (not just the minute) after converting
-    #     both the current time and target to the same timezone
-    # ─────────────────────────────────────────────────────────────────────────
-    """
-    _, mm = map(int, entry_time_str.split(':'))
-    now = datetime.datetime.now()  # always system local time
-    elapsed = now.second + now.microsecond / 1_000_000
-    if now.minute < mm:
-        wait = (mm - now.minute) * 60 - elapsed
-    elif now.minute == mm:
-        wait = 0.0  # already at the target minute — execute immediately
-    else:
-        # Target minute is in the next hour
-        wait = (60 - now.minute + mm) * 60 - elapsed
-    return max(0.0, wait)
-
-
-# ── Signal Monitor panel helpers ──────────────────────────────────────────────
-
-def _signal_monitor_text(sig_s: dict, userbot_ok: bool) -> str:
-    """Build the text body for the Signal Monitor panel."""
-    is_active = sig_s.get('is_active', False)
-    status_icon = "🟢" if is_active else "🔴"
-    sd = int(sig_s.get('signal_delay', 0))
-    ed = int(sig_s.get('entry_delay', 0))
-    dr = sig_s.get('duration_remap_enabled', False)
-    ad = sig_s.get('ask_duration_on_partial', False)
-    man = sig_s.get('manual_trade_mode', False)
-    inv = sig_s.get('inverse_mode', False)
-    pend = sig_s.get('pending_signal')
-
-    text = (
-        f"📡 **Signal Monitor**\n\n"
-        f"{status_icon} Status: **{'ON' if is_active else 'OFF'}**\n"
-        f"📺 Channels: {_channels_summary(sig_s)}\n"
-        f"🤖 Userbot: **{'Running ✅' if userbot_ok else 'Not configured ❌'}**\n"
-        f"✂️ Shorten Duration: **{f'{sd}s subtracted from duration' if sd > 0 else 'Disabled'}**\n"
-        f"⏱ Entry Delay: **{f'{ed}s before entry' if ed > 0 else 'Disabled'}**\n"
-        f"🔄 2min→5min Remap: **{'ON ✅' if dr else 'OFF'}**\n"
-        f"⏱ Ask Duration on Partial: **{'ON ✅' if ad else 'OFF'}**\n"
-        f"🕹 Manual Trade Mode: **{'ON ✅' if man else 'OFF'}**\n"
-        f"🔁 Inverse Mode: **{'ON ✅' if inv else 'OFF'}**\n"
-    )
-
-    if pend:
-        age = int(time.time() - pend.get('timestamp', 0))
-        text += (
-            f"\n⏳ **Pending Signal** (awaiting direction):\n"
-            f"  `{pend.get('asset_display', pend.get('asset'))}` "
-            f"${pend.get('amount')} {pend.get('duration', 0) // 60}min "
-            f"— {age}s ago {'⚠️ expired' if age > 300 else ''}\n"
-        )
-    else:
-        text += "\nNo pending signal.\n"
-
-    return text
-
-
-def _signal_monitor_keyboard(sig_s: dict) -> list:
-    """Build the button rows for the Signal Monitor panel."""
-    is_active = sig_s.get('is_active', False)
-    toggle_label = "🔴 Turn OFF" if is_active else "🟢 Turn ON"
-    sd = int(sig_s.get('signal_delay', 0))
-    ed = int(sig_s.get('entry_delay', 0))
-    dr = sig_s.get('duration_remap_enabled', False)
-    ad = sig_s.get('ask_duration_on_partial', False)
-    man = sig_s.get('manual_trade_mode', False)
-    inv = sig_s.get('inverse_mode', False)
-
-    return [
-        [InlineKeyboardButton(toggle_label, callback_data="signal_toggle")],
-        [InlineKeyboardButton("📺 Manage Channels", callback_data="sig_channels_view")],
-        [InlineKeyboardButton(f"✂️ Shorten Duration ({sd}s)", callback_data="sig_delay_set"),
-         InlineKeyboardButton("🚫 Disable", callback_data="sig_delay_off")],
-        [InlineKeyboardButton(f"⏱ Entry Delay ({ed}s)", callback_data="sig_entry_delay_set"),
-         InlineKeyboardButton("🚫 Off", callback_data="sig_entry_delay_off")],
-        [InlineKeyboardButton(f"🔄 2min→5min: {'ON ✅' if dr else 'OFF'}", callback_data="sig_dur_remap_toggle"),
-         InlineKeyboardButton(f"⏱ Ask Duration: {'ON ✅' if ad else 'OFF'}", callback_data="sig_ask_dur_toggle")],
-        [InlineKeyboardButton(f"🕹 Manual Mode: {'ON ✅' if man else 'OFF'}", callback_data="sig_manual_mode_toggle"),
-         InlineKeyboardButton(f"🔁 Inverse: {'ON ✅' if inv else 'OFF'}", callback_data="sig_inverse_toggle")],
-        [InlineKeyboardButton("🗑 Clear Pending Signal", callback_data="signal_clear_pending")],
-        [InlineKeyboardButton("📋 Signal Logs", callback_data="signal_logs_view")],
-        back_button("main_menu"),
-    ]
-
-
-async def _refresh_signal_monitor(message, sig_s: dict = None):
-    """Edit *message* to show the current Signal Monitor panel.  Fetches fresh
-    settings from DB when *sig_s* is None."""
-    if sig_s is None:
-        sig_s = await get_signal_settings()
-    userbot_ok = userbot_instance is not None
-    try:
-        await message.edit_text(
-            _signal_monitor_text(sig_s, userbot_ok),
-            reply_markup=InlineKeyboardMarkup(_signal_monitor_keyboard(sig_s)),
-        )
-    except Exception as e:
-        if "MESSAGE_NOT_MODIFIED" not in str(e):
-            raise
 
 # --- Permission Decorators ---
 def owner_only(func):
@@ -1136,397 +947,82 @@ def premium_only(func):
     return wrapper
 
 
-# --- Restore/Keep the ASYNC helper function ---
-async def handle_potential_pin_input(prompt: str) -> Optional[str]:
+active_quotex_clients: Dict[str, AsyncQuotexClient] = {}
+
+
+async def get_quotex_client(user_id: int, account_doc_id: str, interaction_type: str = "info") -> Tuple[Optional[AsyncQuotexClient], str]:
     """
-    This ASYNC function is called by our patched input ONLY when
-    the specific PIN prompt is detected. It handles the bot interaction.
+    Gets or creates an AsyncQuotexClient for an account using api_quotex (Playwright-based).
+    Automatically handles Cloudflare — no Selenium/Chrome required.
     """
-    target_prompt = "Insira o código PIN que acabamos de enviar para o seu e-mail:"
-    logger.debug(f"handle_potential_pin_input received prompt: '{prompt}'")
+    global active_quotex_clients
 
-    if target_prompt in prompt:
-        logger.critical(f"--- !!! BUILTIN INPUT PATCH TRIGGERED FOR PIN !!! Prompt: '{prompt}'")
-        global bot_instance, active_otp_requests
+    settings = await get_or_create_trade_settings(account_doc_id)
+    is_demo = settings.get("account_mode", "PRACTICE") == "PRACTICE"
 
-        user_id = None
-        qx_client_instance = None
-        for uid, data in active_otp_requests.items():
-             # Assuming the current call belongs to the context we just added
-             user_id = uid
-             qx_client_instance = data.get('qx_client')
-             logger.info(f"Found potential user_id {user_id} and client {id(qx_client_instance)} from active_otp_requests.")
-             break
-
-        if not bot_instance:
-            logger.error("CRITICAL: Cannot ask for PIN via patched input - bot_instance is None!")
-            return None
-        if not user_id:
-            logger.error(f"CRITICAL: Cannot ask for PIN via patched input - no user_id found in active_otp_requests. State: {active_otp_requests}")
-            return None
-        if not qx_client_instance:
-             logger.error(f"CRITICAL: Cannot ask for PIN via patched input - no qx_client found for user {user_id}.")
-             return None
-
-        pin_code = None
-        try:
-            logger.info(f"Asking user {user_id} for PIN via bot.ask() [from patched input]. Timeout: 120s")
-            pin_message = await bot_instance.ask(
-                chat_id=user_id,
-                text=f"❗️ **QUOTEX 2FA REQUIRED** ❗️\n\n"
-                     f"To log in to `{qx_client_instance.email}`, Quotex needs the PIN code sent to your email.\n\n"
-                     #f"**Prompt:**\n`{prompt}`\n\n"
-                     f"➡️ Please reply to **this message** with the **PIN code only**.",
-                timeout=600, # 2 minutes timeout
-            )
-            if pin_message and pin_message.text:
-                pin_code = pin_message.text.strip()
-                if not pin_code.isdigit(): # Optional check
-                    logger.warning(f"User {user_id} entered non-digit PIN '{pin_code}'. Using it anyway.")
-                logger.info(f"Received PIN '{pin_code}' from user {user_id} via patched input.")
-                await pin_message.delete() # Optional: delete the message after reading
-                return pin_code # Return the actual PIN
-            else:
-                logger.warning(f"User {user_id} did not provide a PIN response message [via patched input].")
-                await bot_instance.send_message(user_id, "❓ Did not receive a PIN response. Login failed.")
-                return "" # Return empty string maybe better than None for input()?
-        except asyncio.TimeoutError:
-            logger.error(f"Timeout waiting for PIN from user {user_id} [via patched input].")
-            try: await bot_instance.send_message(user_id, "⏳ PIN request timed out (2 minutes). Login failed.")
-            except Exception: pass
-            return "" # Return empty string on timeout
-        except Exception as e:
-            logger.error(f"Error occurred in bot.ask() while getting PIN [via patched input] from {user_id}: {e}", exc_info=True)
-            try: await bot_instance.send_message(user_id, f"❌ An error occurred while processing your PIN: {e}\nLogin failed.")
-            except Exception: pass
-            # Raise exception to clearly signal failure in wrapper
-            raise ConnectionError("Failed to get PIN via Telegram interaction.") from e
-    else:
-        # IMPORTANT: If prompt not recognised, call original input
-        logger.warning(f"Patched input called with UNEXPECTED prompt: '{prompt}'. Falling back to original input.")
-        return original_builtin_input(prompt) # This will likely hang bot
-
-
-# --- Restore/Keep the SYNC input_wrapper function ---
-# Store original input safely AT MODULE LEVEL
-original_builtin_input = builtins.input
-patch_state = {'expecting_pin': False} # Manage patch activation state
-
-def input_wrapper(prompt=""):
-    """Synchronous wrapper that replaces input. Calls async handler if needed."""
-    global patch_state # Access the global state flag
-    target_prompt_substr = "Insira o código PIN"
-    # Check if we are *expecting* the PIN and if the prompt matches
-    if target_prompt_substr in prompt and patch_state.get('expecting_pin', False):
-        logger.info(f"Input wrapper intercepting prompt: '{prompt}'")
-        if not main_event_loop:
-            logger.error("CRITICAL: Main event loop not available in input_wrapper!")
-            # Decide how to fail: raise error or return empty? Raising is cleaner.
-            raise RuntimeError("Cannot handle PIN input: Main event loop not set.")
-        if not main_event_loop.is_running():
-            logger.error("CRITICAL: Main event loop is not running in input_wrapper!")
-            raise RuntimeError("Cannot handle PIN input: Main event loop not running.")
-
-        # Prepare the coroutine to run
-        coro = handle_potential_pin_input(prompt) # Pass the prompt
-
-        # Schedule the coroutine on the main loop from this (likely worker) thread
-        # This returns a concurrent.futures.Future, NOT an asyncio.Future
-        future = asyncio.run_coroutine_threadsafe(coro, main_event_loop)
-        logger.debug(f"Scheduled async PIN handler on loop {id(main_event_loop)}. Waiting for result...")
-
-        try:
-            # Block *this thread* (waiting for input) until the coroutine completes
-            # Add a reasonable timeout (e.g., slightly longer than your bot.listen timeout)
-            pin_result = future.result(timeout=130) # Wait up to 130 seconds
-            logger.info(f"Async PIN handler returned: {type(pin_result)} '{pin_result}'")
-            # Return the pin (string) or empty string if it failed/timed out internally
-            return pin_result if pin_result is not None else ""
-        except concurrent.futures.TimeoutError:
-            logger.error("Timeout waiting for async PIN handler result in input_wrapper.")
-            # Optional: Try to cancel the coroutine if it's still running
-            # future.cancel() # May not work reliably depending on coro state
-            # Propagate the timeout or return empty/raise custom error
-            raise TimeoutError("Timed out waiting for PIN input via Telegram.") from None
-        except Exception as e:
-            # This catches exceptions raised *inside* handle_potential_pin_input OR
-            # errors during scheduling/retrieval.
-            logger.error(f"Exception occurred retrieving async PIN handler result in input_wrapper: {e}", exc_info=True)
-            # Propagate the exception so get_quotex_client knows it failed clearly
-            # Wrap it maybe?
-            raise ConnectionError("Failed to get PIN via Telegram interaction.") from e
-        finally:
-             # Optional: Log when the wait finishes
-             logger.debug("Exiting input_wrapper after waiting for future.")
-    else:
-         # If not expecting PIN or prompt mismatch, use original input
-         logger.warning(f"Input wrapper calling original input for prompt: '{prompt}' (expecting_pin={patch_state.get('expecting_pin')})")
-         return original_builtin_input(prompt)
-
-active_quotex_clients: Dict[str, Quotex] = {}
-
-# --- REPLACE the get_quotex_client function (using the AGGRESSIVE timing with CORRECT patch function) ---
-async def get_quotex_client(user_id: int, account_doc_id: str, interaction_type: str = "info") -> Tuple[Optional[Quotex], str]:
-    """
-    Gets or creates a connected Quotex client instance for an account.
-    Uses AGGRESSIVE patching on builtins.input + ASYNC handler for PIN prompts.
-    """
-    global active_quotex_clients, active_otp_requests, bot_instance, patch_state # Ensure patch_state is global
-
-    # --- Cache check logic ---
+    # --- Cache check ---
     if account_doc_id in active_quotex_clients:
         cached = active_quotex_clients[account_doc_id]
-        # Verify the cached connection is still alive before reusing it.
-        # check_connect() is async — MUST be awaited or it returns a truthy coroutine.
         try:
-            still_connected = await cached.check_connect()
+            is_alive = getattr(cached, 'is_connected', False)
         except Exception:
-            still_connected = False
-        if still_connected:
-            # Re-apply the account mode from DB every time — the user may have
-            # switched between PRACTICE and REAL since this client was cached.
-            try:
-                current_settings = await get_or_create_trade_settings(account_doc_id)
-                required_mode = current_settings.get("account_mode", "PRACTICE")
-                await cached.change_account(required_mode)
-                logger.info(f"Reusing cached client for {account_doc_id} (mode: {required_mode})")
-            except Exception as mode_err:
-                logger.warning(f"Could not re-apply account mode for {account_doc_id}: {mode_err}")
+            is_alive = False
+        cached_is_demo = getattr(cached, 'is_demo', None)
+        if is_alive and cached_is_demo == is_demo:
+            logger.info(f"Reusing cached client for {account_doc_id} (mode={'demo' if is_demo else 'live'})")
             return cached, "Reused existing client (cache)."
         else:
-            logger.warning(f"Cached client for {account_doc_id} is stale/disconnected. Reconnecting...")
+            reason = "mode changed" if (is_alive and cached_is_demo != is_demo) else "stale/disconnected"
+            logger.warning(f"Cached client for {account_doc_id} evicted: {reason}. Reconnecting...")
             try:
-                await cached.close()
+                await cached.disconnect()
             except Exception:
                 pass
             del active_quotex_clients[account_doc_id]
 
-    # --- Get account details ---
-    logger.info(f"Fetching Quotex account details for Doc ID: {account_doc_id} (User: {user_id})")
+    # --- Get credentials ---
     account_details = await get_quotex_account_details(account_doc_id)
-    if not account_details: return None, " Quotex account details not found in DB."
+    if not account_details:
+        return None, "Quotex account details not found in DB."
     email = account_details["email"]
     password = account_details["password"]
-    # temp_session_path = f"session_{user_id}_{account_doc_id}"
-    # # Ensure the directory for session files exists
-    # session_dir = Path(temp_session_path).parent
-    # session_dir.mkdir(parents=True, exist_ok=True)
 
-    # Per-account isolated session directory so multiple accounts don't share tokens
-    session_path = f"sessions/{account_doc_id}"
-
-    # --- Selenium pre-auth: ensure a valid __cf_clearance is in session.json ---
-    # pyquotex cannot solve Cloudflare's managed challenge on its own.
-    # ensure_session() checks whether the saved session is still fresh; if not it
-    # runs a headless or visible Selenium login to obtain a new __cf_clearance cookie.
-    if _quotex_auth:
-        try:
-            await _quotex_auth.ensure_session(email, password, session_path=session_path)
-        except Exception as _auth_err:
-            logger.warning(f"[Auth] Selenium pre-auth for {email} failed: {_auth_err}")
-    else:
-        logger.warning("[Auth] quotex_auth not available; skipping Selenium pre-auth.")
-
-    qx_client: Optional[Quotex] = None
-    connection_check = False
-    connection_reason = "Initialization error"
-    patcher = None
-    is_patched = False
+    logger.info(f"[Auth] Authenticating {email} via Playwright (is_demo={is_demo}) ...")
+    try:
+        success, session_data = await get_ssid(email=email, password=password, is_demo=is_demo)
+        if not success or not session_data:
+            return None, "Playwright SSID login failed — check credentials or Cloudflare status."
+        ssid = session_data.get("ssid") or session_data.get("token")
+        if not ssid:
+            return None, "Login succeeded but no SSID/token returned."
+    except Exception as auth_err:
+        logger.error(f"[Auth] get_ssid error for {email}: {auth_err}", exc_info=True)
+        return None, f"Playwright auth error: {auth_err}"
 
     try:
-        # --- Apply AGGRESSIVE patch BEFORE creating instance ---
-        logger.warning("Applying AGGRESSIVE builtins.input patch (using input_wrapper)...")
-        # *** USE THE CORRECT WRAPPER ***
-        patcher = patch('builtins.input', input_wrapper)
-        patcher.start()
-        is_patched = True
-        logger.info("Aggressive builtins.input patch STARTED.")
+        client = AsyncQuotexClient(ssid=ssid, is_demo=is_demo)
+        connected = await client.connect()
+        if not connected:
+            return None, "WebSocket connection failed after successful SSID login."
+        active_quotex_clients[account_doc_id] = client
+        mode_label = "PRACTICE (demo)" if is_demo else "REAL (live)"
+        logger.info(f"[Auth] Connected {email} in {mode_label} mode.")
+        return client, f"Connected successfully in {mode_label} mode."
+    except Exception as conn_err:
+        logger.error(f"[Auth] Connection error for {email}: {conn_err}", exc_info=True)
+        return None, f"Connection error: {conn_err}"
 
-        # Create instance UNDER the patch — use per-account session directory
-        logger.info(f"Creating new Quotex client instance for {email} UNDER PATCH")
-        qx_client = Quotex(
-            email=email,
-            password=password,
-            user_agent=QUOTEX_USER_AGENT,
-            root_path=session_path,
-            user_data_dir="browser",
-        )
-
-        # pyquotex always loads ./session.json from CWD; override with our per-account session
-        _per_acct_session_file = Path(f"{session_path}/session.json")
-        if _per_acct_session_file.exists():
-            try:
-                with open(_per_acct_session_file) as _sf:
-                    _saved_session = json.load(_sf)
-                if _saved_session.get("token") or _saved_session.get("cookies"):
-                    qx_client.session_data = _saved_session
-                    logger.info(f"[Auth] Loaded per-account session for {email} (token={'ok' if _saved_session.get('token') else 'MISSING'}, cookies={'ok' if _saved_session.get('cookies') else 'MISSING'})")
-            except Exception as _se:
-                logger.warning(f"[Auth] Could not load per-account session from {_per_acct_session_file}: {_se}")
-
-        # If env-level override is provided, apply it (overrides the file)
-        if QUOTEX_SSID or QUOTEX_COOKIES:
-            qx_client.set_session(
-                user_agent=QUOTEX_USER_AGENT,
-                cookies=QUOTEX_COOKIES or None,
-                ssid=QUOTEX_SSID or None,
-            )
-
-        # Add context *before* connect call
-        logger.info(f"Adding user {user_id} to active_otp_requests BEFORE connect (under patch).")
-        # Allow startup pre-connect to proceed even before the Telegram bot is live.
-        if not bot_instance and interaction_type != "startup_preconnect":
-            raise ConnectionAbortedError("Bot instance not available for OTP context.")
-        active_otp_requests[user_id] = {'qx_client': qx_client, 'doc_id': account_doc_id}
-
-        # Activate patch state
-        patch_state['expecting_pin'] = True
-        logger.info("Patch state set to expect PIN.")
-
-        # Call connect UNDER the patch
-        logger.info(f"Attempting connection for {email} (aggressive patch active)...")
-        # Run the connection process in a separate thread to avoid blocking the main event loop
-
-        def connect_in_thread():
-            """Wrapper to run the connect method in a thread."""
-            return asyncio.run(qx_client.connect())
-
-        # Use an explicit executor (not a context-manager `with`) so that
-        # asyncio.CancelledError / KeyboardInterrupt during bot shutdown does
-        # NOT block on shutdown(wait=True) while the thread is still running.
-        _executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        future = _executor.submit(connect_in_thread)
-        try:
-            connection_check, connection_reason = await asyncio.wait_for(
-                asyncio.wrap_future(future),
-                timeout=180.0
-            )
-        except asyncio.TimeoutError:
-            logger.error("Connection attempt timed out.")
-            connection_check, connection_reason = False, "Timeout during connection"
-        except (asyncio.CancelledError, KeyboardInterrupt):
-            _executor.shutdown(wait=False, cancel_futures=True)
-            raise
-        except Exception as e:
-            logger.error(f"Error during connection in thread: {e}", exc_info=True)
-            connection_check, connection_reason = False, str(e)
-        finally:
-            _executor.shutdown(wait=False, cancel_futures=True)
-        # Deactivate patch state immediately after
-        patch_state['expecting_pin'] = False
-        logger.info("Patch state set to NOT expect PIN.")
-        logger.info(f"Connect() call finished (aggressive patch active).")
-        logger.info(f"Connection attempt finished. Result Check: {connection_check}, Reason: '{connection_reason}'")
-
-        # --- Handle connection results ---
-        if connection_check:
-            # ... (Success logic: log, switch mode, add to cache) ...
-            logger.info(f"Quotex connection successful for {email}.")
-            settings = await get_or_create_trade_settings(account_doc_id)
-            account_mode = settings.get("account_mode", "PRACTICE")
-            try:
-                await qx_client.change_account(account_mode)
-                logger.info(f"Switched Quotex account {email} to {account_mode} mode.")
-            except Exception as e_mode:
-                logger.error(f"Failed to switch account {email} to {account_mode}: {e_mode}", exc_info=True)
-                # Socket closed immediately after connect — the client is unusable; discard it
-                try:
-                    await qx_client.close()
-                except Exception:
-                    pass
-                return None, f"Connection Failed: socket closed before account mode could be set ({e_mode})"
-
-            active_quotex_clients[account_doc_id] = qx_client
-            return qx_client, f"Connected successfully in {account_mode} mode."
-        else:
-            # ... (Failure logic: check reasons, handle Invalid credentials, Token rejected, PIN/Auth errors) ...
-            logger.error(f"Quotex connection explicitly failed for {email}. Reason: {connection_reason}")
-            reason_str = str(connection_reason) if connection_reason else "Unknown reason"
-            # (Include all failure checks from previous versions)
-            if "Invalid credentials" in reason_str and interaction_type == "login_attempt":
-                await delete_quotex_account(account_doc_id)
-                return None, "Connection Failed: Invalid Credentials. Removed entry."
-            elif "check your email" in reason_str.lower() or "verifique seu e-mail" in reason_str.lower() or "pin" in reason_str.lower():
-                 return None, f"Connection Failed: Authentication error ({reason_str}). Check PIN/email or account status."
-            elif "Token rejected" in reason_str:
-                # ...(delete session file logic)...
-                return None, "Connection Failed: Token rejected. Session deleted."
-            elif (
-                "403" in reason_str
-                or "forbidden" in reason_str.lower()
-                or "cf-mitigated" in reason_str.lower()
-                or "just a moment" in reason_str.lower()
-                or "cloudflare" in reason_str.lower()
-                or "websocket connection closed" in reason_str.lower()
-            ):
-                # Delete the stale session so the next restart forces a fresh Selenium login
-                _stale_sess = Path(f"{session_path}/session.json")
-                if _stale_sess.exists():
-                    try:
-                        _stale_sess.unlink()
-                        logger.warning(
-                            f"[Auth] Deleted stale session.json for {email} "
-                            "(Cloudflare 403 on WebSocket connect)."
-                        )
-                    except Exception as _del_err:
-                        logger.warning(f"[Auth] Could not delete stale session: {_del_err}")
-                return None, (
-                    "Connection blocked by Cloudflare — stale session deleted. "
-                    "Restart the bot; a browser window will open for you to log in."
-                )
-            else:
-                 return None, f"Connection Failed: {reason_str}"
-
-    except asyncio.TimeoutError:
-         logger.error(f"Connection attempt for {email} timed out overall (aggressive patch).")
-         patch_state['expecting_pin'] = False
-         return None, "Connection Failed: Timed out during connection/authentication."
-    except ConnectionAbortedError as cae: # Bot context missing error
-         logger.error(f"Connection aborted for {email}: {cae}")
-         patch_state['expecting_pin'] = False
-         return None, f"Connection Failed: {cae}"
-    except ConnectionError as ce: # Error explicitly raised by PIN handling failure
-         logger.error(f"ConnectionError during PIN handling for {email}: {ce}")
-         patch_state['expecting_pin'] = False
-         # Provide the clearer error from the PIN handler
-         return None, f"Connection Failed: Error during PIN retrieval ({ce})"
-    except Exception as e:
-        logger.error(f"Unexpected error during Quotex connect/setup for {email} (aggressive patch): {e}", exc_info=True)
-        patch_state['expecting_pin'] = False
-        if qx_client:
-             try: await qx_client.close()
-             except: pass
-        return None, f"Connection Failed: An unexpected error occurred ({type(e).__name__}). Check logs."
-    finally:
-         # --- ALWAYS CLEANUP ---
-         patch_state['expecting_pin'] = False # Reset patch state
-         logger.debug(f"Running FINALLY block for get_quotex_client (aggressive patch w/ handler)")
-         # Stop the patch
-         if is_patched and patcher:
-             try:
-                 patcher.stop()
-                 logger.info("Aggressive builtins.input patch STOPPED.")
-             except Exception as stop_err:
-                 logger.error(f"Error stopping aggressive patch: {stop_err}")
-         # Cleanup OTP context dict
-         if user_id in active_otp_requests:
-             if active_otp_requests[user_id].get('doc_id') == account_doc_id:
-                 logger.info(f"Removing user {user_id} from active_otp_requests in finally.")
-                 del active_otp_requests[user_id]
-             else:
-                 logger.warning(f"Context mismatch during finally cleanup for {user_id}/{account_doc_id}.")
-# ----------------------------------------------------
 
 async def disconnect_quotex_client(account_doc_id: str):
-    """Disconnects and removes a Quotex client instance."""
+    """Disconnects and removes an AsyncQuotexClient instance from the cache."""
     global active_quotex_clients
     if account_doc_id in active_quotex_clients:
         client = active_quotex_clients[account_doc_id]
         logger.info(f"Disconnecting Quotex client for {account_doc_id}...")
         try:
-            await client.close() # Assuming close is async
+            await client.disconnect()
         except Exception as e:
-            logger.warning(f"Error closing Quotex client for {account_doc_id}: {e}")
+            logger.warning(f"Error disconnecting client for {account_doc_id}: {e}")
         del active_quotex_clients[account_doc_id]
         logger.info(f"Removed Quotex client instance for {account_doc_id}.")
 
@@ -1682,7 +1178,7 @@ async def help_command(client: Client, message: Message):
 
     **Important Notes:**
     - ⚠️ Trading involves risk. Never risk funds you cannot afford to lose.
-    - This bot uses the `pyquotex` library to interface with Quotex. API changes may occasionally affect functionality.
+    - This bot uses the `api_quotex` library (Playwright-based) to interface with Quotex.
     - Your credentials are stored in the bot's database. Use with caution and only on accounts you control.
 
     For assistance, contact the bot owner.
@@ -2018,13 +1514,14 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
          account_doc_id, new_mode = parts[1], parts[2]
          if new_mode in ["PRACTICE", "REAL"]:
              await update_trade_setting(account_doc_id, {"account_mode": new_mode})
-             # If a client is active, try changing its mode immediately? Risky maybe.
+             # If a client is active, evict it so the next operation reconnects in the new mode.
              if account_doc_id in active_quotex_clients:
                  try:
-                     await active_quotex_clients[account_doc_id].change_account(new_mode)
-                     await callback_query.answer(f"Account mode set to {new_mode} and active client updated.")
-                 except Exception as e_mode:
-                     await callback_query.answer(f"Account mode set to {new_mode}. Error updating active client: {e_mode}")
+                     await active_quotex_clients[account_doc_id].disconnect()
+                 except Exception:
+                     pass
+                 del active_quotex_clients[account_doc_id]
+                 await callback_query.answer(f"Account mode set to {new_mode}. Client evicted — will reconnect on next use.")
              else:
                  await callback_query.answer(f"Account mode set to {new_mode}.")
 
@@ -2531,12 +2028,70 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
 
         # ── Always re-render the view with fresh DB state ────────────────
         sig_settings = await get_signal_settings()
+        is_active = sig_settings.get('is_active', False)
+        channel_id = sig_settings.get('channel_id', 'Not set')
+        pending = sig_settings.get('pending_signal')
+        signal_delay = int(sig_settings.get('signal_delay', 0))
+        dur_remap_on = sig_settings.get('duration_remap_enabled', False)
+        ask_dur_on = sig_settings.get('ask_duration_on_partial', False)
+        manual_on = sig_settings.get('manual_trade_mode', False)
         userbot_ok = userbot_instance is not None
-        try:
-            await message.edit_text(
-                _signal_monitor_text(sig_settings, userbot_ok),
-                reply_markup=InlineKeyboardMarkup(_signal_monitor_keyboard(sig_settings)),
+
+        status_icon = "🟢" if is_active else "🔴"
+        toggle_label = "🔴 Turn OFF" if is_active else "🟢 Turn ON"
+
+        text = (
+            f"📡 **Signal Monitor**\n\n"
+            f"{status_icon} Status: **{'ON' if is_active else 'OFF'}**\n"
+            f"📺 Channels: {_channels_summary(sig_settings)}\n"
+            f"🤖 Userbot: **{'Running ✅' if userbot_ok else 'Not configured ❌'}**\n"
+            f"⏱ Delay Compensation: **{f'{signal_delay}s subtracted from duration' if signal_delay > 0 else 'Disabled'}**\n"
+            f"🔄 2min→5min Remap: **{'ON ✅' if dur_remap_on else 'OFF'}**\n"
+            f"⏱ Ask Duration on Partial: **{'ON ✅' if ask_dur_on else 'OFF'}**\n"
+            f"🕹 Manual Trade Mode: **{'ON ✅' if manual_on else 'OFF'}**\n"
+            f"🔁 Inverse Mode: **{'ON ✅' if sig_settings.get('inverse_mode', False) else 'OFF'}**\n"
+        )
+        if pending:
+            age_s = int(time.time() - pending.get('timestamp', 0))
+            text += (
+                f"\n⏳ **Pending Signal** (awaiting direction):\n"
+                f"  `{pending.get('asset_display', pending.get('asset'))}` "
+                f"${pending.get('amount')} {pending.get('duration', 0) // 60}min "
+                f"— {age_s}s ago {'⚠️ expired' if age_s > 300 else ''}\n"
             )
+        else:
+            text += "\nNo pending signal.\n"
+
+        delay_off_btn = InlineKeyboardButton("🚫 Disable Delay", callback_data="sig_delay_off")
+        delay_set_btn = InlineKeyboardButton(f"✏️ Set Delay ({signal_delay}s)", callback_data="sig_delay_set")
+        remap_btn = InlineKeyboardButton(
+            f"🔄 2min→5min: {'ON ✅' if dur_remap_on else 'OFF'}",
+            callback_data="sig_dur_remap_toggle",
+        )
+        ask_dur_btn = InlineKeyboardButton(
+            f"⏱ Ask Duration: {'ON ✅' if ask_dur_on else 'OFF'}",
+            callback_data="sig_ask_dur_toggle",
+        )
+        manual_btn = InlineKeyboardButton(
+            f"🕹 Manual Mode: {'ON ✅' if manual_on else 'OFF'}",
+            callback_data="sig_manual_mode_toggle",
+        )
+        inverse_btn = InlineKeyboardButton(
+            f"🔁 Inverse Mode: {'ON ✅' if sig_settings.get('inverse_mode', False) else 'OFF'}",
+            callback_data="sig_inverse_toggle",
+        )
+        keyboard = [
+            [InlineKeyboardButton(toggle_label, callback_data="signal_toggle")],
+            [InlineKeyboardButton("📺 Manage Channels", callback_data="sig_channels_view")],
+            [delay_set_btn, delay_off_btn],
+            [remap_btn, ask_dur_btn],
+            [manual_btn, inverse_btn],
+            [InlineKeyboardButton("🗑 Clear Pending Signal", callback_data="signal_clear_pending")],
+            [InlineKeyboardButton("📋 Signal Logs", callback_data="signal_logs_view")],
+            back_button("main_menu"),
+        ]
+        try:
+            await message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
         except Exception as e:
             if "MESSAGE_NOT_MODIFIED" in str(e):
                 pass  # content unchanged — nothing to do
@@ -2676,38 +2231,6 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
 
     # ── Signal Delay Callbacks ────────────────────────────────────────────────
 
-    elif data.startswith("sig_ch_tz:"):
-        if user_id != OWNER_ID:
-            await callback_query.answer("⛔️ Owner only.", show_alert=True)
-            return
-        try:
-            ch_idx = int(data.split(":", 1)[1])
-        except (ValueError, IndexError):
-            await callback_query.answer("Invalid.", show_alert=True)
-            return
-        sig_settings = await get_signal_settings()
-        channels = sig_settings.get('channels', [])
-        if ch_idx < 0 or ch_idx >= len(channels):
-            await callback_query.answer("Channel not found.", show_alert=True)
-            return
-        ch = channels[ch_idx]
-        cur_tz = ch.get('timezone', '').strip() or 'Not set'
-        user_states[user_id] = f"waiting_ch_tz:{ch_idx}:{message.id}"
-        try:
-            await message.edit_text(
-                f"🌐 **Set Channel Timezone**\n\n"
-                f"Channel: `{ch.get('id', '')}` "
-                f"(**{ch.get('nickname', '') or 'no nickname'}**)\n"
-                f"Current timezone: **{cur_tz}**\n\n"
-                f"Send a timezone string:\n"
-                f"  • IANA name: `Asia/Karachi`, `America/New_York`\n"
-                f"  • UTC offset: `UTC+5`, `UTC+5:30`, `UTC-4`\n\n"
-                f"This is used to convert the signal's entry time (HH:MM) to your system clock.\n"
-                f"Send /clear to remove the timezone, or /cancel to go back."
-            )
-        except Exception:
-            pass
-
     elif data in ("sig_delay_off", "sig_delay_set"):
         if user_id != OWNER_ID:
             await callback_query.answer("⛔️ Owner only.", show_alert=True)
@@ -2715,8 +2238,59 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
 
         if data == "sig_delay_off":
             await update_signal_settings({'signal_delay': 0})
-            await callback_query.answer("Shorten Duration disabled.")
-            await _refresh_signal_monitor(message)
+            await callback_query.answer("Delay compensation disabled.")
+            # Re-render signal status view
+            callback_query.data = "signal_status_view"
+            sig_settings2 = await get_signal_settings()
+            is_active2 = sig_settings2.get('is_active', False)
+            channel_id2 = sig_settings2.get('channel_id', 'Not set')
+            pending2 = sig_settings2.get('pending_signal')
+            dur_remap2 = sig_settings2.get('duration_remap_enabled', False)
+            ask_dur2 = sig_settings2.get('ask_duration_on_partial', False)
+            userbot_ok2 = userbot_instance is not None
+            status_icon2 = "🟢" if is_active2 else "🔴"
+            toggle_label2 = "🔴 Turn OFF" if is_active2 else "🟢 Turn ON"
+            text2 = (
+                f"📡 **Signal Monitor**\n\n"
+                f"{status_icon2} Status: **{'ON' if is_active2 else 'OFF'}**\n"
+                f"📺 Channels: {_channels_summary(sig_settings2)}\n"
+                f"🤖 Userbot: **{'Running ✅' if userbot_ok2 else 'Not configured ❌'}**\n"
+                f"⏱ Delay Compensation: **Disabled**\n"
+                f"🔄 2min→5min Remap: **{'ON ✅' if dur_remap2 else 'OFF'}**\n"
+                f"⏱ Ask Duration on Partial: **{'ON ✅' if ask_dur2 else 'OFF'}**\n"
+                f"🕹 Manual Trade Mode: **{'ON ✅' if sig_settings2.get('manual_trade_mode', False) else 'OFF'}**\n"
+                f"🔁 Inverse Mode: **{'ON ✅' if sig_settings2.get('inverse_mode', False) else 'OFF'}**\n"
+            )
+            if pending2:
+                age_s2 = int(time.time() - pending2.get('timestamp', 0))
+                text2 += (
+                    f"\n⏳ **Pending Signal** (awaiting direction):\n"
+                    f"  `{pending2.get('asset_display', pending2.get('asset'))}` "
+                    f"${pending2.get('amount')} {pending2.get('duration', 0) // 60}min "
+                    f"— {age_s2}s ago {'⚠️ expired' if age_s2 > 300 else ''}\n"
+                )
+            else:
+                text2 += "\nNo pending signal.\n"
+            _man2 = sig_settings2.get('manual_trade_mode', False)
+            _inv2 = sig_settings2.get('inverse_mode', False)
+            kb2 = [
+                [InlineKeyboardButton(toggle_label2, callback_data="signal_toggle")],
+                [InlineKeyboardButton("📺 Manage Channels", callback_data="sig_channels_view")],
+                [InlineKeyboardButton("✏️ Set Delay (0s)", callback_data="sig_delay_set"),
+                 InlineKeyboardButton("🚫 Disable Delay", callback_data="sig_delay_off")],
+                [InlineKeyboardButton(f"🔄 2min→5min: {'ON ✅' if dur_remap2 else 'OFF'}", callback_data="sig_dur_remap_toggle"),
+                 InlineKeyboardButton(f"⏱ Ask Duration: {'ON ✅' if ask_dur2 else 'OFF'}", callback_data="sig_ask_dur_toggle")],
+                [InlineKeyboardButton(f"🕹 Manual Mode: {'ON ✅' if _man2 else 'OFF'}", callback_data="sig_manual_mode_toggle"),
+                 InlineKeyboardButton(f"🔁 Inverse: {'ON ✅' if _inv2 else 'OFF'}", callback_data="sig_inverse_toggle")],
+                [InlineKeyboardButton("🗑 Clear Pending Signal", callback_data="signal_clear_pending")],
+                [InlineKeyboardButton("📋 Signal Logs", callback_data="signal_logs_view")],
+                back_button("main_menu"),
+            ]
+            try:
+                await message.edit_text(text2, reply_markup=InlineKeyboardMarkup(kb2))
+            except Exception as e:
+                if "MESSAGE_NOT_MODIFIED" not in str(e):
+                    raise
 
         else:  # sig_delay_set
             user_states[user_id] = f"waiting_signal_delay:{message.id}"
@@ -2724,9 +2298,9 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
                 sig_s = await get_signal_settings()
                 cur_delay = int(sig_s.get('signal_delay', 0))
                 await message.edit_text(
-                    f"✂️ **Set Shorten Duration**\n\n"
-                    f"Current value: **{cur_delay}s**\n\n"
-                    f"Enter the number of seconds to subtract from the signal's candle duration at execution.\n"
+                    f"⏱ **Set Signal Delay Compensation**\n\n"
+                    f"Current delay: **{cur_delay}s**\n\n"
+                    f"Enter the number of seconds to subtract from the signal's duration at execution.\n"
                     f"Typical value: `15` (for a 2‑min signal this gives 1m 45s).\n\n"
                     f"Send `0` to disable, or /cancel to keep current setting.",
                 )
@@ -2744,7 +2318,59 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
         await update_signal_settings({'duration_remap_enabled': new_val})
         await callback_query.answer(f"2min→5min remap {'enabled' if new_val else 'disabled'}.")
         logger.info(f"[Signal] Duration remap (2min→5min) {'enabled' if new_val else 'disabled'} by user {user_id}")
-        await _refresh_signal_monitor(message)
+        # Re-render the signal monitor panel
+        callback_query.data = "signal_status_view"
+        sig_s = await get_signal_settings()
+        is_active_r = sig_s.get('is_active', False)
+        s_icon = "🟢" if is_active_r else "🔴"
+        t_label = "🔴 Turn OFF" if is_active_r else "🟢 Turn ON"
+        sd = int(sig_s.get('signal_delay', 0))
+        dr = sig_s.get('duration_remap_enabled', False)
+        ad = sig_s.get('ask_duration_on_partial', False)
+        pend_r = sig_s.get('pending_signal')
+        ch_r = sig_s.get('channel_id', 'Not set')
+        ub_r = userbot_instance is not None
+        txt_r = (
+            f"📡 **Signal Monitor**\n\n"
+            f"{s_icon} Status: **{'ON' if is_active_r else 'OFF'}**\n"
+            f"📺 Channels: {_channels_summary(sig_s)}\n"
+            f"🤖 Userbot: **{'Running ✅' if ub_r else 'Not configured ❌'}**\n"
+            f"⏱ Delay Compensation: **{f'{sd}s subtracted from duration' if sd > 0 else 'Disabled'}**\n"
+            f"🔄 2min→5min Remap: **{'ON ✅' if dr else 'OFF'}**\n"
+            f"⏱ Ask Duration on Partial: **{'ON ✅' if ad else 'OFF'}**\n"
+            f"🕹 Manual Trade Mode: **{'ON ✅' if sig_s.get('manual_trade_mode', False) else 'OFF'}**\n"
+            f"🔁 Inverse Mode: **{'ON ✅' if sig_s.get('inverse_mode', False) else 'OFF'}**\n"
+        )
+        if pend_r:
+            age_r = int(time.time() - pend_r.get('timestamp', 0))
+            txt_r += (
+                f"\n⏳ **Pending Signal** (awaiting direction):\n"
+                f"  `{pend_r.get('asset_display', pend_r.get('asset'))}` "
+                f"${pend_r.get('amount')} {pend_r.get('duration', 0) // 60}min "
+                f"— {age_r}s ago {'⚠️ expired' if age_r > 300 else ''}\n"
+            )
+        else:
+            txt_r += "\nNo pending signal.\n"
+        _man_r = sig_s.get('manual_trade_mode', False)
+        _inv_r = sig_s.get('inverse_mode', False)
+        kb_r = [
+            [InlineKeyboardButton(t_label, callback_data="signal_toggle")],
+            [InlineKeyboardButton("📺 Manage Channels", callback_data="sig_channels_view")],
+            [InlineKeyboardButton(f"✏️ Set Delay ({sd}s)", callback_data="sig_delay_set"),
+             InlineKeyboardButton("🚫 Disable Delay", callback_data="sig_delay_off")],
+            [InlineKeyboardButton(f"🔄 2min→5min: {'ON ✅' if dr else 'OFF'}", callback_data="sig_dur_remap_toggle"),
+             InlineKeyboardButton(f"⏱ Ask Duration: {'ON ✅' if ad else 'OFF'}", callback_data="sig_ask_dur_toggle")],
+            [InlineKeyboardButton(f"🕹 Manual Mode: {'ON ✅' if _man_r else 'OFF'}", callback_data="sig_manual_mode_toggle"),
+             InlineKeyboardButton(f"🔁 Inverse: {'ON ✅' if _inv_r else 'OFF'}", callback_data="sig_inverse_toggle")],
+            [InlineKeyboardButton("🗑 Clear Pending Signal", callback_data="signal_clear_pending")],
+            [InlineKeyboardButton("📋 Signal Logs", callback_data="signal_logs_view")],
+            back_button("main_menu"),
+        ]
+        try:
+            await message.edit_text(txt_r, reply_markup=InlineKeyboardMarkup(kb_r))
+        except Exception as e:
+            if "MESSAGE_NOT_MODIFIED" not in str(e):
+                raise
 
     # ── Ask Duration on Partial Toggle ────────────────────────────────────────
 
@@ -2757,7 +2383,59 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
         await update_signal_settings({'ask_duration_on_partial': new_val})
         await callback_query.answer(f"Ask duration on partial {'enabled' if new_val else 'disabled'}.")
         logger.info(f"[Signal] Ask duration on partial {'enabled' if new_val else 'disabled'} by user {user_id}")
-        await _refresh_signal_monitor(message)
+        # Re-render the signal monitor panel
+        callback_query.data = "signal_status_view"
+        sig_s = await get_signal_settings()
+        is_active_q = sig_s.get('is_active', False)
+        s_icon_q = "🟢" if is_active_q else "🔴"
+        t_label_q = "🔴 Turn OFF" if is_active_q else "🟢 Turn ON"
+        sd_q = int(sig_s.get('signal_delay', 0))
+        dr_q = sig_s.get('duration_remap_enabled', False)
+        ad_q = sig_s.get('ask_duration_on_partial', False)
+        pend_q = sig_s.get('pending_signal')
+        ch_q = sig_s.get('channel_id', 'Not set')
+        ub_q = userbot_instance is not None
+        txt_q = (
+            f"📡 **Signal Monitor**\n\n"
+            f"{s_icon_q} Status: **{'ON' if is_active_q else 'OFF'}**\n"
+            f"📺 Channels: {_channels_summary(sig_s)}\n"
+            f"🤖 Userbot: **{'Running ✅' if ub_q else 'Not configured ❌'}**\n"
+            f"⏱ Delay Compensation: **{f'{sd_q}s subtracted from duration' if sd_q > 0 else 'Disabled'}**\n"
+            f"🔄 2min→5min Remap: **{'ON ✅' if dr_q else 'OFF'}**\n"
+            f"⏱ Ask Duration on Partial: **{'ON ✅' if ad_q else 'OFF'}**\n"
+            f"🕹 Manual Trade Mode: **{'ON ✅' if sig_s.get('manual_trade_mode', False) else 'OFF'}**\n"
+            f"🔁 Inverse Mode: **{'ON ✅' if sig_s.get('inverse_mode', False) else 'OFF'}**\n"
+        )
+        if pend_q:
+            age_q = int(time.time() - pend_q.get('timestamp', 0))
+            txt_q += (
+                f"\n⏳ **Pending Signal** (awaiting direction):\n"
+                f"  `{pend_q.get('asset_display', pend_q.get('asset'))}` "
+                f"${pend_q.get('amount')} {pend_q.get('duration', 0) // 60}min "
+                f"— {age_q}s ago {'⚠️ expired' if age_q > 300 else ''}\n"
+            )
+        else:
+            txt_q += "\nNo pending signal.\n"
+        _man_q = sig_s.get('manual_trade_mode', False)
+        _inv_q = sig_s.get('inverse_mode', False)
+        kb_q = [
+            [InlineKeyboardButton(t_label_q, callback_data="signal_toggle")],
+            [InlineKeyboardButton("📺 Manage Channels", callback_data="sig_channels_view")],
+            [InlineKeyboardButton(f"✏️ Set Delay ({sd_q}s)", callback_data="sig_delay_set"),
+             InlineKeyboardButton("🚫 Disable Delay", callback_data="sig_delay_off")],
+            [InlineKeyboardButton(f"🔄 2min→5min: {'ON ✅' if dr_q else 'OFF'}", callback_data="sig_dur_remap_toggle"),
+             InlineKeyboardButton(f"⏱ Ask Duration: {'ON ✅' if ad_q else 'OFF'}", callback_data="sig_ask_dur_toggle")],
+            [InlineKeyboardButton(f"🕹 Manual Mode: {'ON ✅' if _man_q else 'OFF'}", callback_data="sig_manual_mode_toggle"),
+             InlineKeyboardButton(f"🔁 Inverse: {'ON ✅' if _inv_q else 'OFF'}", callback_data="sig_inverse_toggle")],
+            [InlineKeyboardButton("🗑 Clear Pending Signal", callback_data="signal_clear_pending")],
+            [InlineKeyboardButton("📋 Signal Logs", callback_data="signal_logs_view")],
+            back_button("main_menu"),
+        ]
+        try:
+            await message.edit_text(txt_q, reply_markup=InlineKeyboardMarkup(kb_q))
+        except Exception as e:
+            if "MESSAGE_NOT_MODIFIED" not in str(e):
+                raise
 
     # ── Manual Trade Mode Toggle ──────────────────────────────────────────────
 
@@ -2770,7 +2448,58 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
         await update_signal_settings({'manual_trade_mode': new_val})
         await callback_query.answer(f"Manual trade mode {'enabled' if new_val else 'disabled'}.")
         logger.info(f"[Signal] Manual trade mode {'enabled' if new_val else 'disabled'} by user {user_id}")
-        await _refresh_signal_monitor(message)
+        # Re-render the signal monitor panel by re-using the main view path
+        sig_sm = await get_signal_settings()
+        is_am = sig_sm.get('is_active', False)
+        ch_m = sig_sm.get('channel_id', 'Not set')
+        pend_m = sig_sm.get('pending_signal')
+        sd_m = int(sig_sm.get('signal_delay', 0))
+        dr_m = sig_sm.get('duration_remap_enabled', False)
+        ad_m = sig_sm.get('ask_duration_on_partial', False)
+        man_m = sig_sm.get('manual_trade_mode', False)
+        ub_m = userbot_instance is not None
+        s_icon_m = "🟢" if is_am else "🔴"
+        t_label_m = "🔴 Turn OFF" if is_am else "🟢 Turn ON"
+        txt_m = (
+            f"📡 **Signal Monitor**\n\n"
+            f"{s_icon_m} Status: **{'ON' if is_am else 'OFF'}**\n"
+            f"📺 Channels: {_channels_summary(sig_sm)}\n"
+            f"🤖 Userbot: **{'Running ✅' if ub_m else 'Not configured ❌'}**\n"
+            f"⏱ Delay Compensation: **{f'{sd_m}s subtracted from duration' if sd_m > 0 else 'Disabled'}**\n"
+            f"🔄 2min→5min Remap: **{'ON ✅' if dr_m else 'OFF'}**\n"
+            f"⏱ Ask Duration on Partial: **{'ON ✅' if ad_m else 'OFF'}**\n"
+            f"🕹 Manual Trade Mode: **{'ON ✅' if man_m else 'OFF'}**\n"
+            f"🔁 Inverse Mode: **{'ON ✅' if sig_sm.get('inverse_mode', False) else 'OFF'}**\n"
+        )
+        if pend_m:
+            age_m = int(time.time() - pend_m.get('timestamp', 0))
+            txt_m += (
+                f"\n⏳ **Pending Signal** (awaiting direction):\n"
+                f"  `{pend_m.get('asset_display', pend_m.get('asset'))}` "
+                f"${pend_m.get('amount')} {pend_m.get('duration', 0) // 60}min "
+                f"— {age_m}s ago {'⚠️ expired' if age_m > 300 else ''}\n"
+            )
+        else:
+            txt_m += "\nNo pending signal.\n"
+        _inv_m = sig_sm.get('inverse_mode', False)
+        kb_m = [
+            [InlineKeyboardButton(t_label_m, callback_data="signal_toggle")],
+            [InlineKeyboardButton("📺 Manage Channels", callback_data="sig_channels_view")],
+            [InlineKeyboardButton(f"✏️ Set Delay ({sd_m}s)", callback_data="sig_delay_set"),
+             InlineKeyboardButton("🚫 Disable Delay", callback_data="sig_delay_off")],
+            [InlineKeyboardButton(f"🔄 2min→5min: {'ON ✅' if dr_m else 'OFF'}", callback_data="sig_dur_remap_toggle"),
+             InlineKeyboardButton(f"⏱ Ask Duration: {'ON ✅' if ad_m else 'OFF'}", callback_data="sig_ask_dur_toggle")],
+            [InlineKeyboardButton(f"🕹 Manual Mode: {'ON ✅' if man_m else 'OFF'}", callback_data="sig_manual_mode_toggle"),
+             InlineKeyboardButton(f"🔁 Inverse: {'ON ✅' if _inv_m else 'OFF'}", callback_data="sig_inverse_toggle")],
+            [InlineKeyboardButton("🗑 Clear Pending Signal", callback_data="signal_clear_pending")],
+            [InlineKeyboardButton("📋 Signal Logs", callback_data="signal_logs_view")],
+            back_button("main_menu"),
+        ]
+        try:
+            await message.edit_text(txt_m, reply_markup=InlineKeyboardMarkup(kb_m))
+        except Exception as e:
+            if "MESSAGE_NOT_MODIFIED" not in str(e):
+                raise
 
     elif data == "sig_inverse_toggle":
         if user_id != OWNER_ID:
@@ -2781,46 +2510,60 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
         await update_signal_settings({'inverse_mode': new_val})
         await callback_query.answer(f"Inverse mode {'enabled' if new_val else 'disabled'}.")
         logger.info(f"[Signal] Inverse mode {'enabled' if new_val else 'disabled'} by user {user_id}")
-        await _refresh_signal_monitor(message)
+        # Re-render the signal monitor panel
+        sig_si = await get_signal_settings()
+        is_ai = sig_si.get('is_active', False)
+        ch_i = sig_si.get('channel_id', 'Not set')
+        pend_i = sig_si.get('pending_signal')
+        sd_i = int(sig_si.get('signal_delay', 0))
+        dr_i = sig_si.get('duration_remap_enabled', False)
+        ad_i = sig_si.get('ask_duration_on_partial', False)
+        man_i = sig_si.get('manual_trade_mode', False)
+        inv_i = sig_si.get('inverse_mode', False)
+        ub_i = userbot_instance is not None
+        s_icon_i = "🟢" if is_ai else "🔴"
+        t_label_i = "🔴 Turn OFF" if is_ai else "🟢 Turn ON"
+        txt_i = (
+            f"📡 **Signal Monitor**\n\n"
+            f"{s_icon_i} Status: **{'ON' if is_ai else 'OFF'}**\n"
+            f"📺 Channels: {_channels_summary(sig_si)}\n"
+            f"🤖 Userbot: **{'Running ✅' if ub_i else 'Not configured ❌'}**\n"
+            f"⏱ Delay Compensation: **{f'{sd_i}s subtracted from duration' if sd_i > 0 else 'Disabled'}**\n"
+            f"🔄 2min→5min Remap: **{'ON ✅' if dr_i else 'OFF'}**\n"
+            f"⏱ Ask Duration on Partial: **{'ON ✅' if ad_i else 'OFF'}**\n"
+            f"🕹 Manual Trade Mode: **{'ON ✅' if man_i else 'OFF'}**\n"
+            f"🔀 Inverse Mode: **{'ON ✅' if inv_i else 'OFF'}**\n"
+        )
+        if pend_i:
+            age_i = int(time.time() - pend_i.get('timestamp', 0))
+            txt_i += (
+                f"\n⏳ **Pending Signal** (awaiting direction):\n"
+                f"  `{pend_i.get('asset_display', pend_i.get('asset'))}` "
+                f"${pend_i.get('amount')} {pend_i.get('duration', 0) // 60}min "
+                f"— {age_i}s ago {'⚠️ expired' if age_i > 300 else ''}\n"
+            )
+        else:
+            txt_i += "\nNo pending signal.\n"
+        kb_i = [
+            [InlineKeyboardButton(t_label_i, callback_data="signal_toggle")],
+            [InlineKeyboardButton("📺 Manage Channels", callback_data="sig_channels_view")],
+            [InlineKeyboardButton(f"✏️ Set Delay ({sd_i}s)", callback_data="sig_delay_set"),
+             InlineKeyboardButton("🚫 Disable Delay", callback_data="sig_delay_off")],
+            [InlineKeyboardButton(f"🔄 2min→5min: {'ON ✅' if dr_i else 'OFF'}", callback_data="sig_dur_remap_toggle"),
+             InlineKeyboardButton(f"⏱ Ask Duration: {'ON ✅' if ad_i else 'OFF'}", callback_data="sig_ask_dur_toggle")],
+            [InlineKeyboardButton(f"🕹 Manual Mode: {'ON ✅' if man_i else 'OFF'}", callback_data="sig_manual_mode_toggle"),
+             InlineKeyboardButton(f"🔀 Inverse: {'ON ✅' if inv_i else 'OFF'}", callback_data="sig_inverse_toggle")],
+            [InlineKeyboardButton("🗑 Clear Pending Signal", callback_data="signal_clear_pending")],
+            [InlineKeyboardButton("📋 Signal Logs", callback_data="signal_logs_view")],
+            back_button("main_menu"),
+        ]
+        try:
+            await message.edit_text(txt_i, reply_markup=InlineKeyboardMarkup(kb_i))
+        except Exception as e:
+            if "MESSAGE_NOT_MODIFIED" not in str(e):
+                raise
 
-    # ── Cancel Timed Entry ────────────────────────────────────────────────────
-
-    elif data == "cancel_timed_entry":
-        if user_id != OWNER_ID:
-            await callback_query.answer("⛔️ Owner only.", show_alert=True)
-            return
-        global _timed_entry_cancel, _timed_entry_info
-        if _timed_entry_info is None:
-            await callback_query.answer("ℹ️ No active timed entry to cancel.", show_alert=True)
-            return
-        _timed_entry_cancel = True
-        await callback_query.answer("❌ Timed entry cancellation requested.")
-
-    # ── Entry Delay Callbacks ──────────────────────────────────────────────────
-
-    elif data in ("sig_entry_delay_off", "sig_entry_delay_set"):
-        if user_id != OWNER_ID:
-            await callback_query.answer("⛔️ Owner only.", show_alert=True)
-            return
-
-        if data == "sig_entry_delay_off":
-            await update_signal_settings({'entry_delay': 0})
-            await callback_query.answer("Entry Delay disabled.")
-            await _refresh_signal_monitor(message)
-        else:  # sig_entry_delay_set
-            user_states[user_id] = f"waiting_entry_delay:{message.id}"
-            try:
-                sig_s = await get_signal_settings()
-                cur_ed = int(sig_s.get('entry_delay', 0))
-                await message.edit_text(
-                    f"⏱ **Set Entry Delay**\n\n"
-                    f"Current value: **{cur_ed}s**\n\n"
-                    f"All incoming signals will be held for this many seconds before the trade is placed.\n"
-                    f"Useful when you want to intentionally delay entry across all signals.\n\n"
-                    f"Send the number of seconds (e.g. `5`), `0` to disable, or /cancel.",
-                )
-            except Exception:
-                pass
+    # ── Signal Amount Selection Callbacks ─────────────────────────────────────
 
     elif data.startswith("sig_amt:") or data in ("sig_amt_custom", "sig_amt_cancel"):
         sig_settings = await get_signal_settings()
@@ -3798,7 +3541,7 @@ async def message_handler(client: Client, message: Message):
                     chat_id=user_id,
                     message_id=delay_msg_id,
                     text=(
-                        f"✅ **Shorten Duration set to: {delay_display}**\n\n"
+                        f"✅ **Delay compensation set to: {delay_display}**\n\n"
                         f"Go back to Signal Monitor to review settings."
                     ),
                 )
@@ -3806,103 +3549,10 @@ async def message_handler(client: Client, message: Message):
                 pass
 
         await message.reply_text(
-            f"✅ Shorten Duration set to **{delay_display}**."
-            + (f" Candle durations will be reduced by {new_delay}s at execution." if new_delay > 0 else " No duration reduction will be applied."),
+            f"✅ Signal delay set to **{delay_display}**."
+            + (f" Durations will be reduced by {new_delay}s at execution." if new_delay > 0 else " No compensation will be applied."),
             quote=True,
         )
-
-    elif state and state.startswith("waiting_entry_delay:"):
-        del user_states[user_id]
-        try:
-            ed_msg_id = int(state.split(":", 1)[1])
-        except (IndexError, ValueError):
-            ed_msg_id = None
-
-        raw = text.strip()
-        if raw.lower() == "/cancel":
-            await message.reply_text("Cancelled — Entry Delay unchanged.", quote=True)
-            return
-        try:
-            new_ed = int(raw)
-            if new_ed < 0:
-                raise ValueError("Entry delay cannot be negative")
-        except ValueError:
-            await message.reply_text(
-                "❌ Invalid value. Send a whole number of seconds (e.g. `5`), or `0` to disable.",
-                quote=True,
-            )
-            return
-
-        await update_signal_settings({'entry_delay': new_ed})
-        ed_display = f"{new_ed}s" if new_ed > 0 else "Disabled"
-
-        if bot_instance and ed_msg_id:
-            try:
-                await bot_instance.edit_message_text(
-                    chat_id=user_id,
-                    message_id=ed_msg_id,
-                    text=f"✅ **Entry Delay set to: {ed_display}**\n\nGo back to Signal Monitor to review settings.",
-                )
-            except Exception:
-                pass
-
-        await message.reply_text(
-            f"✅ Entry Delay set to **{ed_display}**."
-            + (f" All signals will be held {new_ed}s before entry." if new_ed > 0 else " No entry delay will be applied."),
-            quote=True,
-        )
-
-    elif state and state.startswith("waiting_ch_tz:"):
-        del user_states[user_id]
-        # state = "waiting_ch_tz:{ch_idx}:{msg_id}"
-        parts_tz = state.split(":", 2)
-        try:
-            ch_idx_tz = int(parts_tz[1]) if len(parts_tz) > 1 else -1
-        except (ValueError, TypeError):
-            ch_idx_tz = -1
-        try:
-            ch_tz_msg_id = int(parts_tz[2]) if len(parts_tz) > 2 else None
-        except (ValueError, TypeError):
-            ch_tz_msg_id = None
-
-        raw = text.strip()
-        if raw.lower() == "/cancel":
-            await message.reply_text("❌ Cancelled.", quote=True)
-        else:
-            new_tz = '' if raw.lower() == "/clear" else raw[:60]
-            # Validate timezone string (warn but still save)
-            tz_valid = True
-            if new_tz:
-                resolved = _resolve_tz(new_tz)
-                if resolved is None:
-                    tz_valid = False
-
-            sig_settings_cur = await get_signal_settings()
-            channels = list(sig_settings_cur.get('channels', []))
-            if 0 <= ch_idx_tz < len(channels):
-                channels[ch_idx_tz]['timezone'] = new_tz
-                await update_signal_settings({'channels': channels})
-                if new_tz:
-                    label = f"**{new_tz}**" + ("" if tz_valid else " ⚠️ _(unrecognised — will use local time)_")
-                    await message.reply_text(f"✅ Timezone set to {label}.", quote=True)
-                else:
-                    await message.reply_text("✅ Channel timezone cleared.", quote=True)
-            else:
-                await message.reply_text("❌ Channel not found.", quote=True)
-
-        # Refresh the channels panel
-        if bot_instance and ch_tz_msg_id:
-            try:
-                sig_settings_updated = await get_signal_settings()
-                chs_updated = sig_settings_updated.get('channels', [])
-                await bot_instance.edit_message_text(
-                    chat_id=user_id,
-                    message_id=ch_tz_msg_id,
-                    text=_channels_panel_text(chs_updated),
-                    reply_markup=InlineKeyboardMarkup(_channels_panel_keyboard(chs_updated)),
-                )
-            except Exception:
-                pass
 
     elif state and state.startswith("waiting_signal_amount:"):
         # state = "waiting_signal_amount:{amount_msg_id}"
@@ -3958,57 +3608,52 @@ async def message_handler(client: Client, message: Message):
         )
 
 
-async def _check_asset_open_and_get_name(qx_client: Quotex, asset_name_original: str) -> Optional[str]:
+async def _check_asset_open_and_get_name(qx_client: AsyncQuotexClient, asset_name_original: str) -> Optional[str]:
     """
-    Checks if the asset (or its OTC/non-OTC counterpart) is open.
-    Returns the name of the tradeable asset, or None if unavailable.
+    Checks if the asset (or its OTC/non-OTC counterpart) is open using api_quotex.
+    Returns the tradeable asset name, or None if unavailable.
 
     Resolution order:
-      • Non-OTC asset  → try force_open=False, then _otc with force_open=True
-      • OTC asset      → try force_open=True first, then non-OTC base as fallback
+      • Non-OTC asset  → try base, then _otc variant
+      • OTC asset      → try OTC first, then non-OTC base as fallback
     """
     try:
+        assets = await qx_client.get_available_assets()
+        if not assets:
+            logger.warning(f"[{asset_name_original}] get_available_assets() returned empty.")
+            return None
+
+        def _asset_open(name: str) -> bool:
+            info = assets.get(name)
+            if not info:
+                return False
+            return bool(info.get('is_open', False))
+
         is_otc = asset_name_original.endswith("_otc")
 
         if not is_otc:
-            # 1. Try the base asset
-            checked_name, data = await qx_client.get_available_asset(asset_name_original, force_open=False)
-            if checked_name and data and data[2]:
+            # Try the base asset first
+            if asset_name_original in assets and _asset_open(asset_name_original):
                 logger.info(f"[{asset_name_original}] Asset is open.")
-                return checked_name
-
-            # 2. Base is closed — try the OTC variant
+                return asset_name_original
+            # Try OTC variant
             otc_asset = asset_name_original + "_otc"
-            logger.info(f"[{asset_name_original}] Closed. Trying OTC variant {otc_asset}...")
-            checked_name_otc, data_otc = await qx_client.get_available_asset(otc_asset, force_open=True)
-            if checked_name_otc and data_otc:
-                logger.info(f"[{otc_asset}] OTC variant is open.")
-                return checked_name_otc
-
+            if otc_asset in assets:
+                logger.info(f"[{otc_asset}] OTC variant available (fallback).")
+                return otc_asset
             logger.warning(f"[{asset_name_original}] Neither base nor OTC variant is available.")
             return None
-
         else:
-            # 1. Asset name is already OTC.
-            # Do NOT use get_available_asset(force_open=True) here — when the OTC
-            # instrument's i[14] flag is 0, it silently strips "_otc" and returns
-            # the base non-OTC name, causing orders on the wrong asset and not_price_.
-            # OTC pairs on Quotex are available 24/7, so we only need to confirm the
-            # symbol exists in the instruments list (i[0] != None), ignoring i[14].
-            _, otc_data = await qx_client.check_asset_open(asset_name_original)
-            if otc_data and otc_data[0] is not None:
+            # OTC asset — check directly first (OTC pairs trade 24/7)
+            if asset_name_original in assets:
                 logger.info(f"[{asset_name_original}] OTC asset found in instruments.")
                 return asset_name_original
-
-            # 2. OTC symbol not in instruments list — try the non-OTC base as fallback
-            base_asset = asset_name_original[:-4]  # strip "_otc"
-            logger.info(f"[{asset_name_original}] OTC not in instruments. Trying base asset {base_asset}...")
-            checked_name_base, data_base = await qx_client.get_available_asset(base_asset, force_open=False)
-            if checked_name_base and data_base and data_base[2]:
-                logger.info(f"[{base_asset}] Base asset is open (fallback from OTC).")
-                return checked_name_base
-
-            logger.warning(f"[{asset_name_original}] Neither OTC nor base asset {base_asset} is available.")
+            # Fallback to non-OTC base
+            base_asset = asset_name_original[:-4]
+            if base_asset in assets and _asset_open(base_asset):
+                logger.info(f"[{base_asset}] Base asset open (OTC fallback).")
+                return base_asset
+            logger.warning(f"[{asset_name_original}] Neither OTC nor base asset available.")
             return None
 
     except Exception as e:
@@ -4031,12 +3676,9 @@ async def get_owner_balance() -> Optional[float]:
         account_doc_id = str(accounts[0]['_id'])
         if account_doc_id in active_quotex_clients:
             qx_client = active_quotex_clients[account_doc_id]
-            settings = await get_or_create_trade_settings(account_doc_id)
-            account_mode = settings.get('account_mode', 'PRACTICE')
-            profile = await qx_client.get_profile()
-            if profile:
-                bal = profile.live_balance if account_mode == 'REAL' else profile.demo_balance
-                return float(bal)
+            bal_obj = await qx_client.get_balance()
+            if bal_obj:
+                return float(bal_obj.balance if hasattr(bal_obj, 'balance') else bal_obj.amount)
     except Exception as e:
         logger.warning(f"[SignalAmt] Could not fetch owner balance: {e}")
     return None
@@ -4154,9 +3796,6 @@ async def execute_signal_trade(signal: Dict[str, Any]):
     # ── Apply signal-delay compensation ──────────────────────────────────────
     sig_settings = await get_signal_settings()
     signal_delay = int(sig_settings.get('signal_delay', 0))
-    entry_delay = int(sig_settings.get('entry_delay', 0))
-    entry_time_str: Optional[str] = signal.get('entry_time')  # e.g. "18:20" or None
-    timed_entry = False
 
     # ── Strategy Mode: override trade amount ──────────────────────────────────
     # ── Strategy Mode: override trade amount ──────────────────────────────────
@@ -4227,134 +3866,11 @@ async def execute_signal_trade(signal: Dict[str, Any]):
 
     logger.info(f"[Signal Trade] {asset_display} | {dir_label} | ${amount} | {duration}s (signal: {raw_duration}s, delay: {signal_delay}s){inverse_note}")
 
-    # ── Timed Entry: sleep until HH:MM specified in signal ────────────────────
-    if entry_time_str:
-        global _timed_entry_cancel, _timed_entry_info
-
-        # ── Future: per-channel timezone resolution (reserved) ───────────────
-        # ch_tz_str = ""
-        # sig_channel_id = signal.get('_channel_id')
-        # if sig_channel_id:
-        #     for ch in sig_settings.get('channels', []):
-        #         if str(ch.get('id', '')) == str(sig_channel_id):
-        #             ch_tz_str = ch.get('timezone', '')
-        #             break
-        # tz_obj = _resolve_tz(ch_tz_str)
-        # ─────────────────────────────────────────────────────────────────────
-
-        # Capture current time and initial wait for the notification
-        now_local = datetime.datetime.now()
-        wait_secs = _compute_timed_entry_wait(entry_time_str)
-        timed_entry = True
-        now_str = now_local.strftime('%Y-%m-%d %H:%M:%S')
-        logger.info(
-            f"[Signal Trade] Timed entry: now={now_str} (system local), waiting {wait_secs:.1f}s until :{entry_time_str.split(':')[1]}"
-        )
-
-        # Register active timed entry so the UI can display and cancel it
-        _timed_entry_cancel = False
-        _timed_entry_info = {
-            'asset_display': asset_display,
-            'direction': dir_label,
-            'entry_time': entry_time_str,
-        }
-
-        # Send notification with cancel button
-        _te_notif_msg_id = None
-        if bot_instance:
-            try:
-                wait_h = int(wait_secs // 3600)
-                wait_m = int((wait_secs % 3600) // 60)
-                wait_s = int(wait_secs % 60)
-                wait_human = (
-                    f"{wait_h}h {wait_m}m {wait_s}s" if wait_h
-                    else f"{wait_m}m {wait_s}s" if wait_m
-                    else f"{wait_s}s"
-                )
-                _te_msg = await bot_instance.send_message(
-                    OWNER_ID,
-                    f"⏰ **Timed Entry Scheduled**\n\n"
-                    f"📊 Asset: `{asset_display}`\n"
-                    f"📈 Direction: **{dir_label}**{inverse_note}\n"
-                    f"🕐 Bot system time: `{now_str}`\n"
-                    f"⌚ Signal entry time: **{entry_time_str}** → entering at :{entry_time_str.split(':')[1]}\n"
-                    f"⏳ Waiting **{wait_human}** ({wait_secs:.0f}s) before placing trade.",
-                    reply_markup=InlineKeyboardMarkup(
-                        [[InlineKeyboardButton("❌ Cancel Timed Entry", callback_data="cancel_timed_entry")]]
-                    ),
-                )
-                _te_notif_msg_id = _te_msg.id
-            except Exception:
-                pass
-
-        # Polling loop — re-evaluates wall-clock every 5s so clock adjustments
-        # are picked up quickly, and the cancel flag is checked each iteration.
-        _POLL_INTERVAL = 5  # seconds
-        while True:
-            remaining = _compute_timed_entry_wait(entry_time_str)
-            if remaining <= 0:
-                break
-            if _timed_entry_cancel:
-                _timed_entry_info = None
-                _timed_entry_cancel = False
-                logger.info("[Signal Trade] Timed entry cancelled by user.")
-                if bot_instance and _te_notif_msg_id:
-                    try:
-                        await bot_instance.edit_message_text(
-                            chat_id=OWNER_ID,
-                            message_id=_te_notif_msg_id,
-                            text=(
-                                f"❌ **Timed Entry Cancelled**\n\n"
-                                f"📊 Asset: `{asset_display}`\n"
-                                f"⌚ Was waiting until :{entry_time_str.split(':')[1]}"
-                            ),
-                        )
-                    except Exception:
-                        pass
-                if bot_instance:
-                    try:
-                        await bot_instance.send_message(
-                            OWNER_ID, "❌ Timed entry cancelled. Trade will not be placed."
-                        )
-                    except Exception:
-                        pass
-                return  # abort execute_signal_trade entirely
-            await asyncio.sleep(min(_POLL_INTERVAL, remaining))
-
-        # Clear active entry info now that target time has been reached
-        _timed_entry_info = None
-        _timed_entry_cancel = False
-        # Remove the cancel button in the background — don't block the trade entry.
-        if bot_instance and _te_notif_msg_id:
-            async def _remove_cancel_button(_mid=_te_notif_msg_id):
-                try:
-                    await bot_instance.edit_message_reply_markup(
-                        chat_id=OWNER_ID, message_id=_mid, reply_markup=None,
-                    )
-                except Exception:
-                    pass
-            asyncio.create_task(_remove_cancel_button())
-
-        # ── Precision approach: sleep the exact sub-second remainder so the
-        # trade hits the broker as close to :MM:00 as possible.
-        _final_remaining = _compute_timed_entry_wait(entry_time_str)
-        if 0 < _final_remaining < 2.0:
-            await asyncio.sleep(_final_remaining)
-    # ─────────────────────────────────────────────────────────────────────────
-
-    # ── Entry Delay: hold entry for N seconds after signal receipt ────────────
-    if entry_delay > 0:
-        logger.info(f"[Signal Trade] Entry delay: sleeping {entry_delay}s before placing trades.")
-        await asyncio.sleep(entry_delay)
-    # ─────────────────────────────────────────────────────────────────────────
-
     if bot_instance:
         try:
             dur_display = f"{duration // 60}m {duration % 60}s" if duration % 60 else f"{duration // 60} min"
             raw_dur_display = f"{raw_duration // 60}m {raw_duration % 60}s" if raw_duration % 60 else f"{raw_duration // 60} min"
-            entry_time_note = f"\n⌚ Entry time: `{entry_time_str}` _(timed entry)_" if entry_time_str else ""
-            entry_delay_note = f"\n⏱ Entry delay applied: `{entry_delay}s`" if entry_delay > 0 else ""
-            _sig_recv_coro = bot_instance.send_message(
+            await bot_instance.send_message(
                 OWNER_ID,
                 f"🔔 **Signal Received — Executing Trades**\n\n"
                 f"📊 Asset: `{asset_display}`\n"
@@ -4362,15 +3878,8 @@ async def execute_signal_trade(signal: Dict[str, Any]):
                 f"💵 Amount: `${amount}`\n"
                 f"⏱ Duration: `{dur_display}`"
                 + (f" _(signal: {raw_dur_display}, −{signal_delay}s)_" if signal_delay > 0 else f" `({duration}s)`")
-                + entry_time_note + entry_delay_note
                 + f"\n\n⚡ Placing on all **Active** accounts...",
             )
-            # For timed entries fire the notification in the background so it
-            # doesn't add latency between the target moment and buy().
-            if entry_time_str:
-                asyncio.create_task(_sig_recv_coro)
-            else:
-                await _sig_recv_coro
         except Exception as e:
             logger.warning(f"[Signal Trade] Could not notify owner: {e}")
 
@@ -4386,7 +3895,6 @@ async def execute_signal_trade(signal: Dict[str, Any]):
             str(acc['_id']), acc['email'], asset, asset_display, direction, amount, duration,
             strategy_override=strategy_override,
             received_at=received_at,
-            timed_entry=timed_entry,
         )
         for acc in accounts
     ]
@@ -4402,7 +3910,6 @@ async def _execute_single_account_signal_trade(
     direction: str, amount: float, duration: int,
     strategy_override: Optional[dict] = None,
     received_at: Optional[float] = None,
-    timed_entry: bool = False,
 ):
     """Execute a signal-based trade on one Quotex account and report result to owner."""
     try:
@@ -4427,17 +3934,8 @@ async def _execute_single_account_signal_trade(
                 )
             return
 
-        trade_mode = settings.get("trade_mode", DEFAULT_TRADE_MODE)
         account_mode = settings.get("account_mode", "PRACTICE")
-
-        # Explicitly switch to the account mode from settings (PRACTICE / REAL).
-        # This is critical — the cached client may still be in PRACTICE mode even
-        # after the user switches to REAL in the bot settings.
-        try:
-            await qx_client.change_account(account_mode)
-            logger.info(f"[Signal Trade] [{email}] Account mode set to {account_mode}")
-        except Exception as mode_err:
-            logger.warning(f"[Signal Trade] [{email}] Could not switch to {account_mode}: {mode_err}")
+        # Note: account mode is set at client creation via is_demo — no change_account() needed.
 
         # Check asset availability (tries OTC variant automatically)
         asset_open = await _check_asset_open_and_get_name(qx_client, asset)
@@ -4452,7 +3950,8 @@ async def _execute_single_account_signal_trade(
         # ── Strategy Mode: balance check + override amount ────────────────────
         if strategy_override:
             try:
-                current_balance = await qx_client.get_balance()
+                _bal_obj = await qx_client.get_balance()
+                current_balance = float(_bal_obj.balance) if _bal_obj and hasattr(_bal_obj, 'balance') else None
             except Exception:
                 current_balance = None
 
@@ -4491,46 +3990,20 @@ async def _execute_single_account_signal_trade(
         # Capture opening balance (only persisted on first trade of the calendar day)
         date_str_today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
         try:
-            balance_before = await qx_client.get_balance()
-            await record_opening_balance(account_doc_id, email, date_str_today, account_mode, balance_before)
-            logger.info(f"[Signal Trade] [{email}] Balance before trade: {balance_before}")
+            _bal_before_obj = await qx_client.get_balance()
+            balance_before = float(_bal_before_obj.balance) if _bal_before_obj and hasattr(_bal_before_obj, 'balance') else None
+            if balance_before is not None:
+                await record_opening_balance(account_doc_id, email, date_str_today, account_mode, balance_before)
+                logger.info(f"[Signal Trade] [{email}] Balance before trade: {balance_before}")
         except Exception as bal_err:
             logger.warning(f"[Signal Trade] [{email}] Could not fetch pre-trade balance: {bal_err}")
             balance_before = None
-
-        # Prime the price feed before placing the order.
-        # Quotex rejects orders with "not_price_" when no price data is actively
-        # streaming for the asset. start_realtime_price() subscribes AND waits
-        # until the server sends at least one tick, preventing the race condition
-        # that buy() has (it calls start_candles_stream but doesn't wait for data).
-        try:
-            await asyncio.wait_for(
-                qx_client.start_realtime_price(asset_open),
-                timeout=8,
-            )
-            logger.info(f"[Signal Trade] [{email}] Price feed ready for {asset_open}.")
-        except asyncio.TimeoutError:
-            logger.warning(
-                f"[Signal Trade] [{email}] Price feed for {asset_open} not ready after 8s — "
-                "proceeding anyway."
-            )
-        except Exception as pf_err:
-            logger.warning(f"[Signal Trade] [{email}] Price feed priming error: {pf_err} — proceeding anyway.")
-
-        # Clear any stale WebSocket error flag from a previous trade or session.
-        # global_value.check_websocket_if_error is never reset by pyquotex — once it
-        # is set (e.g. from a prior not_price_ response) every subsequent buy() call
-        # exits the wait loop immediately with the old error reason.
-        _qx_global_value.check_websocket_if_error = False
-        _qx_global_value.websocket_error_reason = None
 
         # ── Deadline check ────────────────────────────────────────────────────
         # All setup is done. If more than MAX_ENTRY_DELAY_SECONDS have elapsed
         # since the signal arrived, skip the trade — a late entry is worse than
         # no entry. This catches slow re-auth, slow WS reconnects, etc.
-        # EXCEPTION: timed_entry=True means we deliberately slept until a specific
-        # HH:MM; the elapsed time is expected to be large — skip the check.
-        if received_at is not None and not timed_entry:
+        if received_at is not None:
             elapsed = time.time() - received_at
             if elapsed > MAX_ENTRY_DELAY_SECONDS:
                 logger.warning(
@@ -4551,17 +4024,23 @@ async def _execute_single_account_signal_trade(
                 return
         # ─────────────────────────────────────────────────────────────────────
 
-        # Attempt buy with one automatic reconnect on connection-reset errors
+        # Place order with one automatic reconnect on connection-reset errors
         entry_time = datetime.datetime.now(datetime.timezone.utc)
         _CONNECTION_ERRS = (ConnectionResetError, ConnectionAbortedError, ConnectionError, OSError)
+        order = None
         for attempt in range(2):
             try:
-                status, buy_info = await qx_client.buy(amount, asset_open, direction, duration, trade_mode)
+                order = await qx_client.place_order(
+                    asset=asset_open,
+                    amount=amount,
+                    direction=OrderDirection.CALL if direction == 'call' else OrderDirection.PUT,
+                    duration=duration,
+                )
                 break  # success — exit retry loop
             except _CONNECTION_ERRS as conn_err:
                 if attempt == 0:
                     logger.warning(
-                        f"[Signal Trade] [{email}] Connection error on buy() (attempt 1): {conn_err}. "
+                        f"[Signal Trade] [{email}] Connection error on place_order() (attempt 1): {conn_err}. "
                         "Evicting stale client and reconnecting..."
                     )
                     await disconnect_quotex_client(account_doc_id)
@@ -4577,31 +4056,30 @@ async def _execute_single_account_signal_trade(
                     asset_open = await _check_asset_open_and_get_name(qx_client, asset) or asset_open
                 else:
                     raise  # second attempt also failed — let outer handler report it
+            except Exception as order_err:
+                logger.error(f"[Signal Trade] [{email}] place_order() error: {order_err}", exc_info=True)
+                if bot_instance:
+                    await bot_instance.send_message(
+                        OWNER_ID,
+                        f"❌ **{email}**\nTrade placement failed.\n_Reason: {order_err}_",
+                    )
+                return
 
-        if not status:
-            err = buy_info if isinstance(buy_info, str) else str(buy_info)
-            logger.warning(
-                f"[Signal Trade] [{email}] buy() returned status=False "
-                f"(buy_info={err!r}). Trade was not placed — "
-                f"likely a WebSocket timeout (no buy_id received from Quotex)."
-            )
+        if order is None:
+            logger.warning(f"[Signal Trade] [{email}] place_order() returned None (unknown error).")
             if bot_instance:
                 await bot_instance.send_message(
                     OWNER_ID,
-                    f"❌ **{email}**\nTrade placement failed.\n_Reason: {err}_",
+                    f"❌ **{email}**\nTrade placement returned no order (unknown error).",
                 )
             return
 
-        placed_at_str = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
-        trade_id = buy_info.get('id', 'N/A')
-        entry_price = (
-            buy_info.get('openPrice') or buy_info.get('open_price')
-            or buy_info.get('price') or buy_info.get('open')
-        )
+        trade_id = order.order_id
+        entry_price = getattr(order, 'open_price', None) or getattr(order, 'openPrice', None)
         dur_display_r = f"{duration // 60}m {duration % 60}s" if duration % 60 else f"{duration // 60} min"
         dir_label_r = '🔼 BUY (CALL)' if direction == 'call' else '🔽 SELL (PUT)'
         entry_price_str = f"`{entry_price}`" if entry_price else "_unknown_"
-        logger.info(f"[Signal Trade] [{email}] Trade ID {trade_id} placed at {placed_at_str}. Waiting {duration + 2}s for result...")
+        logger.info(f"[Signal Trade] [{email}] Trade ID {trade_id} placed. Waiting {duration + 2}s for result...")
         if bot_instance:
             try:
                 await bot_instance.send_message(
@@ -4612,7 +4090,6 @@ async def _execute_single_account_signal_trade(
                     f"💵 Amount: `${amount}`\n"
                     f"⏱ Duration: `{dur_display_r}`\n"
                     f"🏷 Trade ID: `{trade_id}`\n"
-                    f"🕐 Placed at: `{placed_at_str}`\n"
                     f"📌 Entry Price: {entry_price_str}\n\n"
                     f"⏳ Waiting for result...",
                 )
@@ -4620,82 +4097,45 @@ async def _execute_single_account_signal_trade(
                 logger.warning(f"[Signal Trade] [{email}] Could not send placement notification: {notify_err}")
         await asyncio.sleep(duration + 2)
 
-        # check_win polls listinfodata (populated via WebSocket).
-        # If the result packet is lost (e.g. after a reconnect), it loops forever.
-        # Wrap with a generous timeout and fall back to get_result() (history API).
+        # check_win returns (profit_float, status_str) where status is 'win'/'loss'/'draw'/None.
         _CHECK_TIMEOUT = 45  # seconds after the trade should already be settled
-        win_result = None
         profit = 0.0
+        result_str = "TIE"
+        icon = "⚠️"
+        outcome = "TIE  (no profit/loss)"
         try:
-            win_result = await asyncio.wait_for(
-                qx_client.check_win(buy_info["id"]), timeout=_CHECK_TIMEOUT
+            profit_raw, win_status = await asyncio.wait_for(
+                qx_client.check_win(trade_id), timeout=_CHECK_TIMEOUT
             )
-            profit = qx_client.get_profit()
-            logger.info(f"[Signal Trade] [{email}] check_win={win_result}, profit={profit}")
+            if win_status == 'win':
+                profit = float(profit_raw) if profit_raw is not None else 0.0
+                result_str = "WIN"
+                icon, outcome = "✅", f"WIN!  Profit: +${abs(profit):.2f}"
+            elif win_status == 'loss':
+                profit = -abs(float(profit_raw)) if profit_raw is not None else 0.0
+                result_str = "LOSS"
+                icon, outcome = "❌", f"LOSS!  Lost: -${abs(profit):.2f}"
+            else:  # 'draw' or None (no result yet)
+                profit = 0.0
+                result_str = "TIE"
+                icon, outcome = "⚠️", "TIE  (no profit/loss)"
+            logger.info(f"[Signal Trade] [{email}] check_win status={win_status}, profit={profit}")
         except asyncio.TimeoutError:
             logger.warning(
                 f"[Signal Trade] [{email}] check_win timed out after {_CHECK_TIMEOUT}s "
-                f"(trade_id={trade_id}). Trying get_result() fallback..."
-            )
-            try:
-                fb_status, fb_data = await qx_client.get_result(str(trade_id))
-                if fb_status in ("win", "loss") and isinstance(fb_data, dict):
-                    profit = float(fb_data.get("profitAmount", 0))
-                    win_result = profit > 0
-                    logger.info(
-                        f"[Signal Trade] [{email}] get_result fallback: "
-                        f"status={fb_status}, profit={profit}"
-                    )
-                else:
-                    logger.warning(
-                        f"[Signal Trade] [{email}] get_result fallback: not found "
-                        f"({fb_status!r}: {fb_data!r}). Reporting as unavailable."
-                    )
-                    if bot_instance:
-                        await bot_instance.send_message(
-                            OWNER_ID,
-                            f"⏳ **{email}** — Trade result could not be retrieved.\n"
-                            f"Trade ID: `{trade_id}`\n"
-                            f"_Check your Quotex account directly._",
-                        )
-                    return
-            except Exception as fb_err:
-                logger.error(
-                    f"[Signal Trade] [{email}] get_result fallback also failed: {fb_err}",
-                    exc_info=True,
-                )
-                if bot_instance:
-                    await bot_instance.send_message(
-                        OWNER_ID,
-                        f"⏳ **{email}** — Trade result unavailable (timed out + fallback failed).\n"
-                        f"Trade ID: `{trade_id}`\n"
-                        f"_Check your Quotex account directly._",
-                    )
-                return
-        except KeyError:
-            logger.error(
-                f"[Signal Trade] [{email}] buy_info missing 'id' key — buy_info={buy_info!r}",
-                exc_info=True,
+                f"(trade_id={trade_id}). Reporting as unavailable."
             )
             if bot_instance:
                 await bot_instance.send_message(
                     OWNER_ID,
-                    f"⚠️ **{email}** — Trade placed but result check failed (no trade ID in buy response).",
+                    f"⏳ **{email}** — Trade result could not be retrieved.\n"
+                    f"Trade ID: `{trade_id}`\n"
+                    f"_Check your Quotex account directly._",
                 )
             return
 
         closing_time = datetime.datetime.now(datetime.timezone.utc)
-        closing_price = (
-            (win_result if isinstance(win_result, dict) and win_result.get('closePrice') else None)
-            or buy_info.get('closePrice') or buy_info.get('close_price') or buy_info.get('close')
-        )
-
-        if win_result:
-            icon, outcome, result_str = "✅", f"WIN!  Profit: +${abs(profit):.2f}", "WIN"
-        elif profit == 0:
-            icon, outcome, result_str = "⚠️", "TIE  (no profit/loss)", "TIE"
-        else:
-            icon, outcome, result_str = "❌", f"LOSS!  Lost: -${abs(profit):.2f}", "LOSS"
+        closing_price = getattr(order, 'close_price', None) or getattr(order, 'closePrice', None)
 
         # ── Strategy step advance / reset ─────────────────────────────────────
         strategy_note = ""
@@ -4741,9 +4181,11 @@ async def _execute_single_account_signal_trade(
 
         # Capture closing balance after trade settlement
         try:
-            balance_after = await qx_client.get_balance()
-            await record_closing_balance(account_doc_id, date_str_today, balance_after)
-            logger.info(f"[Signal Trade] [{email}] Balance after trade: {balance_after}")
+            _bal_after_obj = await qx_client.get_balance()
+            balance_after = float(_bal_after_obj.balance) if _bal_after_obj and hasattr(_bal_after_obj, 'balance') else None
+            if balance_after is not None:
+                await record_closing_balance(account_doc_id, date_str_today, balance_after)
+                logger.info(f"[Signal Trade] [{email}] Balance after trade: {balance_after}")
         except Exception as bal_err:
             logger.warning(f"[Signal Trade] [{email}] Could not fetch post-trade balance: {bal_err}")
             balance_after = None
@@ -4800,7 +4242,7 @@ async def _execute_single_account_signal_trade(
             try:
                 _stale_client = active_quotex_clients.pop(account_doc_id, None)
                 if _stale_client:
-                    await _stale_client.close()
+                    await _stale_client.disconnect()
             except Exception:
                 pass
             # Delete the stale session file
@@ -5038,7 +4480,6 @@ async def handle_channel_message(client: Client, message):
                                     logger.warning(f"[Userbot] Could not update manual trade keyboard: {exc}")
                         else:
                             full_signal['received_at'] = time.time()  # direction just arrived
-                            full_signal.setdefault('_channel_id', matched_channel)  # for timezone lookup
                             await execute_signal_trade(full_signal)
                     else:
                         logger.info("[Userbot] Pending signal expired (>5 min). Discarding.")
@@ -5093,7 +4534,6 @@ async def handle_channel_message(client: Client, message):
             else:
                 await update_signal_settings({'pending_signal': None})
                 parsed['received_at'] = time.time()  # full signal — timer starts now
-                parsed['_channel_id'] = matched_channel  # for timezone lookup
                 await execute_signal_trade(parsed)
         else:
             # Partial signal — store and wait for direction follow-up
@@ -5104,7 +4544,6 @@ async def handle_channel_message(client: Client, message):
                 'asset':              parsed['asset'],
                 'asset_display':      parsed.get('asset_display', parsed['asset']),
                 'duration':           parsed.get('duration', DEFAULT_TRADE_DURATION),
-                'entry_time':         parsed.get('entry_time'),   # HH:MM from signal
                 'amount':             sig_amount,
                 'timestamp':          time.time(),
                 'amount_confirmed':   False,
@@ -5113,7 +4552,6 @@ async def handle_channel_message(client: Client, message):
                 'duration_msg_id':    None,
                 'signal_direction':   None,   # filled when direction arrives
                 'manual_msg_id':      None,
-                '_channel_id':        matched_channel,  # for timezone lookup
             }
             await update_signal_settings({'pending_signal': pending})
             await log_signal_event('partial', message, parsed)
@@ -5385,117 +4823,29 @@ async def journal_command(client: Client, message: Message):
 # --- Main Function ---
 async def _quotex_keepalive():
     """
-    Send a Socket.IO tick heartbeat to every active Quotex WebSocket connection
-    every 20 seconds.  This is a belt-and-suspenders guard against the server's
-    ~30 s idle-close (the primary fix is in ws/client.py on_message).
+    Periodically check that each cached AsyncQuotexClient is still alive.
+    If a client is disconnected, evict it so the next trade re-authenticates.
     """
     while True:
-        await asyncio.sleep(20)
+        await asyncio.sleep(60)
         for acct_id, qx_client in list(active_quotex_clients.items()):
             try:
-                ws = getattr(qx_client, 'websocket', None)  # WebSocketApp
-                if ws:
-                    ws.send('42["tick"]')
+                is_alive = getattr(qx_client, 'is_connected', False)
+                if not is_alive:
+                    logger.warning(f"[KeepAlive] {acct_id}: client disconnected — evicting from cache.")
+                    try:
+                        await qx_client.disconnect()
+                    except Exception:
+                        pass
+                    active_quotex_clients.pop(acct_id, None)
             except Exception as exc:
                 logger.debug(f"[KeepAlive] {acct_id}: {exc}")
-
-
-# Track consecutive failed connection cycles per account for the health monitor
-_ws_fail_ticks: dict = {}
-
-
-async def _quotex_ws_health_monitor():
-    """
-    Detect when a Quotex WebSocket is stuck in a Cloudflare 403 reconnect loop
-    and automatically re-authenticate to get fresh cookies.
-
-    Every 30 s it checks each cached client.  If the websocket thread is alive
-    but the connection flag shows disconnected for 2+ consecutive checks
-    (~60 s), it tears down the old WebSocket, runs ensure_session() for fresh
-    __cf_clearance cookies, then reconnects.
-    """
-    await asyncio.sleep(60)  # let the bot settle before first check
-    while True:
-        await asyncio.sleep(30)
-        for acct_id, qx_client in list(active_quotex_clients.items()):
-            try:
-                from pyquotex import global_value as _gv
-
-                ws_thread_alive = (
-                    hasattr(qx_client, 'websocket_thread') and
-                    qx_client.websocket_thread is not None and
-                    qx_client.websocket_thread.is_alive()
-                )
-                ws_connected = _gv.check_websocket_if_connect == 1
-
-                if ws_thread_alive and not ws_connected:
-                    # Thread is alive but no active connection → likely in a
-                    # Cloudflare 403 reconnect loop.
-                    _ws_fail_ticks[acct_id] = _ws_fail_ticks.get(acct_id, 0) + 1
-                    logger.warning(
-                        f"[WSHealth] {acct_id}: WS thread alive but disconnected "
-                        f"(tick {_ws_fail_ticks[acct_id]})."
-                    )
-
-                    if _ws_fail_ticks[acct_id] >= 2:
-                        # Stuck for ~60 s → attempt full re-auth + reconnect
-                        logger.warning(
-                            f"[WSHealth] {acct_id}: stuck for multiple cycles — "
-                            "re-authenticating and reconnecting ..."
-                        )
-                        _ws_fail_ticks[acct_id] = 0
-
-                        # Fetch account creds from DB
-                        account_details = await get_quotex_account_details(acct_id)
-                        if not account_details:
-                            logger.error(f"[WSHealth] {acct_id}: could not fetch account details.")
-                            continue
-
-                        email = account_details["email"]
-                        password = account_details["password"]
-                        session_path = f"sessions/{acct_id}"
-
-                        # Delete the stale session.json so pyquotex does a
-                        # clean native HTTP login on the next connect attempt.
-                        _stale_p = Path(f"{session_path}/session.json")
-                        if _stale_p.exists():
-                            try:
-                                _stale_p.unlink()
-                                logger.warning(
-                                    f"[WSHealth] {acct_id}: deleted stale session.json "
-                                    "(WS stuck in 403 loop — will re-auth via pyquotex native login)."
-                                )
-                            except Exception as _del_err:
-                                logger.warning(
-                                    f"[WSHealth] {acct_id}: could not delete stale "
-                                    f"session.json: {_del_err}"
-                                )
-
-                        # Evict cache — next trade signal or keepalive will
-                        # fully reconnect using pyquotex's own HTTP auth.
-                        try:
-                            await qx_client.close()
-                        except Exception:
-                            pass
-                        active_quotex_clients.pop(acct_id, None)
-                        logger.info(
-                            f"[WSHealth] {acct_id}: evicted stale client. "
-                            "Will reconnect (native re-auth) on next signal."
-                        )
-                else:
-                    # Connection looks healthy — reset counter
-                    _ws_fail_ticks[acct_id] = 0
-
-            except asyncio.CancelledError:
-                return
-            except Exception as exc:
-                logger.debug(f"[WSHealth] {acct_id}: monitor error: {exc}")
 
 
 async def preconnect_all_accounts():
     """
     At startup, Playwright-authenticate and pre-open WebSocket connections
-    for all owner Quotex accounts so signal execution is instant (0-3 s).
+    for all owner Quotex accounts so signal execution is instant.
     """
     if quotex_accounts_db is None:
         logger.warning("[Startup] DB not ready — skipping account pre-connect.")
@@ -5630,10 +4980,8 @@ async def run_bot():
                 logger.error(f"[Userbot] Failed to start userbot: {ub_err}", exc_info=True)
 
         logger.info("Bot is running... Press CTRL+C to stop.")
-        # Start Quotex WebSocket keep-alive heartbeat task
+        # Start Quotex WebSocket keep-alive / disconnection monitor
         asyncio.create_task(_quotex_keepalive())
-        # Start Quotex WebSocket health monitor (detects + recovers from 403 loops)
-        asyncio.create_task(_quotex_ws_health_monitor())
         # Keep the main thread alive (Pyrogram handles the event loop)
         await asyncio.Event().wait() # Keeps running until interrupted
 
