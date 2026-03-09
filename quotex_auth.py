@@ -371,15 +371,30 @@ async def ensure_session(
         except Exception:
             pass
 
+    _visible_browser_enabled = os.getenv("QUOTEX_VISIBLE_BROWSER", "false").strip().lower() not in (
+        "false", "0", "no", "off", ""
+    )
+
     logger.info(f"[Selenium] Attempting headless login for {email} ...")
     try:
         result = await selenium_login(email, password, session_path=session_path)
         if result.get("token"):
             return True
-        logger.warning("[Selenium] Headless login gave no token - trying visible browser.")
+        if _visible_browser_enabled:
+            logger.warning("[Selenium] Headless login gave no token - trying visible browser.")
+        else:
+            logger.warning("[Selenium] Headless login gave no token. "
+                           "Visible browser is disabled (QUOTEX_VISIBLE_BROWSER=false). "
+                           "Bot will run without a pre-cached session.")
+            return False
     except Exception as exc:
-        # Strip newlines so stack trace stays readable in the log file
-        logger.warning(f"[Selenium] Headless login failed: {str(exc)[:200]} - opening visible browser.")
+        if _visible_browser_enabled:
+            logger.warning(f"[Selenium] Headless login failed: {str(exc)[:200]} - opening visible browser.")
+        else:
+            logger.warning(f"[Selenium] Headless login failed: {str(exc)[:200]}. "
+                           "Visible browser is disabled (QUOTEX_VISIBLE_BROWSER=false). "
+                           "Bot will run without a pre-cached session.")
+            return False
 
     try:
         result = await interactive_login(

@@ -32,6 +32,51 @@ Direction may arrive in a *separate* follow-up message (2-part signal flow).
 import re
 from typing import Optional, Dict, Any
 
+# ── Unicode normalization (Mathematical Alphanumeric Symbols → ASCII) ──────────
+# Many Telegram channels style text with Unicode bold/monospace/italic variants
+# (U+1D400–U+1D7FF). We normalise them to plain ASCII before applying regexes.
+_MATH_UPPER_BASES = (
+    0x1D400, 0x1D434, 0x1D468, 0x1D49C, 0x1D4D0, 0x1D504,
+    0x1D538, 0x1D56C, 0x1D5A0, 0x1D5D4, 0x1D608, 0x1D63C, 0x1D670,
+)
+_MATH_LOWER_BASES = (
+    0x1D41A, 0x1D44E, 0x1D482, 0x1D4B6, 0x1D4EA, 0x1D51E,
+    0x1D552, 0x1D586, 0x1D5BA, 0x1D5EE, 0x1D622, 0x1D656, 0x1D68A,
+)
+_MATH_DIGIT_BASES = (0x1D7CE, 0x1D7D8, 0x1D7E2, 0x1D7EC, 0x1D7F6)
+
+
+def _normalize_unicode(text: str) -> str:
+    """Map Unicode mathematical styled letters/digits to plain ASCII equivalents."""
+    out = []
+    for ch in text:
+        cp = ord(ch)
+        if not (0x1D400 <= cp <= 0x1D7FF):
+            out.append(ch)
+            continue
+        mapped = False
+        for base in _MATH_UPPER_BASES:
+            if base <= cp < base + 26:
+                out.append(chr(65 + cp - base))
+                mapped = True
+                break
+        if not mapped:
+            for base in _MATH_LOWER_BASES:
+                if base <= cp < base + 26:
+                    out.append(chr(97 + cp - base))
+                    mapped = True
+                    break
+        if not mapped:
+            for base in _MATH_DIGIT_BASES:
+                if base <= cp < base + 10:
+                    out.append(chr(48 + cp - base))
+                    mapped = True
+                    break
+        if not mapped:
+            out.append(ch)
+    return ''.join(out)
+
+
 # ── Referral link replacement ──────────────────────────────────────────────────
 # Any broker-qx.pro sign-up URL found in non-signal channel messages will be
 # replaced with the configured affiliate link.
@@ -82,6 +127,7 @@ def parse_direction(text: str) -> Optional[str]:
     if not text:
         return None
 
+    text = _normalize_unicode(text)
     t = text.upper()
 
     UP_PATTERNS = [
@@ -130,7 +176,7 @@ def parse_direction(text: str) -> Optional[str]:
 
 # Emojis that commonly precede the asset symbol line
 _ASSET_EMOJI_RE = re.compile(
-    r'(?:👉|📊|📈|📉|💹|🎯|⚡|🔔|🔸|🔹|➡|▶|•|\*)\s*(.+?)(?:\n|$)'
+    r'(?:👉|📊|📈|📉|💹|🎯|⚡|🔔|🔸|🔹|➡|▶|💷|💵|•|\*)\s*(.+?)(?:\n|$)'
 )
 
 # Standalone forex-pair line: "USD/BRL (OTC)", "USDMXN-OTCq", "EURUSD_otc", "NZD/JPY"
@@ -216,6 +262,7 @@ def parse_signal(text: str) -> Optional[Dict[str, Any]]:
     if not text:
         return None
 
+    text = _normalize_unicode(text)
     result: Dict[str, Any] = {}
 
     # ── Asset ──────────────────────────────────────────────────────────────
@@ -230,7 +277,7 @@ def parse_signal(text: str) -> Optional[Dict[str, Any]]:
 
     # Try minutes first
     m = re.search(
-        r'[⏱⏰⌛]\ufe0f?[\s\ufe0f]*(\d+)\s*(?:MINUTES?|MINS?|MIN\b)',
+        r'[⏱⏰⌛⌚]\ufe0f?[\s\ufe0f]*(\d+)\s*(?:MINUTES?|MINS?|MIN\b)',
         text, re.IGNORECASE,
     )
     if not m:
@@ -238,10 +285,18 @@ def parse_signal(text: str) -> Optional[Dict[str, Any]]:
     if m:
         result['duration'] = int(m.group(1)) * 60
 
+    # Try M-notation shorthand: M1 / M5 / M15 / M30 (e.g. "⌚️ M1", "⏱ M5")
+    if 'duration' not in result:
+        m = re.search(r'[⌚⏱⏰⌛]\ufe0f?[\s]*[Mm](\d+)\b', text)
+        if not m:
+            m = re.search(r'(?:^|\n)\s*[Mm](\d+)\b', text)
+        if m:
+            result['duration'] = int(m.group(1)) * 60
+
     # Try seconds if no minutes found
     if 'duration' not in result:
         m = re.search(
-            r'[⏱⏰⌛]\ufe0f?[\s\ufe0f]*([\d]+)\s*(?:SECONDS?|SECS?|S\b)',
+            r'[⏱⏰⌛⌚]\ufe0f?[\s\ufe0f]*([\d]+)\s*(?:SECONDS?|SECS?|S\b)',
             text, re.IGNORECASE,
         )
         if not m:
@@ -260,7 +315,7 @@ def parse_signal(text: str) -> Optional[Dict[str, Any]]:
     # Must NOT fire on duration lines like "⏰ 3 MINUTES".
     # Strategy: match HH:MM only when NOT followed by a time-unit word.
     m_et = re.search(
-        r'[⏰]\ufe0f?\s*(\d{1,2}):(\d{2})[^\S\n]*(AM|PM)?[^\S\n]*(?!\S*(?:MINUTE|SECOND|MIN|SEC)\b)',
+        r'[⏰⏳]\ufe0f?\s*(\d{1,2}):(\d{2})[^\S\n]*(AM|PM)?[^\S\n]*(?!\S*(?:MINUTE|SECOND|MIN|SEC)\b)',
         text, re.IGNORECASE,
     )
     if not m_et:
@@ -317,6 +372,7 @@ def is_signal_message(text: str) -> bool:
     if not text:
         return False
 
+    text = _normalize_unicode(text)
     text_upper = text.upper()
 
     # Has a forex/crypto pair  (e.g. USD/BRL, USDMXN, EURUSD-OTCq)
@@ -330,7 +386,7 @@ def is_signal_message(text: str) -> bool:
     ))
 
     # Emoji hints that strongly suggest a signal
-    signal_emojis = ['👉', '⏱', '⏰', '⌛', '💵', '🔼', '🔽', '📈', '📉', '⬆', '⬇', '🟢', '🔴']
+    signal_emojis = ['👉', '⏱', '⏰', '⌛', '⌚', '⏳', '💵', '💷', '🔼', '🔽', '📈', '📉', '⬆', '⬇', '🟢', '🔴']
 
     # Text keywords
     text_kws = [

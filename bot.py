@@ -276,7 +276,30 @@ STRATEGIES: Dict[int, Dict[str, Any]] = {
         "min_balance": 50.0,
         "steps":       [15, 20, 25, 30, 35, 65, 125, 200, 300, 350],
     },
+    3: {
+        "name":        "Martingale",
+        "min_balance": 0.0,   # dynamic — checked at runtime from starting amount
+        "steps":       [],    # generated dynamically via _martingale_steps()
+    },
+    4: {
+        "name":        "GALE2 (2-loss cap)",
+        "min_balance": 0.0,   # dynamic — checked at runtime from starting amount
+        "steps":       [],    # generated dynamically via _gale2_steps() — 3-step cycle
+    },
 }
+
+
+def _martingale_steps(start: float, count: int = 10) -> list:
+    """Return a list of *count* Martingale trade amounts starting from *start*.
+    Each step doubles the previous: [start, start*2, start*4, …]
+    Values are rounded to 2 decimal places."""
+    return [round(start * (2 ** i), 2) for i in range(count)]
+
+
+def _gale2_steps(start: float) -> list:
+    """GALE2: 3-step doubling sequence — double at most twice then reset.
+    e.g. start=$1 → [$1, $2, $4]; after 3 consecutive losses the cycle resets."""
+    return [round(start * (2 ** i), 2) for i in range(3)]
 # ─────────────────────────────────────────────────────────────────────────────
 
 # --- Database Setup ---
@@ -774,8 +797,11 @@ async def get_signal_settings() -> Dict[str, Any]:
             'manual_trade_mode': False,
             'inverse_mode': False,
             'strategy_mode': False,        # bool — strategy mode on/off
-            'strategy_id': 1,              # int — which strategy (1 or 2)
-            'strategy_step': 0,            # int — current step index (0-9)
+            'strategy_id': 1,              # int — which strategy (1, 2, 3 or 4)
+            'strategy_step': 0,            # int — current step index
+            'martingale_start': 1.0,       # float — Martingale (sid=3) starting amount ($)
+            'gale2_start': 1.0,            # float — GALE2 (sid=4) starting amount ($)
+            'symbol_blacklist': [],        # list[str] — symbols blocked from trading
         }
         await signal_settings_db.insert_one(doc)
     else:
@@ -802,6 +828,34 @@ async def update_signal_settings(data: dict):
     )
 
 
+# ── Symbol Blacklist helpers ─────────────────────────────────────────────────
+
+def _blacklist_panel_text(sig_settings: dict) -> str:
+    """Text body for the Symbol Blacklist settings panel."""
+    bl = sig_settings.get('symbol_blacklist', [])
+    lines = ["🚫 **Symbol Blacklist**\n"]
+    if bl:
+        lines.append(f"**{len(bl)} symbol(s) blocked** — these will be skipped when a signal arrives:\n")
+        for sym in sorted(bl):
+            lines.append(f"  • `{sym}`")
+    else:
+        lines.append("_No symbols blacklisted._\n_All incoming signals will be processed normally._")
+    return '\n'.join(lines)
+
+
+def _blacklist_panel_keyboard(sig_settings: dict) -> list:
+    """Keyboard for the Symbol Blacklist panel."""
+    bl = sig_settings.get('symbol_blacklist', [])
+    rows = []
+    rows.append([InlineKeyboardButton("➕ Add Symbol", callback_data="blacklist_add")])
+    if bl:
+        for sym in sorted(bl):
+            rows.append([InlineKeyboardButton(f"❌  {sym}", callback_data=f"blacklist_remove:{sym}")])
+        rows.append([InlineKeyboardButton("🗑 Clear All", callback_data="blacklist_clear")])
+    rows.append(back_button("settings_main"))
+    return rows
+
+
 # ── Strategy Mode helpers ────────────────────────────────────────────────────
 
 def _strategy_summary(sig_settings: dict) -> str:
@@ -813,9 +867,16 @@ def _strategy_summary(sig_settings: dict) -> str:
     strat = STRATEGIES.get(sid)
     if not strat:
         return f'Strategy {sid} (unknown)'
-    steps = strat['steps']
+    if sid == 3:
+        mg_start = float(sig_settings.get('martingale_start', 1.0))
+        steps = _martingale_steps(mg_start)
+    elif sid == 4:
+        g2_start = float(sig_settings.get('gale2_start', 1.0))
+        steps = _gale2_steps(g2_start)
+    else:
+        steps = strat['steps']
     current_amt = steps[min(step, len(steps) - 1)]
-    return f"Strategy {sid} — Step {step + 1}/10 (${current_amt})"
+    return f"{strat['name']} — Step {step + 1}/{len(steps)} (${current_amt})"
 
 
 def _strategy_panel_text(sig_settings: dict) -> str:
@@ -823,21 +884,39 @@ def _strategy_panel_text(sig_settings: dict) -> str:
     enabled = sig_settings.get('strategy_mode', False)
     active_sid = sig_settings.get('strategy_id', 1)
     step = sig_settings.get('strategy_step', 0)
+    mg_start = float(sig_settings.get('martingale_start', 1.0))
 
     lines = ["🎯 **Strategy Mode**\n"]
     lines.append(f"Status: {'🟢 **Enabled**' if enabled else '🔴 Disabled'}\n")
+    g2_start = float(sig_settings.get('gale2_start', 1.0))
     if enabled:
         strat = STRATEGIES.get(active_sid, {})
-        steps = strat.get('steps', [])
+        if active_sid == 3:
+            steps = _martingale_steps(mg_start)
+        elif active_sid == 4:
+            steps = _gale2_steps(g2_start)
+        else:
+            steps = strat.get('steps', [])
         current_amt = steps[min(step, len(steps) - 1)] if steps else '?'
         lines.append(f"Active: **{strat.get('name', f'Strategy {active_sid}')}**")
-        lines.append(f"Progress: Step **{step + 1}/10** — Next trade amount: **${current_amt}**\n")
+        if active_sid == 3:
+            lines.append(f"Starting amount: **${mg_start:g}**")
+        elif active_sid == 4:
+            lines.append(f"Starting amount: **${g2_start:g}**")
+        lines.append(f"Progress: Step **{step + 1}/{len(steps)}** — Next trade amount: **${current_amt}**\n")
         lines.append("_WIN → resets to step 1 | LOSS → advances to next step_\n")
     lines.append("\n**Available Strategies:**")
     for sid, strat in STRATEGIES.items():
         marker = '✅' if (enabled and sid == active_sid) else '○'
         lines.append(f"{marker} **{strat['name']}**")
-        lines.append("  Steps: " + " → ".join(f"${s}" for s in strat['steps']))
+        if sid == 3:
+            steps = _martingale_steps(mg_start)
+            lines.append(f"  Starting: ${mg_start:g} · Steps: " + " → ".join(f"${s:g}" for s in steps[:5]) + " → …")
+        elif sid == 4:
+            g2_steps = _gale2_steps(g2_start)
+            lines.append(f"  Starting: ${g2_start:g} · Steps: " + " → ".join(f"${s:g}" for s in g2_steps) + " (3-step cycle, then reset)")
+        else:
+            lines.append("  Steps: " + " → ".join(f"${s}" for s in strat['steps']))
     return '\n'.join(lines)
 
 
@@ -845,10 +924,23 @@ def _strategy_panel_keyboard(sig_settings: dict) -> list:
     """Keyboard for the Strategy Mode panel."""
     enabled = sig_settings.get('strategy_mode', False)
     active_sid = sig_settings.get('strategy_id', 1)
+    mg_start = float(sig_settings.get('martingale_start', 1.0))
     rows = []
     toggle_label = '🔴 Disable Strategy Mode' if enabled else '🟢 Enable Strategy Mode'
     rows.append([InlineKeyboardButton(toggle_label, callback_data='strat_toggle')])
     rows.append([InlineKeyboardButton('🔄 Reset Step Counter', callback_data='strat_reset_step')])
+    # Show starting-amount button for dynamic strategies
+    if active_sid == 3:
+        rows.append([InlineKeyboardButton(
+            f"💵 Starting Amount: ${mg_start:g}",
+            callback_data='strat_set_mg_start',
+        )])
+    elif active_sid == 4:
+        g2_start = float(sig_settings.get('gale2_start', 1.0))
+        rows.append([InlineKeyboardButton(
+            f"💵 Starting Amount: ${g2_start:g}",
+            callback_data='strat_set_gale2_start',
+        )])
     rows.append([InlineKeyboardButton('— Select Strategy —', callback_data='noop')])
     for sid, strat in STRATEGIES.items():
         selected = '✅ ' if sid == active_sid else ''
@@ -863,18 +955,24 @@ def _strategy_panel_keyboard(sig_settings: dict) -> list:
 def _build_step_selector_keyboard(
     strategy_id: int,
     current_step: int,
+    mg_start: float = 1.0,
 ) -> Optional[InlineKeyboardMarkup]:
     """Compact 2-row step selector keyboard embedded in trade/result messages."""
     strat = STRATEGIES.get(strategy_id)
     if not strat:
         return None
-    steps = strat['steps']
+    if strategy_id == 3:
+        steps = _martingale_steps(mg_start)
+    elif strategy_id == 4:
+        steps = _gale2_steps(mg_start)
+    else:
+        steps = strat['steps']
     rows: list = []
     row: list = []
     for i, amt in enumerate(steps):
         star = '⭐' if i == current_step else ''
         row.append(InlineKeyboardButton(
-            f"{star}{i + 1}·${amt}",
+            f"{star}{i + 1}·${amt:g}",
             callback_data=f"strat_step_set:{i}",
         ))
         if len(row) == 5:
@@ -1058,6 +1156,7 @@ def _signal_monitor_keyboard(sig_s: dict) -> list:
     toggle_label = "🔴 Turn OFF" if is_active else "🟢 Turn ON"
     sd = int(sig_s.get('signal_delay', 0))
     ed = int(sig_s.get('entry_delay', 0))
+    ed_label = f"{ed:+d}s early" if ed < 0 else (f"+{ed}s delay" if ed > 0 else "off")
     dr = sig_s.get('duration_remap_enabled', False)
     ad = sig_s.get('ask_duration_on_partial', False)
     man = sig_s.get('manual_trade_mode', False)
@@ -1068,7 +1167,7 @@ def _signal_monitor_keyboard(sig_s: dict) -> list:
         [InlineKeyboardButton("📺 Manage Channels", callback_data="sig_channels_view")],
         [InlineKeyboardButton(f"✂️ Shorten Duration ({sd}s)", callback_data="sig_delay_set"),
          InlineKeyboardButton("🚫 Disable", callback_data="sig_delay_off")],
-        [InlineKeyboardButton(f"⏱ Entry Delay ({ed}s)", callback_data="sig_entry_delay_set"),
+        [InlineKeyboardButton(f"⏱ Entry Offset ({ed_label})", callback_data="sig_entry_delay_set"),
          InlineKeyboardButton("🚫 Off", callback_data="sig_entry_delay_off")],
         [InlineKeyboardButton(f"🔄 2min→5min: {'ON ✅' if dr else 'OFF'}", callback_data="sig_dur_remap_toggle"),
          InlineKeyboardButton(f"⏱ Ask Duration: {'ON ✅' if ad else 'OFF'}", callback_data="sig_ask_dur_toggle")],
@@ -2349,6 +2448,7 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
         if user_id == OWNER_ID:
             keyboard_rows.append([InlineKeyboardButton("📡 Signal Mode", callback_data="signal_status_view")])
             keyboard_rows.append([InlineKeyboardButton("🎯 Strategy Mode", callback_data="strategy_view")])
+            keyboard_rows.append([InlineKeyboardButton("🚫 Symbol Blacklist", callback_data="blacklist_view")])
 
         keyboard_rows.append(back_button("main_menu")) # Always provide a way back
 
@@ -2431,6 +2531,25 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
     elif data == "noop":
         await callback_query.answer()
 
+    elif data == "strat_set_mg_start":
+        if user_id != OWNER_ID:
+            await callback_query.answer("⛔️ Owner only.", show_alert=True)
+            return
+        sig_settings = await get_signal_settings()
+        cur_start = float(sig_settings.get('martingale_start', 1.0))
+        user_states[user_id] = f"waiting_martingale_start:{message.id}"
+        try:
+            await message.edit_text(
+                f"💵 **Set Martingale Starting Amount**\n\n"
+                f"Current value: **${cur_start:g}**\n\n"
+                f"This is the amount for the first trade in the Martingale sequence.\n"
+                f"Each subsequent loss doubles the previous amount:\n"
+                f"e.g. starting at $1 → $1 → $2 → $4 → $8 → …\n\n"
+                f"Send a positive amount (e.g. `1`, `2.50`, `5`), or /cancel.",
+            )
+        except Exception:
+            pass
+
     elif data.startswith("strat_step_set:"):
         if user_id != OWNER_ID:
             await callback_query.answer("⛔️ Owner only.", show_alert=True)
@@ -2441,12 +2560,21 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
             await callback_query.answer("Invalid.", show_alert=True)
             return
         sig_settings = await get_signal_settings()
-        strat = STRATEGIES.get(sig_settings.get('strategy_id', 1))
-        if not strat or new_step_idx < 0 or new_step_idx >= len(strat['steps']):
+        sid_now = sig_settings.get('strategy_id', 1)
+        strat = STRATEGIES.get(sid_now)
+        _mg_s = float(sig_settings.get('martingale_start', 1.0))
+        _g2_s = float(sig_settings.get('gale2_start', 1.0))
+        if sid_now == 3:
+            dyn_steps = _martingale_steps(_mg_s)
+        elif sid_now == 4:
+            dyn_steps = _gale2_steps(_g2_s)
+        else:
+            dyn_steps = strat['steps'] if strat else []
+        if not dyn_steps or new_step_idx < 0 or new_step_idx >= len(dyn_steps):
             await callback_query.answer("Invalid step.", show_alert=True)
             return
         await update_signal_settings({'strategy_step': new_step_idx})
-        amt = strat['steps'][new_step_idx]
+        amt = dyn_steps[new_step_idx]
         await callback_query.answer(f"✅ Step {new_step_idx + 1} active — ${amt}")
         # Refresh the keyboard on the current message to highlight the new step
         sig_settings = await get_signal_settings()
@@ -2458,13 +2586,98 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
                     reply_markup=build_manual_trade_keyboard(direction, sig_settings)
                 )
             else:
-                kbd = _build_step_selector_keyboard(sig_settings.get('strategy_id', 1), new_step_idx)
+                _dyn_start = _g2_s if sid_now == 4 else _mg_s
+                kbd = _build_step_selector_keyboard(sid_now, new_step_idx, mg_start=_dyn_start)
                 if kbd:
                     await message.edit_reply_markup(reply_markup=kbd)
         except Exception:
             pass
 
     # ── End Strategy Mode ──────────────────────────────────────────────────────
+
+    elif data == "strat_set_gale2_start":
+        if user_id != OWNER_ID:
+            await callback_query.answer("⛔️ Owner only.", show_alert=True)
+            return
+        sig_settings = await get_signal_settings()
+        cur_g2 = float(sig_settings.get('gale2_start', 1.0))
+        user_states[user_id] = f"waiting_gale2_start:{message.id}"
+        try:
+            await message.edit_text(
+                f"💵 **Set GALE2 Starting Amount**\n\n"
+                f"Current value: **${cur_g2:g}**\n\n"
+                f"GALE2 doubles for up to 2 consecutive losses, then resets:\n"
+                f"e.g. starting at $1 → $1 → $2 → $4 → reset to $1 → …\n\n"
+                f"Send a positive amount (e.g. `1`, `2.50`, `5`), or /cancel.",
+            )
+        except Exception:
+            pass
+
+    elif data == "blacklist_view":
+        if user_id != OWNER_ID:
+            await callback_query.answer("⛔️ Owner only.", show_alert=True)
+            return
+        sig_settings = await get_signal_settings()
+        await message.edit_text(
+            _blacklist_panel_text(sig_settings),
+            reply_markup=InlineKeyboardMarkup(_blacklist_panel_keyboard(sig_settings)),
+        )
+
+    elif data == "blacklist_add":
+        if user_id != OWNER_ID:
+            await callback_query.answer("⛔️ Owner only.", show_alert=True)
+            return
+        sig_settings = await get_signal_settings()
+        bl = sig_settings.get('symbol_blacklist', [])
+        user_states[user_id] = f"waiting_blacklist_add:{message.id}"
+        try:
+            current_list = "\n".join(f"  • {s}" for s in sorted(bl)) if bl else "  _(none yet)_"
+            await message.edit_text(
+                f"🚫 **Add Symbol to Blacklist**\n\n"
+                f"Current blacklist:\n{current_list}\n\n"
+                f"Send the symbol to block (e.g. `USDPKR-OTCq`, `EURUSD`).\n"
+                f"You can paste it exactly from a signal message.\n\n"
+                f"Or /cancel to go back.",
+            )
+        except Exception:
+            pass
+
+    elif data.startswith("blacklist_remove:"):
+        if user_id != OWNER_ID:
+            await callback_query.answer("⛔️ Owner only.", show_alert=True)
+            return
+        sym_to_remove = data.split(":", 1)[1].strip()
+        sig_settings = await get_signal_settings()
+        bl = list(sig_settings.get('symbol_blacklist', []))
+        if sym_to_remove in bl:
+            bl.remove(sym_to_remove)
+            await update_signal_settings({'symbol_blacklist': bl})
+            await callback_query.answer(f"✅ {sym_to_remove} removed.")
+        else:
+            await callback_query.answer("Symbol not found.", show_alert=True)
+        sig_settings = await get_signal_settings()
+        try:
+            await message.edit_text(
+                _blacklist_panel_text(sig_settings),
+                reply_markup=InlineKeyboardMarkup(_blacklist_panel_keyboard(sig_settings)),
+            )
+        except Exception:
+            pass
+
+    elif data == "blacklist_clear":
+        if user_id != OWNER_ID:
+            await callback_query.answer("⛔️ Owner only.", show_alert=True)
+            return
+        await update_signal_settings({'symbol_blacklist': []})
+        await callback_query.answer("✅ Blacklist cleared.")
+        sig_settings = await get_signal_settings()
+        try:
+            await message.edit_text(
+                _blacklist_panel_text(sig_settings),
+                reply_markup=InlineKeyboardMarkup(_blacklist_panel_keyboard(sig_settings)),
+            )
+        except Exception:
+            pass
 
     # --- Role Management Navigation ---
     elif data == "admin_manage_sudo":
@@ -2805,7 +3018,7 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
 
         if data == "sig_entry_delay_off":
             await update_signal_settings({'entry_delay': 0})
-            await callback_query.answer("Entry Delay disabled.")
+            await callback_query.answer("Entry Offset disabled.")
             await _refresh_signal_monitor(message)
         else:  # sig_entry_delay_set
             user_states[user_id] = f"waiting_entry_delay:{message.id}"
@@ -2813,11 +3026,14 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
                 sig_s = await get_signal_settings()
                 cur_ed = int(sig_s.get('entry_delay', 0))
                 await message.edit_text(
-                    f"⏱ **Set Entry Delay**\n\n"
+                    f"⏱ **Set Entry Offset**\n\n"
                     f"Current value: **{cur_ed}s**\n\n"
-                    f"All incoming signals will be held for this many seconds before the trade is placed.\n"
-                    f"Useful when you want to intentionally delay entry across all signals.\n\n"
-                    f"Send the number of seconds (e.g. `5`), `0` to disable, or /cancel.",
+                    f"Adjusts when the trade is placed:\n"
+                    f"• **Positive** (e.g. `5`) → delay entry by 5 seconds\n"
+                    f"• **Negative** (e.g. `-4`) → fire entry 4 seconds early (compensates for broker latency)\n"
+                    f"• `0` → disabled\n\n"
+                    f"For timed entries the offset is subtracted from the scheduled wait.\n\n"
+                    f"Send a number of seconds (e.g. `-4`, `5`), `0` to disable, or /cancel.",
                 )
             except Exception:
                 pass
@@ -3824,33 +4040,173 @@ async def message_handler(client: Client, message: Message):
             return
         try:
             new_ed = int(raw)
-            if new_ed < 0:
-                raise ValueError("Entry delay cannot be negative")
+            if not (-3600 <= new_ed <= 3600):
+                raise ValueError("Out of range")
         except ValueError:
             await message.reply_text(
-                "❌ Invalid value. Send a whole number of seconds (e.g. `5`), or `0` to disable.",
+                "❌ Invalid value. Send a whole number of seconds (e.g. `-4` to fire early, `5` to delay, `0` to disable).",
                 quote=True,
             )
             return
 
         await update_signal_settings({'entry_delay': new_ed})
-        ed_display = f"{new_ed}s" if new_ed > 0 else "Disabled"
+        if new_ed > 0:
+            ed_display = f"+{new_ed}s (delay)"
+            ed_note = f"Trades will be held {new_ed}s after signal receipt."
+        elif new_ed < 0:
+            ed_display = f"{new_ed}s (early)"
+            ed_note = f"Trades will fire {abs(new_ed)}s early to compensate for broker latency."
+        else:
+            ed_display = "Disabled"
+            ed_note = "No entry offset will be applied."
 
         if bot_instance and ed_msg_id:
             try:
                 await bot_instance.edit_message_text(
                     chat_id=user_id,
                     message_id=ed_msg_id,
-                    text=f"✅ **Entry Delay set to: {ed_display}**\n\nGo back to Signal Monitor to review settings.",
+                    text=f"✅ **Entry Offset set to: {ed_display}**\n\nGo back to Signal Monitor to review settings.",
                 )
             except Exception:
                 pass
 
         await message.reply_text(
-            f"✅ Entry Delay set to **{ed_display}**."
-            + (f" All signals will be held {new_ed}s before entry." if new_ed > 0 else " No entry delay will be applied."),
+            f"✅ Entry Offset set to **{ed_display}**. {ed_note}",
             quote=True,
         )
+
+    elif state and state.startswith("waiting_martingale_start:"):
+        del user_states[user_id]
+        try:
+            mg_msg_id = int(state.split(":", 1)[1])
+        except (IndexError, ValueError):
+            mg_msg_id = None
+
+        raw = text.strip()
+        if raw.lower() == "/cancel":
+            await message.reply_text("Cancelled — Martingale starting amount unchanged.", quote=True)
+            return
+        try:
+            new_start = float(raw)
+            if new_start <= 0:
+                raise ValueError
+        except ValueError:
+            await message.reply_text(
+                "❌ Invalid value. Enter a positive number (e.g. `1`, `2.50`, `5`).",
+                quote=True,
+            )
+            return
+
+        await update_signal_settings({'martingale_start': new_start, 'strategy_step': 0})
+        steps = _martingale_steps(new_start)
+        preview = " → ".join(f"${s:g}" for s in steps[:5]) + " → …"
+
+        if bot_instance and mg_msg_id:
+            try:
+                sig_settings = await get_signal_settings()
+                await bot_instance.edit_message_text(
+                    chat_id=user_id,
+                    message_id=mg_msg_id,
+                    text=_strategy_panel_text(sig_settings),
+                    reply_markup=InlineKeyboardMarkup(_strategy_panel_keyboard(sig_settings)),
+                )
+            except Exception:
+                pass
+
+        await message.reply_text(
+            f"✅ Martingale starting amount set to **${new_start:g}**.\n"
+            f"Step counter reset to 1.\n"
+            f"Sequence: {preview}",
+            quote=True,
+        )
+
+    elif state and state.startswith("waiting_gale2_start:"):
+        del user_states[user_id]
+        try:
+            g2_msg_id = int(state.split(":", 1)[1])
+        except (IndexError, ValueError):
+            g2_msg_id = None
+
+        raw = text.strip()
+        if raw.lower() == "/cancel":
+            await message.reply_text("Cancelled — GALE2 starting amount unchanged.", quote=True)
+            return
+        try:
+            new_g2 = float(raw)
+            if new_g2 <= 0:
+                raise ValueError
+        except ValueError:
+            await message.reply_text(
+                "❌ Invalid value. Enter a positive number (e.g. `1`, `2.50`, `5`).",
+                quote=True,
+            )
+            return
+
+        await update_signal_settings({'gale2_start': new_g2, 'strategy_step': 0})
+        g2_steps = _gale2_steps(new_g2)
+        preview_g2 = " → ".join(f"${s:g}" for s in g2_steps) + " → reset"
+
+        if bot_instance and g2_msg_id:
+            try:
+                sig_settings = await get_signal_settings()
+                await bot_instance.edit_message_text(
+                    chat_id=user_id,
+                    message_id=g2_msg_id,
+                    text=_strategy_panel_text(sig_settings),
+                    reply_markup=InlineKeyboardMarkup(_strategy_panel_keyboard(sig_settings)),
+                )
+            except Exception:
+                pass
+
+        await message.reply_text(
+            f"✅ GALE2 starting amount set to **${new_g2:g}**.\n"
+            f"Step counter reset to 1.\n"
+            f"Cycle: {preview_g2}",
+            quote=True,
+        )
+
+    elif state and state.startswith("waiting_blacklist_add:"):
+        del user_states[user_id]
+        try:
+            bl_msg_id = int(state.split(":", 1)[1])
+        except (IndexError, ValueError):
+            bl_msg_id = None
+
+        raw = text.strip()
+        if raw.lower() == "/cancel":
+            await message.reply_text("Cancelled — blacklist unchanged.", quote=True)
+            return
+
+        from signal_parser import normalize_asset as _normalize_asset
+        normalized = _normalize_asset(raw)
+        sig_settings = await get_signal_settings()
+        bl = list(sig_settings.get('symbol_blacklist', []))
+        if normalized in bl:
+            await message.reply_text(
+                f"ℹ️ `{normalized}` is already in the blacklist.",
+                quote=True,
+            )
+        else:
+            bl.append(normalized)
+            await update_signal_settings({'symbol_blacklist': bl})
+
+        if bot_instance and bl_msg_id:
+            try:
+                sig_settings = await get_signal_settings()
+                await bot_instance.edit_message_text(
+                    chat_id=user_id,
+                    message_id=bl_msg_id,
+                    text=_blacklist_panel_text(sig_settings),
+                    reply_markup=InlineKeyboardMarkup(_blacklist_panel_keyboard(sig_settings)),
+                )
+            except Exception:
+                pass
+
+        if normalized not in bl:  # was newly added
+            await message.reply_text(
+                f"✅ `{normalized}` added to blacklist. Signals for this symbol will be skipped.",
+                quote=True,
+            )
 
     elif state and state.startswith("waiting_ch_tz:"):
         del user_states[user_id]
@@ -4066,10 +4422,17 @@ def build_manual_trade_keyboard(
         current_step = sig_settings.get('strategy_step', 0)
         strat = STRATEGIES.get(sid)
         if strat:
-            steps = strat['steps']
+            _mg_s = float(sig_settings.get('martingale_start', 1.0))
+            _g2_s = float(sig_settings.get('gale2_start', 1.0))
+            if sid == 3:
+                steps = _martingale_steps(_mg_s)
+            elif sid == 4:
+                steps = _gale2_steps(_g2_s)
+            else:
+                steps = strat['steps']
             amt_now = steps[min(current_step, len(steps) - 1)]
             keyboard.append([InlineKeyboardButton(
-                f"🎯 Strategy: Step {current_step + 1}/10 — ${amt_now}  (tap to change)",
+                f"🎯 Strategy: Step {current_step + 1}/{len(steps)} — ${amt_now}  (tap to change)",
                 callback_data="noop",
             )])
             row: list = []
@@ -4174,7 +4537,20 @@ async def execute_signal_trade(signal: Dict[str, Any]):
         step  = sig_settings.get('strategy_step', 0)
         strat = STRATEGIES.get(sid)
         if strat:
-            steps = strat['steps']
+            mg_start = float(sig_settings.get('martingale_start', 1.0))
+            g2_start = float(sig_settings.get('gale2_start', 1.0))
+            if sid == 3:
+                steps = _martingale_steps(mg_start)
+                min_bal = mg_start
+                dyn_start = mg_start
+            elif sid == 4:
+                steps = _gale2_steps(g2_start)
+                min_bal = g2_start
+                dyn_start = g2_start
+            else:
+                steps = strat['steps']
+                min_bal = strat['min_balance']
+                dyn_start = 1.0
             step  = min(step, len(steps) - 1)
             strategy_amount = float(steps[step])
             strategy_override = {
@@ -4183,12 +4559,13 @@ async def execute_signal_trade(signal: Dict[str, Any]):
                 'strategy_amount': strategy_amount,
                 'strategy_steps':  steps,
                 'strategy_name':   strat['name'],
-                'min_balance':     strat['min_balance'],
+                'min_balance':     min_bal,
+                'mg_start':        dyn_start,
             }
             amount = strategy_amount  # use for the initial notification
             logger.info(
                 f"[Signal Trade] Strategy Mode — {strat['name']} "
-                f"step {step + 1}/10 amount=${strategy_amount}"
+                f"step {step + 1}/{len(steps)} amount=${strategy_amount}"
             )
         else:
             logger.warning(f"[Signal Trade] Unknown strategy_id={sid}, proceeding with signal amount.")
@@ -4228,6 +4605,7 @@ async def execute_signal_trade(signal: Dict[str, Any]):
     logger.info(f"[Signal Trade] {asset_display} | {dir_label} | ${amount} | {duration}s (signal: {raw_duration}s, delay: {signal_delay}s){inverse_note}")
 
     # ── Timed Entry: sleep until HH:MM specified in signal ────────────────────
+    _late_timed_entry = False  # set True if signal arrived < 8s before target
     if entry_time_str:
         global _timed_entry_cancel, _timed_entry_info
 
@@ -4244,106 +4622,134 @@ async def execute_signal_trade(signal: Dict[str, Any]):
 
         # Capture current time and initial wait for the notification
         now_local = datetime.datetime.now()
-        wait_secs = _compute_timed_entry_wait(entry_time_str)
+        _raw_wait = _compute_timed_entry_wait(entry_time_str)
+        wait_secs = max(0.0, _raw_wait + entry_delay)
         timed_entry = True
         now_str = now_local.strftime('%Y-%m-%d %H:%M:%S')
-        logger.info(
-            f"[Signal Trade] Timed entry: now={now_str} (system local), waiting {wait_secs:.1f}s until :{entry_time_str.split(':')[1]}"
-        )
 
-        # Register active timed entry so the UI can display and cancel it
-        _timed_entry_cancel = False
-        _timed_entry_info = {
-            'asset_display': asset_display,
-            'direction': dir_label,
-            'entry_time': entry_time_str,
-        }
-
-        # Send notification with cancel button
-        _te_notif_msg_id = None
-        if bot_instance:
-            try:
-                wait_h = int(wait_secs // 3600)
-                wait_m = int((wait_secs % 3600) // 60)
-                wait_s = int(wait_secs % 60)
-                wait_human = (
-                    f"{wait_h}h {wait_m}m {wait_s}s" if wait_h
-                    else f"{wait_m}m {wait_s}s" if wait_m
-                    else f"{wait_s}s"
-                )
-                _te_msg = await bot_instance.send_message(
+        _LATE_ENTRY_THRESHOLD = 8.0  # seconds
+        if _raw_wait < _LATE_ENTRY_THRESHOLD:
+            # Signal arrived too close to the target minute — fire immediately
+            # without any delay or offset so we don't miss the candle entirely.
+            _late_timed_entry = True
+            logger.info(
+                f"[Signal Trade] Timed entry arrived late ({_raw_wait:.1f}s to :{entry_time_str.split(':')[1]}) "
+                "— firing immediately, all delays skipped."
+            )
+            if bot_instance:
+                asyncio.create_task(bot_instance.send_message(
                     OWNER_ID,
-                    f"⏰ **Timed Entry Scheduled**\n\n"
+                    f"⚡ **Timed Entry — Late Arrival**\n\n"
                     f"📊 Asset: `{asset_display}`\n"
                     f"📈 Direction: **{dir_label}**{inverse_note}\n"
-                    f"🕐 Bot system time: `{now_str}`\n"
-                    f"⌚ Signal entry time: **{entry_time_str}** → entering at :{entry_time_str.split(':')[1]}\n"
-                    f"⏳ Waiting **{wait_human}** ({wait_secs:.0f}s) before placing trade.",
-                    reply_markup=InlineKeyboardMarkup(
-                        [[InlineKeyboardButton("❌ Cancel Timed Entry", callback_data="cancel_timed_entry")]]
-                    ),
-                )
-                _te_notif_msg_id = _te_msg.id
-            except Exception:
-                pass
+                    f"⏰ Signal entry time: **{entry_time_str}** (only **{_raw_wait:.1f}s** to target)\n"
+                    f"⚡ Firing immediately — no delay applied.",
+                ))
+        else:
+            logger.info(
+                f"[Signal Trade] Timed entry: now={now_str} (system local), "
+                f"waiting {wait_secs:.1f}s until :{entry_time_str.split(':')[1]}"
+            )
 
-        # Polling loop — re-evaluates wall-clock every 5s so clock adjustments
-        # are picked up quickly, and the cancel flag is checked each iteration.
-        _POLL_INTERVAL = 5  # seconds
-        while True:
-            remaining = _compute_timed_entry_wait(entry_time_str)
-            if remaining <= 0:
-                break
-            if _timed_entry_cancel:
-                _timed_entry_info = None
-                _timed_entry_cancel = False
-                logger.info("[Signal Trade] Timed entry cancelled by user.")
-                if bot_instance and _te_notif_msg_id:
-                    try:
-                        await bot_instance.edit_message_text(
-                            chat_id=OWNER_ID,
-                            message_id=_te_notif_msg_id,
-                            text=(
-                                f"❌ **Timed Entry Cancelled**\n\n"
-                                f"📊 Asset: `{asset_display}`\n"
-                                f"⌚ Was waiting until :{entry_time_str.split(':')[1]}"
-                            ),
-                        )
-                    except Exception:
-                        pass
-                if bot_instance:
-                    try:
-                        await bot_instance.send_message(
-                            OWNER_ID, "❌ Timed entry cancelled. Trade will not be placed."
-                        )
-                    except Exception:
-                        pass
-                return  # abort execute_signal_trade entirely
-            await asyncio.sleep(min(_POLL_INTERVAL, remaining))
+            # Register active timed entry so the UI can display and cancel it
+            _timed_entry_cancel = False
+            _timed_entry_info = {
+                'asset_display': asset_display,
+                'direction': dir_label,
+                'entry_time': entry_time_str,
+            }
 
-        # Clear active entry info now that target time has been reached
-        _timed_entry_info = None
-        _timed_entry_cancel = False
-        # Remove the cancel button in the background — don't block the trade entry.
-        if bot_instance and _te_notif_msg_id:
-            async def _remove_cancel_button(_mid=_te_notif_msg_id):
+            # Send notification with cancel button
+            _te_notif_msg_id = None
+            if bot_instance:
                 try:
-                    await bot_instance.edit_message_reply_markup(
-                        chat_id=OWNER_ID, message_id=_mid, reply_markup=None,
+                    wait_h = int(wait_secs // 3600)
+                    wait_m = int((wait_secs % 3600) // 60)
+                    wait_s = int(wait_secs % 60)
+                    wait_human = (
+                        f"{wait_h}h {wait_m}m {wait_s}s" if wait_h
+                        else f"{wait_m}m {wait_s}s" if wait_m
+                        else f"{wait_s}s"
                     )
+                    _te_msg = await bot_instance.send_message(
+                        OWNER_ID,
+                        f"⏰ **Timed Entry Scheduled**\n\n"
+                        f"📊 Asset: `{asset_display}`\n"
+                        f"📈 Direction: **{dir_label}**{inverse_note}\n"
+                        f"🕐 Bot system time: `{now_str}`\n"
+                        f"⌚ Signal entry time: **{entry_time_str}** → entering at :{entry_time_str.split(':')[1]}\n"
+                        f"⏳ Waiting **{wait_human}** ({wait_secs:.0f}s) before placing trade.",
+                        reply_markup=InlineKeyboardMarkup(
+                            [[InlineKeyboardButton("❌ Cancel Timed Entry", callback_data="cancel_timed_entry")]]
+                        ),
+                    )
+                    _te_notif_msg_id = _te_msg.id
                 except Exception:
                     pass
-            asyncio.create_task(_remove_cancel_button())
 
-        # ── Precision approach: sleep the exact sub-second remainder so the
-        # trade hits the broker as close to :MM:00 as possible.
-        _final_remaining = _compute_timed_entry_wait(entry_time_str)
-        if 0 < _final_remaining < 2.0:
-            await asyncio.sleep(_final_remaining)
+            # Polling loop — re-evaluates wall-clock every 5s so clock adjustments
+            # are picked up quickly, and the cancel flag is checked each iteration.
+            # Only the negative portion of entry_delay is applied here (early-fire
+            # offset). Positive entry_delay is handled by the sleep block below;
+            # if we included it here, _compute_timed_entry_wait's max(0,...) floor
+            # would keep remaining > 0 forever once the target minute is reached.
+            _ED_OFFSET = min(entry_delay, 0)  # ≤ 0
+            _POLL_INTERVAL = 5  # seconds
+            while True:
+                remaining = _compute_timed_entry_wait(entry_time_str) + _ED_OFFSET
+                if remaining <= 0:
+                    break
+                if _timed_entry_cancel:
+                    _timed_entry_info = None
+                    _timed_entry_cancel = False
+                    logger.info("[Signal Trade] Timed entry cancelled by user.")
+                    if bot_instance and _te_notif_msg_id:
+                        try:
+                            await bot_instance.edit_message_text(
+                                chat_id=OWNER_ID,
+                                message_id=_te_notif_msg_id,
+                                text=(
+                                    f"❌ **Timed Entry Cancelled**\n\n"
+                                    f"📊 Asset: `{asset_display}`\n"
+                                    f"⌚ Was waiting until :{entry_time_str.split(':')[1]}"
+                                ),
+                            )
+                        except Exception:
+                            pass
+                    if bot_instance:
+                        try:
+                            await bot_instance.send_message(
+                                OWNER_ID, "❌ Timed entry cancelled. Trade will not be placed."
+                            )
+                        except Exception:
+                            pass
+                    return  # abort execute_signal_trade entirely
+                await asyncio.sleep(min(_POLL_INTERVAL, remaining))
+
+            # Clear active entry info now that target time has been reached
+            _timed_entry_info = None
+            _timed_entry_cancel = False
+            # Remove the cancel button in the background — don't block the trade entry.
+            if bot_instance and _te_notif_msg_id:
+                async def _remove_cancel_button(_mid=_te_notif_msg_id):
+                    try:
+                        await bot_instance.edit_message_reply_markup(
+                            chat_id=OWNER_ID, message_id=_mid, reply_markup=None,
+                        )
+                    except Exception:
+                        pass
+                asyncio.create_task(_remove_cancel_button())
+
+            # ── Precision approach: sleep the exact sub-second remainder so the
+            # trade hits the broker as close to :MM:00 as possible.
+            _final_remaining = _compute_timed_entry_wait(entry_time_str) + _ED_OFFSET
+            if 0 < _final_remaining < 2.0:
+                await asyncio.sleep(_final_remaining)
     # ─────────────────────────────────────────────────────────────────────────
 
-    # ── Entry Delay: hold entry for N seconds after signal receipt ────────────
-    if entry_delay > 0:
+    # ── Entry Delay/Offset: hold entry for N seconds after signal receipt ─────
+    # Skipped for timed entries that arrived late — already past the deadline.
+    if entry_delay > 0 and not _late_timed_entry:
         logger.info(f"[Signal Trade] Entry delay: sleeping {entry_delay}s before placing trades.")
         await asyncio.sleep(entry_delay)
     # ─────────────────────────────────────────────────────────────────────────
@@ -4460,19 +4866,20 @@ async def _execute_single_account_signal_trade(
             min_balance     = strategy_override['min_balance']
             strat_name      = strategy_override['strategy_name']
             strat_step      = strategy_override['strategy_step']
+            strat_total     = len(strategy_override['strategy_steps'])
 
             if current_balance is not None and current_balance < strategy_amount:
                 logger.warning(
                     f"[Signal Trade] [{email}] Strategy balance check failed: "
                     f"balance=${current_balance:.2f} < step amount=${strategy_amount} "
-                    f"(step {strat_step + 1}/10, {strat_name})"
+                    f"(step {strat_step + 1}/{strat_total}, {strat_name})"
                 )
                 if bot_instance:
                     await bot_instance.send_message(
                         OWNER_ID,
                         f"⚠️ **{email}** — Strategy trade skipped\n\n"
                         f"🎯 {strat_name}\n"
-                        f"📍 Step {strat_step + 1}/10 requires **${strategy_amount:g}**\n"
+                        f"📍 Step {strat_step + 1}/{strat_total} requires **${strategy_amount:g}**\n"
                         f"💰 Current balance: **${current_balance:.2f}**\n\n"
                         f"_Insufficient balance for this strategy step. "
                         f"Deposit funds or reset the step counter._",
@@ -4482,7 +4889,7 @@ async def _execute_single_account_signal_trade(
             amount = strategy_amount
             logger.info(
                 f"[Signal Trade] [{email}] Strategy override: amount=${amount} "
-                f"(step {strat_step + 1}/10, {strat_name})"
+                f"(step {strat_step + 1}/{strat_total}, {strat_name})"
             )
         # ─────────────────────────────────────────────────────────────────────
 
@@ -4710,7 +5117,7 @@ async def _execute_single_account_signal_trade(
             elif result_str == "TIE":
                 # Treat tie as no change — stay on same step
                 new_step = strat_step
-                strategy_note = f"\n🎯 Strategy: TIE — step unchanged (**{strat_step + 1}/10**)"
+                strategy_note = f"\n🎯 Strategy: TIE — step unchanged (**{strat_step + 1}/{len(strat_steps)}**)"
             else:  # LOSS
                 new_step = strat_step + 1
                 if new_step >= len(strat_steps):
@@ -4721,7 +5128,7 @@ async def _execute_single_account_signal_trade(
                 else:
                     next_amt = strat_steps[new_step]
                     strategy_note = (
-                        f"\n🎯 Strategy: LOSS — advancing to step **{new_step + 1}/10** "
+                        f"\n🎯 Strategy: LOSS — advancing to step **{new_step + 1}/{len(strat_steps)}** "
                         f"(next amount: **${next_amt}**) 📈"
                     )
             # Persist the new step unconditionally — we always want the step to
@@ -4736,7 +5143,10 @@ async def _execute_single_account_signal_trade(
                 )
             except Exception as step_err:
                 logger.warning(f"[Signal Trade] [{email}] Could not update strategy step: {step_err}")
-            result_keyboard = _build_step_selector_keyboard(strategy_override['strategy_id'], new_step)
+            result_keyboard = _build_step_selector_keyboard(
+                strategy_override['strategy_id'], new_step,
+                mg_start=float(strategy_override.get('mg_start', 1.0)),
+            )
         # ─────────────────────────────────────────────────────────────────────
 
         # Capture closing balance after trade settlement
