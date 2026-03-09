@@ -103,6 +103,7 @@ def normalize_asset(raw: str) -> str:
         'EURUSD_otc'        → 'EURUSD_otc'
         'Bitcoin (OTC)'     → 'BITCOIN_otc'
     """
+    raw = _normalize_unicode(raw)
     # Detect OTC by any of: (OTC), -OTC, _otc, OTCq (case-insensitive)
     is_otc = bool(re.search(r'[\s\-_(]?otc\w*', raw, re.IGNORECASE))
     # Strip OTC markers, parentheses, slashes, spaces, dashes — keep only letters
@@ -277,7 +278,7 @@ def parse_signal(text: str) -> Optional[Dict[str, Any]]:
 
     # Try minutes first
     m = re.search(
-        r'[⏱⏰⌛⌚]\ufe0f?[\s\ufe0f]*(\d+)\s*(?:MINUTES?|MINS?|MIN\b)',
+        r'[⏱⏰⌛⌚⏳]\ufe0f?[\s\ufe0f]*(\d+)\s*(?:MINUTES?|MINS?|MIN\b)',
         text, re.IGNORECASE,
     )
     if not m:
@@ -287,7 +288,7 @@ def parse_signal(text: str) -> Optional[Dict[str, Any]]:
 
     # Try M-notation shorthand: M1 / M5 / M15 / M30 (e.g. "⌚️ M1", "⏱ M5")
     if 'duration' not in result:
-        m = re.search(r'[⌚⏱⏰⌛]\ufe0f?[\s]*[Mm](\d+)\b', text)
+        m = re.search(r'[⌚⏱⏰⌛⏳]\ufe0f?[\s]*[Mm](\d+)\b', text)
         if not m:
             m = re.search(r'(?:^|\n)\s*[Mm](\d+)\b', text)
         if m:
@@ -296,7 +297,7 @@ def parse_signal(text: str) -> Optional[Dict[str, Any]]:
     # Try seconds if no minutes found
     if 'duration' not in result:
         m = re.search(
-            r'[⏱⏰⌛⌚]\ufe0f?[\s\ufe0f]*([\d]+)\s*(?:SECONDS?|SECS?|S\b)',
+            r'[⏱⏰⌛⌚⏳]\ufe0f?[\s\ufe0f]*([\d]+)\s*(?:SECONDS?|SECS?|S\b)',
             text, re.IGNORECASE,
         )
         if not m:
@@ -314,8 +315,10 @@ def parse_signal(text: str) -> Optional[Dict[str, Any]]:
     # Supports 24-hour (23:41) and 12-hour (11:41 PM / 11:41PM) formats.
     # Must NOT fire on duration lines like "⏰ 3 MINUTES".
     # Strategy: match HH:MM only when NOT followed by a time-unit word.
+    # Clock-face emojis 🕐–🕧 (U+1F550–U+1F567) are also used for entry times.
+    _CLOCK_FACES = '\U0001F550-\U0001F567'
     m_et = re.search(
-        r'[⏰⏳]\ufe0f?\s*(\d{1,2}):(\d{2})[^\S\n]*(AM|PM)?[^\S\n]*(?!\S*(?:MINUTE|SECOND|MIN|SEC)\b)',
+        rf'[⏰⏳{_CLOCK_FACES}]\ufe0f?\s*(\d{{1,2}}):(\d{{2}})[^\S\n]*(AM|PM)?[^\S\n]*(?!\S*(?:MINUTE|SECOND|MIN|SEC)\b)',
         text, re.IGNORECASE,
     )
     if not m_et:
@@ -386,7 +389,8 @@ def is_signal_message(text: str) -> bool:
     ))
 
     # Emoji hints that strongly suggest a signal
-    signal_emojis = ['👉', '⏱', '⏰', '⌛', '⌚', '⏳', '💵', '💷', '🔼', '🔽', '📈', '📉', '⬆', '⬇', '🟢', '🔴']
+    signal_emojis = ['👉', '⏱', '⏰', '⌛', '⌚', '⏳', '💵', '💷', '🔼', '🔽', '📈', '📉', '⬆', '⬇', '🟢', '🔴',
+                     '🕐', '🕑', '🕒', '🕓', '🕔', '🕕', '🕖', '🕗', '🕘', '🕙', '🕚', '🕛']
 
     # Text keywords
     text_kws = [

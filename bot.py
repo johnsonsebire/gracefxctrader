@@ -802,6 +802,7 @@ async def get_signal_settings() -> Dict[str, Any]:
             'martingale_start': 1.0,       # float — Martingale (sid=3) starting amount ($)
             'gale2_start': 1.0,            # float — GALE2 (sid=4) starting amount ($)
             'symbol_blacklist': [],        # list[str] — symbols blocked from trading
+            'symbol_overrides': {},        # dict[str, dict] — per-symbol setting overrides
         }
         await signal_settings_db.insert_one(doc)
     else:
@@ -832,7 +833,7 @@ async def update_signal_settings(data: dict):
 
 def _blacklist_panel_text(sig_settings: dict) -> str:
     """Text body for the Symbol Blacklist settings panel."""
-    bl = sig_settings.get('symbol_blacklist', [])
+    bl = [s for s in sig_settings.get('symbol_blacklist', []) if s and s.strip()]
     lines = ["🚫 **Symbol Blacklist**\n"]
     if bl:
         lines.append(f"**{len(bl)} symbol(s) blocked** — these will be skipped when a signal arrives:\n")
@@ -845,7 +846,7 @@ def _blacklist_panel_text(sig_settings: dict) -> str:
 
 def _blacklist_panel_keyboard(sig_settings: dict) -> list:
     """Keyboard for the Symbol Blacklist panel."""
-    bl = sig_settings.get('symbol_blacklist', [])
+    bl = [s for s in sig_settings.get('symbol_blacklist', []) if s and s.strip()]
     rows = []
     rows.append([InlineKeyboardButton("➕ Add Symbol", callback_data="blacklist_add")])
     if bl:
@@ -854,6 +855,107 @@ def _blacklist_panel_keyboard(sig_settings: dict) -> list:
         rows.append([InlineKeyboardButton("🗑 Clear All", callback_data="blacklist_clear")])
     rows.append(back_button("settings_main"))
     return rows
+
+
+# ── Per-Symbol Overrides helpers ─────────────────────────────────────────────────
+
+def _sym_ov_fmt(ov: dict) -> str:
+    """One-line summary of a single symbol's active overrides."""
+    parts = []
+    if ov.get('entry_offset') is not None:
+        v = int(ov['entry_offset'])
+        parts.append(f"Offset:{v:+d}s")
+    if ov.get('duration_adjust') is not None:
+        v = int(ov['duration_adjust'])
+        parts.append(f"Dur:{v:+d}s")
+    if ov.get('signal_delay') is not None:
+        v = int(ov['signal_delay'])
+        parts.append(f"Shorten:{v}s")
+    return " | ".join(parts) if parts else "(none set)"
+
+
+def _sym_override_list_text(sig_settings: dict) -> str:
+    """Text body for the Symbol Overrides listing panel."""
+    overrides = sig_settings.get('symbol_overrides', {})
+    lines = ["\ud83c\udfd9 **Symbol Overrides**\n",
+             "Per-symbol tweaks that override global Signal Monitor settings.\n"]
+    if overrides:
+        lines.append(f"**{len(overrides)} symbol(s)** configured:\n")
+        for sym, ov in sorted(overrides.items()):
+            lines.append(f"\u2022 `{sym}` \u2014 {_sym_ov_fmt(ov)}")
+    else:
+        lines.append("_No per-symbol overrides yet._")
+        lines.append("_Tap **\u2795 Add** to configure tweaks for a specific pair._")
+    return '\n'.join(lines)
+
+
+def _sym_override_list_keyboard(sig_settings: dict) -> list:
+    """Keyboard for the Symbol Overrides list panel."""
+    overrides = sig_settings.get('symbol_overrides', {})
+    rows = []
+    rows.append([InlineKeyboardButton("\u2795 Add Symbol Override", callback_data="sym_override_add")])
+    for sym in sorted(overrides.keys()):
+        rows.append([
+            InlineKeyboardButton(f"\ud83c\udfd9 {sym}", callback_data=f"sym_override_edit:{sym}"),
+            InlineKeyboardButton("\u274c Remove", callback_data=f"sym_override_remove:{sym}"),
+        ])
+    rows.append(back_button("settings_main"))
+    return rows
+
+
+def _sym_override_edit_text(sym: str, ov: dict, sig_settings: dict) -> str:
+    """Text body for the edit sub-panel of one symbol override."""
+    global_ed = int(sig_settings.get('entry_delay', 0))
+    global_sd = int(sig_settings.get('signal_delay', 0))
+    entry_offset = ov.get('entry_offset')
+    dur_adj      = ov.get('duration_adjust')
+    sig_delay    = ov.get('signal_delay')
+
+    if entry_offset is not None:
+        v = int(entry_offset)
+        eo_str = f"**{v:+d}s** ({'early' if v < 0 else 'delay' if v > 0 else 'no offset'})"
+    else:
+        eo_str = f"_off \u2014 using global ({global_ed:+d}s)_"
+
+    if dur_adj is not None:
+        v = int(dur_adj)
+        da_str = f"**{v:+d}s** to signal duration"
+    else:
+        da_str = "_off \u2014 no adjustment_"
+
+    if sig_delay is not None:
+        v = int(sig_delay)
+        sd_str = f"**{v}s** subtracted from duration"
+    else:
+        sd_str = f"_off \u2014 using global ({global_sd}s)_"
+
+    return (
+        f"\ud83c\udfd9 **Symbol Override \u2014 `{sym}`**\n\n"
+        f"\u23f1 Entry Offset: {eo_str}\n"
+        f"\u23f3 Duration Adjust: {da_str}\n"
+        f"\u2702\ufe0f Signal Delay (shorten): {sd_str}\n\n"
+        f"_Tap a setting to change it, or \ud83d\udeab to reset to global._"
+    )
+
+
+def _sym_override_edit_keyboard(sym: str, ov: dict) -> list:
+    """Keyboard for the symbol override edit sub-panel."""
+    entry_offset = ov.get('entry_offset')
+    dur_adj      = ov.get('duration_adjust')
+    sig_delay    = ov.get('signal_delay')
+    eo_label = f"\u23f1 Entry: {int(entry_offset):+d}s" if entry_offset is not None else "\u23f1 Entry Offset: off"
+    da_label = f"\u23f3 Dur: {int(dur_adj):+d}s"        if dur_adj      is not None else "\u23f3 Duration Adj: off"
+    sd_label = f"\u2702\ufe0f Shorten: {int(sig_delay)}s"    if sig_delay    is not None else "\u2702\ufe0f Signal Delay: off"
+    return [
+        [InlineKeyboardButton(eo_label, callback_data=f"sym_ov_set_offset:{sym}"),
+         InlineKeyboardButton("\ud83d\udeab Off", callback_data=f"sym_ov_off_offset:{sym}")],
+        [InlineKeyboardButton(da_label, callback_data=f"sym_ov_set_dur:{sym}"),
+         InlineKeyboardButton("\ud83d\udeab Off", callback_data=f"sym_ov_off_dur:{sym}")],
+        [InlineKeyboardButton(sd_label, callback_data=f"sym_ov_set_delay:{sym}"),
+         InlineKeyboardButton("\ud83d\udeab Off", callback_data=f"sym_ov_off_delay:{sym}")],
+        [InlineKeyboardButton("\ud83d\uddd1 Remove Override", callback_data=f"sym_override_remove:{sym}")],
+        [InlineKeyboardButton("\u2190 Back to List", callback_data="sym_override_view")],
+    ]
 
 
 # ── Strategy Mode helpers ────────────────────────────────────────────────────
@@ -2449,6 +2551,7 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
             keyboard_rows.append([InlineKeyboardButton("📡 Signal Mode", callback_data="signal_status_view")])
             keyboard_rows.append([InlineKeyboardButton("🎯 Strategy Mode", callback_data="strategy_view")])
             keyboard_rows.append([InlineKeyboardButton("🚫 Symbol Blacklist", callback_data="blacklist_view")])
+            keyboard_rows.append([InlineKeyboardButton("🏙 Symbol Overrides", callback_data="sym_override_view")])
 
         keyboard_rows.append(back_button("main_menu")) # Always provide a way back
 
@@ -2678,6 +2781,202 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
             )
         except Exception:
             pass
+
+    # ── Symbol Overrides ─────────────────────────────────────────────────────────
+
+    elif data == "sym_override_view":
+        if user_id != OWNER_ID:
+            await callback_query.answer("⛔️ Owner only.", show_alert=True)
+            return
+        sig_settings = await get_signal_settings()
+        await message.edit_text(
+            _sym_override_list_text(sig_settings),
+            reply_markup=InlineKeyboardMarkup(_sym_override_list_keyboard(sig_settings)),
+        )
+
+    elif data == "sym_override_add":
+        if user_id != OWNER_ID:
+            await callback_query.answer("⛔️ Owner only.", show_alert=True)
+            return
+        user_states[user_id] = f"waiting_sym_override_add:{message.id}"
+        try:
+            await message.edit_text(
+                "🏙 **Add Symbol Override**\n\n"
+                "Send the pair/symbol to configure overrides for\n"
+                "(e.g. `USDMXN-OTCq`, `EUR/USD`, `EURUSD_otc`).\n\n"
+                "Or /cancel to go back.",
+            )
+        except Exception:
+            pass
+
+    elif data.startswith("sym_override_edit:"):
+        if user_id != OWNER_ID:
+            await callback_query.answer("⛔️ Owner only.", show_alert=True)
+            return
+        sym = data.split(":", 1)[1]
+        sig_settings = await get_signal_settings()
+        ov = sig_settings.get('symbol_overrides', {}).get(sym, {})
+        try:
+            await message.edit_text(
+                _sym_override_edit_text(sym, ov, sig_settings),
+                reply_markup=InlineKeyboardMarkup(_sym_override_edit_keyboard(sym, ov)),
+            )
+        except Exception:
+            pass
+
+    elif data.startswith("sym_override_remove:"):
+        if user_id != OWNER_ID:
+            await callback_query.answer("⛔️ Owner only.", show_alert=True)
+            return
+        sym = data.split(":", 1)[1]
+        sig_settings = await get_signal_settings()
+        overrides = dict(sig_settings.get('symbol_overrides', {}))
+        if sym in overrides:
+            del overrides[sym]
+            await update_signal_settings({'symbol_overrides': overrides})
+            await callback_query.answer(f"✅ {sym} override removed.")
+        else:
+            await callback_query.answer("Not found.", show_alert=True)
+        sig_settings = await get_signal_settings()
+        try:
+            await message.edit_text(
+                _sym_override_list_text(sig_settings),
+                reply_markup=InlineKeyboardMarkup(_sym_override_list_keyboard(sig_settings)),
+            )
+        except Exception:
+            pass
+
+    elif data.startswith("sym_ov_set_offset:"):
+        if user_id != OWNER_ID:
+            await callback_query.answer("⛔️ Owner only.", show_alert=True)
+            return
+        sym = data.split(":", 1)[1]
+        user_states[user_id] = f"waiting_sym_ov_offset:{sym}:{message.id}"
+        try:
+            await message.edit_text(
+                f"⏱ **Entry Offset for `{sym}`**\n\n"
+                f"Send a number of seconds:\n"
+                f"• **Negative** (e.g. `-2`) → fire 2s early\n"
+                f"• **Positive** (e.g. `3`) → delay entry by 3s\n"
+                f"• `0` → no offset for this symbol\n"
+                f"\nOr /cancel.",
+            )
+        except Exception:
+            pass
+
+    elif data.startswith("sym_ov_set_dur:"):
+        if user_id != OWNER_ID:
+            await callback_query.answer("⛔️ Owner only.", show_alert=True)
+            return
+        sym = data.split(":", 1)[1]
+        user_states[user_id] = f"waiting_sym_ov_dur:{sym}:{message.id}"
+        try:
+            await message.edit_text(
+                f"⏳ **Duration Adjustment for `{sym}`**\n\n"
+                f"Send seconds to add or subtract from the signal\'s duration:\n"
+                f"• **Positive** (e.g. `10`) → extend by 10s\n"
+                f"• **Negative** (e.g. `-15`) → shorten by 15s\n"
+                f"• `0` → no adjustment\n"
+                f"\n_Applied **after** global signal-delay subtraction._\n"
+                f"\nOr /cancel.",
+            )
+        except Exception:
+            pass
+
+    elif data.startswith("sym_ov_set_delay:"):
+        if user_id != OWNER_ID:
+            await callback_query.answer("⛔️ Owner only.", show_alert=True)
+            return
+        sym = data.split(":", 1)[1]
+        user_states[user_id] = f"waiting_sym_ov_delay:{sym}:{message.id}"
+        try:
+            await message.edit_text(
+                f"✂️ **Signal Delay (shorten) for `{sym}`**\n\n"
+                f"Seconds subtracted from the signal\'s duration to compensate\n"
+                f"for provider delay (overrides global setting for this symbol).\n\n"
+                f"• e.g. `20` → subtract 20s from duration\n"
+                f"• `0` → no subtraction for this symbol\n"
+                f"\nOr /cancel.",
+            )
+        except Exception:
+            pass
+
+    elif data.startswith("sym_ov_off_offset:"):
+        if user_id != OWNER_ID:
+            await callback_query.answer("⛔️ Owner only.", show_alert=True)
+            return
+        sym = data.split(":", 1)[1]
+        sig_settings = await get_signal_settings()
+        overrides = dict(sig_settings.get('symbol_overrides', {}))
+        ov = dict(overrides.get(sym, {}))
+        ov.pop('entry_offset', None)
+        if ov:
+            overrides[sym] = ov
+        else:
+            overrides.pop(sym, None)
+        await update_signal_settings({'symbol_overrides': overrides})
+        await callback_query.answer("✅ Entry offset reset to global.")
+        sig_settings = await get_signal_settings()
+        ov = sig_settings.get('symbol_overrides', {}).get(sym, {})
+        try:
+            await message.edit_text(
+                _sym_override_edit_text(sym, ov, sig_settings),
+                reply_markup=InlineKeyboardMarkup(_sym_override_edit_keyboard(sym, ov)),
+            )
+        except Exception:
+            pass
+
+    elif data.startswith("sym_ov_off_dur:"):
+        if user_id != OWNER_ID:
+            await callback_query.answer("⛔️ Owner only.", show_alert=True)
+            return
+        sym = data.split(":", 1)[1]
+        sig_settings = await get_signal_settings()
+        overrides = dict(sig_settings.get('symbol_overrides', {}))
+        ov = dict(overrides.get(sym, {}))
+        ov.pop('duration_adjust', None)
+        if ov:
+            overrides[sym] = ov
+        else:
+            overrides.pop(sym, None)
+        await update_signal_settings({'symbol_overrides': overrides})
+        await callback_query.answer("✅ Duration adjustment reset.")
+        sig_settings = await get_signal_settings()
+        ov = sig_settings.get('symbol_overrides', {}).get(sym, {})
+        try:
+            await message.edit_text(
+                _sym_override_edit_text(sym, ov, sig_settings),
+                reply_markup=InlineKeyboardMarkup(_sym_override_edit_keyboard(sym, ov)),
+            )
+        except Exception:
+            pass
+
+    elif data.startswith("sym_ov_off_delay:"):
+        if user_id != OWNER_ID:
+            await callback_query.answer("⛔️ Owner only.", show_alert=True)
+            return
+        sym = data.split(":", 1)[1]
+        sig_settings = await get_signal_settings()
+        overrides = dict(sig_settings.get('symbol_overrides', {}))
+        ov = dict(overrides.get(sym, {}))
+        ov.pop('signal_delay', None)
+        if ov:
+            overrides[sym] = ov
+        else:
+            overrides.pop(sym, None)
+        await update_signal_settings({'symbol_overrides': overrides})
+        await callback_query.answer("✅ Signal delay reset to global.")
+        sig_settings = await get_signal_settings()
+        ov = sig_settings.get('symbol_overrides', {}).get(sym, {})
+        try:
+            await message.edit_text(
+                _sym_override_edit_text(sym, ov, sig_settings),
+                reply_markup=InlineKeyboardMarkup(_sym_override_edit_keyboard(sym, ov)),
+            )
+        except Exception:
+            pass
+
+    # ── End Symbol Overrides ─────────────────────────────────────────────────────
 
     # --- Role Management Navigation ---
     elif data == "admin_manage_sudo":
@@ -4208,6 +4507,190 @@ async def message_handler(client: Client, message: Message):
                 quote=True,
             )
 
+    # ── Symbol Override state handlers ────────────────────────────────────────
+
+    elif state and state.startswith("waiting_sym_override_add:"):
+        del user_states[user_id]
+        try:
+            ov_msg_id = int(state.split(":", 1)[1])
+        except (IndexError, ValueError):
+            ov_msg_id = None
+
+        raw = text.strip()
+        if raw.lower() == "/cancel":
+            await message.reply_text("Cancelled.", quote=True)
+            # Restore list panel
+            if bot_instance and ov_msg_id:
+                try:
+                    sig_settings = await get_signal_settings()
+                    await bot_instance.edit_message_text(
+                        chat_id=user_id, message_id=ov_msg_id,
+                        text=_sym_override_list_text(sig_settings),
+                        reply_markup=InlineKeyboardMarkup(_sym_override_list_keyboard(sig_settings)),
+                    )
+                except Exception:
+                    pass
+            return
+
+        from signal_parser import normalize_asset as _normalize_asset
+        normalized = _normalize_asset(raw)
+        sig_settings = await get_signal_settings()
+        overrides = dict(sig_settings.get('symbol_overrides', {}))
+        if normalized not in overrides:
+            overrides[normalized] = {}
+            await update_signal_settings({'symbol_overrides': overrides})
+
+        sig_settings = await get_signal_settings()
+        ov = overrides.get(normalized, {})
+        if bot_instance and ov_msg_id:
+            try:
+                await bot_instance.edit_message_text(
+                    chat_id=user_id, message_id=ov_msg_id,
+                    text=_sym_override_edit_text(normalized, ov, sig_settings),
+                    reply_markup=InlineKeyboardMarkup(_sym_override_edit_keyboard(normalized, ov)),
+                )
+            except Exception:
+                pass
+        await message.reply_text(
+            f"✅ Override entry created for `{normalized}`. Configure settings in the panel above.",
+            quote=True,
+        )
+
+    elif state and state.startswith("waiting_sym_ov_offset:"):
+        del user_states[user_id]
+        # state = "waiting_sym_ov_offset:{sym}:{msg_id}"
+        parts = state.split(":", 2)
+        sym = parts[1] if len(parts) > 1 else ""
+        try:
+            ov_msg_id = int(parts[2]) if len(parts) > 2 else None
+        except (IndexError, ValueError):
+            ov_msg_id = None
+
+        raw = text.strip()
+        if raw.lower() == "/cancel":
+            await message.reply_text("Cancelled.", quote=True)
+        else:
+            try:
+                val = int(raw)
+            except ValueError:
+                await message.reply_text("❌ Invalid integer. Try again or /cancel.", quote=True)
+                return
+            sig_settings = await get_signal_settings()
+            overrides = dict(sig_settings.get('symbol_overrides', {}))
+            ov = dict(overrides.get(sym, {}))
+            if val == 0:
+                ov.pop('entry_offset', None)
+            else:
+                ov['entry_offset'] = val
+            if ov:
+                overrides[sym] = ov
+            else:
+                overrides.pop(sym, None)
+            await update_signal_settings({'symbol_overrides': overrides})
+            await message.reply_text(f"✅ Entry offset for `{sym}` → **{val:+d}s**", quote=True)
+
+        sig_settings = await get_signal_settings()
+        ov = sig_settings.get('symbol_overrides', {}).get(sym, {})
+        if bot_instance and ov_msg_id:
+            try:
+                await bot_instance.edit_message_text(
+                    chat_id=user_id, message_id=ov_msg_id,
+                    text=_sym_override_edit_text(sym, ov, sig_settings),
+                    reply_markup=InlineKeyboardMarkup(_sym_override_edit_keyboard(sym, ov)),
+                )
+            except Exception:
+                pass
+
+    elif state and state.startswith("waiting_sym_ov_dur:"):
+        del user_states[user_id]
+        parts = state.split(":", 2)
+        sym = parts[1] if len(parts) > 1 else ""
+        try:
+            ov_msg_id = int(parts[2]) if len(parts) > 2 else None
+        except (IndexError, ValueError):
+            ov_msg_id = None
+
+        raw = text.strip()
+        if raw.lower() == "/cancel":
+            await message.reply_text("Cancelled.", quote=True)
+        else:
+            try:
+                val = int(raw)
+            except ValueError:
+                await message.reply_text("❌ Invalid integer. Try again or /cancel.", quote=True)
+                return
+            sig_settings = await get_signal_settings()
+            overrides = dict(sig_settings.get('symbol_overrides', {}))
+            ov = dict(overrides.get(sym, {}))
+            if val == 0:
+                ov.pop('duration_adjust', None)
+            else:
+                ov['duration_adjust'] = val
+            if ov:
+                overrides[sym] = ov
+            else:
+                overrides.pop(sym, None)
+            await update_signal_settings({'symbol_overrides': overrides})
+            await message.reply_text(f"✅ Duration adjust for `{sym}` → **{val:+d}s**", quote=True)
+
+        sig_settings = await get_signal_settings()
+        ov = sig_settings.get('symbol_overrides', {}).get(sym, {})
+        if bot_instance and ov_msg_id:
+            try:
+                await bot_instance.edit_message_text(
+                    chat_id=user_id, message_id=ov_msg_id,
+                    text=_sym_override_edit_text(sym, ov, sig_settings),
+                    reply_markup=InlineKeyboardMarkup(_sym_override_edit_keyboard(sym, ov)),
+                )
+            except Exception:
+                pass
+
+    elif state and state.startswith("waiting_sym_ov_delay:"):
+        del user_states[user_id]
+        parts = state.split(":", 2)
+        sym = parts[1] if len(parts) > 1 else ""
+        try:
+            ov_msg_id = int(parts[2]) if len(parts) > 2 else None
+        except (IndexError, ValueError):
+            ov_msg_id = None
+
+        raw = text.strip()
+        if raw.lower() == "/cancel":
+            await message.reply_text("Cancelled.", quote=True)
+        else:
+            try:
+                val = int(raw)
+                if val < 0:
+                    raise ValueError
+            except ValueError:
+                await message.reply_text("❌ Invalid — must be a non-negative integer. Try again or /cancel.", quote=True)
+                return
+            sig_settings = await get_signal_settings()
+            overrides = dict(sig_settings.get('symbol_overrides', {}))
+            ov = dict(overrides.get(sym, {}))
+            if val == 0:
+                ov.pop('signal_delay', None)
+            else:
+                ov['signal_delay'] = val
+            if ov:
+                overrides[sym] = ov
+            else:
+                overrides.pop(sym, None)
+            await update_signal_settings({'symbol_overrides': overrides})
+            await message.reply_text(f"✅ Signal delay for `{sym}` → **{val}s**", quote=True)
+
+        sig_settings = await get_signal_settings()
+        ov = sig_settings.get('symbol_overrides', {}).get(sym, {})
+        if bot_instance and ov_msg_id:
+            try:
+                await bot_instance.edit_message_text(
+                    chat_id=user_id, message_id=ov_msg_id,
+                    text=_sym_override_edit_text(sym, ov, sig_settings),
+                    reply_markup=InlineKeyboardMarkup(_sym_override_edit_keyboard(sym, ov)),
+                )
+            except Exception:
+                pass
+
     elif state and state.startswith("waiting_ch_tz:"):
         del user_states[user_id]
         # state = "waiting_ch_tz:{ch_idx}:{msg_id}"
@@ -4516,8 +4999,50 @@ async def execute_signal_trade(signal: Dict[str, Any]):
 
     # ── Apply signal-delay compensation ──────────────────────────────────────
     sig_settings = await get_signal_settings()
+
+    # ── Symbol blacklist check ────────────────────────────────────────────────
+    _bl_list = [s.lower() for s in sig_settings.get('symbol_blacklist', []) if s and s.strip()]
+    if _bl_list:
+        _asset_lower = (asset or '').lower()
+        _asset_base  = _asset_lower.replace('_otc', '')
+        if _asset_lower in _bl_list or _asset_base in _bl_list:
+            logger.info(
+                f"[Signal Trade] Symbol blacklisted: {asset_display} ({asset}) — trade skipped."
+            )
+            if bot_instance:
+                try:
+                    await bot_instance.send_message(
+                        OWNER_ID,
+                        f"🚫 **Signal Blocked — Blacklisted Symbol**\n\n"
+                        f"Symbol `{asset_display}` is on your blacklist.\n"
+                        f"_Trade skipped. Go to Settings → Symbol Blacklist to manage._",
+                    )
+                except Exception:
+                    pass
+            return
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # ── Per-symbol overrides: look up asset in symbol_overrides dict ──────────
+    _sym_overrides = sig_settings.get('symbol_overrides', {})
+    _sym_ov: dict = {}
+    _asset_key = (asset or '').lower()
+    for _ov_key, _ov_val in _sym_overrides.items():
+        if _ov_key.lower() == _asset_key or _ov_key.lower() == _asset_key.replace('_otc', ''):
+            _sym_ov = _ov_val
+            break
+
     signal_delay = int(sig_settings.get('signal_delay', 0))
     entry_delay = int(sig_settings.get('entry_delay', 0))
+
+    # Apply per-symbol overrides (if set) — they take precedence over globals
+    if _sym_ov.get('signal_delay') is not None:
+        _global_sd = signal_delay
+        signal_delay = int(_sym_ov['signal_delay'])
+        logger.info(f"[Signal Trade] Per-symbol signal_delay override for {asset}: {_global_sd}→{signal_delay}s")
+    if _sym_ov.get('entry_offset') is not None:
+        _global_ed = entry_delay
+        entry_delay = int(_sym_ov['entry_offset'])
+        logger.info(f"[Signal Trade] Per-symbol entry_offset override for {asset}: {_global_ed}→{entry_delay}s")
     entry_time_str: Optional[str] = signal.get('entry_time')  # e.g. "18:20" or None
     timed_entry = False
 
@@ -4590,6 +5115,14 @@ async def execute_signal_trade(signal: Dict[str, Any]):
         if _remapped:
             logger.info(f"[Signal Trade] Duration remapped {duration}s → {_remapped}s (remap rule active)")
             duration = _remapped
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # ── Per-symbol duration adjustment (applied after remap + signal-delay) ──
+    if _sym_ov.get('duration_adjust') is not None:
+        _dur_adj = int(_sym_ov['duration_adjust'])
+        _pre_adj = duration
+        duration = max(duration + _dur_adj, 5)  # floor at 5s
+        logger.info(f"[Signal Trade] Per-symbol duration_adjust for {asset}: {_pre_adj}s {_dur_adj:+d}s → {duration}s")
     # ─────────────────────────────────────────────────────────────────────────
 
     # ── Inverse mode (flip direction) ────────────────────────────────────────
@@ -5149,14 +5682,35 @@ async def _execute_single_account_signal_trade(
             )
         # ─────────────────────────────────────────────────────────────────────
 
-        # Capture closing balance after trade settlement
+        # Capture closing balance and account mode after trade settlement
+        balance_after = None
+        post_account_mode = account_mode          # fallback to pre-trade value
+        _balance_fetch_failed = False
         try:
             balance_after = await qx_client.get_balance()
             await record_closing_balance(account_doc_id, date_str_today, balance_after)
             logger.info(f"[Signal Trade] [{email}] Balance after trade: {balance_after}")
+            try:
+                _profile = await qx_client.get_profile()
+                if _profile:
+                    post_account_mode = "REAL" if _profile.live_balance == balance_after else "PRACTICE"
+            except Exception:
+                pass  # non-critical — keep pre-trade account_mode
         except Exception as bal_err:
             logger.warning(f"[Signal Trade] [{email}] Could not fetch post-trade balance: {bal_err}")
-            balance_after = None
+            _balance_fetch_failed = True
+            # Balance fetch failure may indicate a stale session — evict client
+            # so the next trade triggers a fresh connection.
+            try:
+                _stale = active_quotex_clients.pop(account_doc_id, None)
+                if _stale:
+                    await _stale.close()
+                logger.warning(
+                    f"[Signal Trade] [{email}] Evicted client after balance-fetch failure — "
+                    "next trade will reconnect."
+                )
+            except Exception:
+                pass
 
         # ── Record to trading journal ──────────────────────────────────
         await save_journal_entry({
@@ -5181,6 +5735,13 @@ async def _execute_single_account_signal_trade(
         })
 
         if bot_instance:
+            _bal_line = (
+                f"💰 Balance: `${balance_after:,.2f}`"
+                if balance_after is not None
+                else "💰 Balance: `⚠️ Fetch failed — session may be stale`"
+            )
+            _mode_icon = "🔴" if post_account_mode == "REAL" else "🟡"
+            _mode_line = f"{_mode_icon} Mode: `{post_account_mode}`"
             await bot_instance.send_message(
                 OWNER_ID,
                 f"{icon} **Signal Trade Result** — `{email}`\n\n"
@@ -5188,7 +5749,9 @@ async def _execute_single_account_signal_trade(
                 f"📈 Direction: `{direction.upper()}`\n"
                 f"💵 Amount: `${amount}`\n"
                 f"🏷 Trade ID: `{trade_id}`\n"
-                f"📌 Result: **{outcome}**"
+                f"📌 Result: **{outcome}**\n\n"
+                f"{_bal_line}\n"
+                f"{_mode_line}"
                 + strategy_note,
                 reply_markup=result_keyboard,
             )
