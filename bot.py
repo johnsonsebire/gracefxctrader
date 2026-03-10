@@ -40,7 +40,7 @@ try:
         ForceReply
     )
     from pyrogram import enums
-    from pyrogram.errors import UserIsBlocked, FloodWait, InputUserDeactivated, UserDeactivated
+    from pyrogram.errors import UserIsBlocked, FloodWait, InputUserDeactivated, UserDeactivated, MessageNotModified
 except ImportError:
     print("Error: Pyrofork not found. Install it: pip install pyrofork tgcrypto")
     sys.exit(1)
@@ -233,6 +233,13 @@ trade_journal_withdrawals_db = None  # Collection for withdrawal records
 _timed_entry_cancel: bool = False
 # Info about the active timed entry shown to the user (None when idle)
 _timed_entry_info: Optional[Dict[str, Any]] = None
+
+# ── Concurrent timed-entry collision guard ────────────────────────────────────
+# Tracks recent timed-entry signals: entry_time → list of {asset, ts, cancel_event}
+# When two different pairs register the same entry_time within _CTE_WINDOW seconds,
+# both are cancelled to avoid simultaneous exposure.
+_CTE_WINDOW: float = 90.0            # seconds — how long entries stay in the registry
+_cte_registry: Dict[str, list] = {}   # "HH:MM" → [{asset, ts, cancel_event}, ...]
 
 # Temporary storage for OTP requests: {user_id: {'qx_client': qx_client_instance, 'event': asyncio.Event()}}
 active_otp_requests: Dict[int, Dict[str, Any]] = {}
@@ -802,6 +809,8 @@ async def get_signal_settings() -> Dict[str, Any]:
             'martingale_start': 1.0,       # float — Martingale (sid=3) starting amount ($)
             'gale2_start': 1.0,            # float — GALE2 (sid=4) starting amount ($)
             'symbol_blacklist': [],        # list[str] — symbols blocked from trading
+            'favorite_symbols': [],        # list[str] — favorite symbols (used with locked_mode)
+            'locked_mode': False,          # bool — when True, only favorite_symbols are traded
             'symbol_overrides': {},        # dict[str, dict] — per-symbol setting overrides
         }
         await signal_settings_db.insert_one(doc)
@@ -853,6 +862,43 @@ def _blacklist_panel_keyboard(sig_settings: dict) -> list:
         for sym in sorted(bl):
             rows.append([InlineKeyboardButton(f"❌  {sym}", callback_data=f"blacklist_remove:{sym}")])
         rows.append([InlineKeyboardButton("🗑 Clear All", callback_data="blacklist_clear")])
+    rows.append(back_button("settings_main"))
+    return rows
+
+
+# ── Favorite Symbols / Locked Mode helpers ──────────────────────────────────────
+
+def _favorites_panel_text(sig_settings: dict) -> str:
+    """Text body for the Favorite Symbols settings panel."""
+    favs = [s for s in sig_settings.get('favorite_symbols', []) if s and s.strip()]
+    locked = sig_settings.get('locked_mode', False)
+    lines = ["⭐ **Favorite Symbols**\n"]
+    lines.append(f"🔒 Locked Mode: **{'ON' if locked else 'OFF'}**")
+    if locked:
+        lines.append("_Only signals for favorite symbols will be executed._\n")
+    else:
+        lines.append("_All signals are processed normally (locked mode is off)._\n")
+    if favs:
+        lines.append(f"**{len(favs)} favorite(s):**\n")
+        for sym in sorted(favs):
+            lines.append(f"  ⭐ `{sym}`")
+    else:
+        lines.append("_No favorites added yet._")
+    return '\n'.join(lines)
+
+
+def _favorites_panel_keyboard(sig_settings: dict) -> list:
+    """Keyboard for the Favorite Symbols panel."""
+    favs = [s for s in sig_settings.get('favorite_symbols', []) if s and s.strip()]
+    locked = sig_settings.get('locked_mode', False)
+    rows = []
+    toggle_label = "🔓 Turn Locked Mode OFF" if locked else "🔒 Turn Locked Mode ON"
+    rows.append([InlineKeyboardButton(toggle_label, callback_data="fav_toggle_lock")])
+    rows.append([InlineKeyboardButton("➕ Add Symbol", callback_data="fav_add")])
+    if favs:
+        for sym in sorted(favs):
+            rows.append([InlineKeyboardButton(f"❌  {sym}", callback_data=f"fav_remove:{sym}")])
+        rows.append([InlineKeyboardButton("🗑 Clear All", callback_data="fav_clear")])
     rows.append(back_button("settings_main"))
     return rows
 
@@ -1467,7 +1513,7 @@ def input_wrapper(prompt=""):
 active_quotex_clients: Dict[str, Quotex] = {}
 
 # --- REPLACE the get_quotex_client function (using the AGGRESSIVE timing with CORRECT patch function) ---
-async def get_quotex_client(user_id: int, account_doc_id: str, interaction_type: str = "info") -> Tuple[Optional[Quotex], str]:
+async def get_quotex_client(user_id: int, account_doc_id: str, interaction_type: str = "info", _cf_retry: bool = False) -> Tuple[Optional[Quotex], str]:
     """
     Gets or creates a connected Quotex client instance for an account.
     Uses AGGRESSIVE patching on builtins.input + ASYNC handler for PIN prompts.
@@ -1660,7 +1706,7 @@ async def get_quotex_client(user_id: int, account_doc_id: str, interaction_type:
                 or "cloudflare" in reason_str.lower()
                 or "websocket connection closed" in reason_str.lower()
             ):
-                # Delete the stale session so the next restart forces a fresh Selenium login
+                # Delete the stale session so pyquotex does a fresh login
                 _stale_sess = Path(f"{session_path}/session.json")
                 if _stale_sess.exists():
                     try:
@@ -1671,9 +1717,27 @@ async def get_quotex_client(user_id: int, account_doc_id: str, interaction_type:
                         )
                     except Exception as _del_err:
                         logger.warning(f"[Auth] Could not delete stale session: {_del_err}")
+                # Also delete root session.json if it exists (legacy path)
+                _root_sess = Path("session.json")
+                if _root_sess.exists():
+                    try:
+                        _root_sess.unlink()
+                        logger.warning("[Auth] Deleted root session.json (stale).")
+                    except Exception:
+                        pass
+                # Auto-retry once with a clean session
+                if not _cf_retry:
+                    logger.info(
+                        f"[Auth] {email}: Cloudflare 403 detected — retrying "
+                        "with fresh session after 5s cooldown ..."
+                    )
+                    await asyncio.sleep(5)
+                    return await get_quotex_client(
+                        user_id, account_doc_id, interaction_type, _cf_retry=True,
+                    )
                 return None, (
-                    "Connection blocked by Cloudflare — stale session deleted. "
-                    "Restart the bot; a browser window will open for you to log in."
+                    "Connection blocked by Cloudflare even after session refresh. "
+                    "The broker may be temporarily unreachable — will auto-retry on next signal."
                 )
             else:
                  return None, f"Connection Failed: {reason_str}"
@@ -1913,6 +1977,15 @@ async def broadcast_command_handler(client: Client, message: Message):
 async def callback_query_handler(client: Client, callback_query: CallbackQuery):
     global bot_instance # Store the client instance
     if not bot_instance: bot_instance = client
+
+    try:
+        await _callback_query_handler_inner(client, callback_query)
+    except MessageNotModified:
+        pass  # User double-tapped a button — content unchanged, safe to ignore
+
+
+async def _callback_query_handler_inner(client: Client, callback_query: CallbackQuery):
+    global bot_instance
 
     user_id = callback_query.from_user.id
     data = callback_query.data
@@ -2551,6 +2624,7 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
             keyboard_rows.append([InlineKeyboardButton("📡 Signal Mode", callback_data="signal_status_view")])
             keyboard_rows.append([InlineKeyboardButton("🎯 Strategy Mode", callback_data="strategy_view")])
             keyboard_rows.append([InlineKeyboardButton("🚫 Symbol Blacklist", callback_data="blacklist_view")])
+            keyboard_rows.append([InlineKeyboardButton("⭐ Favorite Symbols", callback_data="fav_view")])
             keyboard_rows.append([InlineKeyboardButton("🏙 Symbol Overrides", callback_data="sym_override_view")])
 
         keyboard_rows.append(back_button("main_menu")) # Always provide a way back
@@ -2778,6 +2852,91 @@ async def callback_query_handler(client: Client, callback_query: CallbackQuery):
             await message.edit_text(
                 _blacklist_panel_text(sig_settings),
                 reply_markup=InlineKeyboardMarkup(_blacklist_panel_keyboard(sig_settings)),
+            )
+        except Exception:
+            pass
+
+    # ── Favorite Symbols / Locked Mode ────────────────────────────────────────────
+
+    elif data == "fav_view":
+        if user_id != OWNER_ID:
+            await callback_query.answer("⛔️ Owner only.", show_alert=True)
+            return
+        sig_settings = await get_signal_settings()
+        await message.edit_text(
+            _favorites_panel_text(sig_settings),
+            reply_markup=InlineKeyboardMarkup(_favorites_panel_keyboard(sig_settings)),
+        )
+
+    elif data == "fav_toggle_lock":
+        if user_id != OWNER_ID:
+            await callback_query.answer("⛔️ Owner only.", show_alert=True)
+            return
+        sig_settings = await get_signal_settings()
+        new_val = not sig_settings.get('locked_mode', False)
+        await update_signal_settings({'locked_mode': new_val})
+        await callback_query.answer(f"🔒 Locked Mode {'ON' if new_val else 'OFF'}")
+        sig_settings = await get_signal_settings()
+        try:
+            await message.edit_text(
+                _favorites_panel_text(sig_settings),
+                reply_markup=InlineKeyboardMarkup(_favorites_panel_keyboard(sig_settings)),
+            )
+        except Exception:
+            pass
+
+    elif data == "fav_add":
+        if user_id != OWNER_ID:
+            await callback_query.answer("⛔️ Owner only.", show_alert=True)
+            return
+        sig_settings = await get_signal_settings()
+        favs = sig_settings.get('favorite_symbols', [])
+        user_states[user_id] = f"waiting_fav_add:{message.id}"
+        try:
+            current_list = "\n".join(f"  ⭐ {s}" for s in sorted(favs)) if favs else "  _(none yet)_"
+            await message.edit_text(
+                f"⭐ **Add Favorite Symbol**\n\n"
+                f"Current favorites:\n{current_list}\n\n"
+                f"Send the symbol to add (e.g. `EURUSD-OTCq`, `GBPJPY`).\n"
+                f"You can paste it exactly from a signal message.\n\n"
+                f"Or /cancel to go back.",
+            )
+        except Exception:
+            pass
+
+    elif data.startswith("fav_remove:"):
+        if user_id != OWNER_ID:
+            await callback_query.answer("⛔️ Owner only.", show_alert=True)
+            return
+        sym_to_remove = data.split(":", 1)[1].strip()
+        sig_settings = await get_signal_settings()
+        favs = list(sig_settings.get('favorite_symbols', []))
+        if sym_to_remove in favs:
+            favs.remove(sym_to_remove)
+            await update_signal_settings({'favorite_symbols': favs})
+            await callback_query.answer(f"✅ {sym_to_remove} removed.")
+        else:
+            await callback_query.answer("Symbol not found.", show_alert=True)
+        sig_settings = await get_signal_settings()
+        try:
+            await message.edit_text(
+                _favorites_panel_text(sig_settings),
+                reply_markup=InlineKeyboardMarkup(_favorites_panel_keyboard(sig_settings)),
+            )
+        except Exception:
+            pass
+
+    elif data == "fav_clear":
+        if user_id != OWNER_ID:
+            await callback_query.answer("⛔️ Owner only.", show_alert=True)
+            return
+        await update_signal_settings({'favorite_symbols': [], 'locked_mode': False})
+        await callback_query.answer("✅ Favorites cleared & locked mode turned off.")
+        sig_settings = await get_signal_settings()
+        try:
+            await message.edit_text(
+                _favorites_panel_text(sig_settings),
+                reply_markup=InlineKeyboardMarkup(_favorites_panel_keyboard(sig_settings)),
             )
         except Exception:
             pass
@@ -4507,6 +4666,60 @@ async def message_handler(client: Client, message: Message):
                 quote=True,
             )
 
+    # ── Favorite Symbols state handler ────────────────────────────────────────
+
+    elif state and state.startswith("waiting_fav_add:"):
+        del user_states[user_id]
+        try:
+            fav_msg_id = int(state.split(":", 1)[1])
+        except (IndexError, ValueError):
+            fav_msg_id = None
+
+        raw = text.strip()
+        if raw.lower() == "/cancel":
+            await message.reply_text("Cancelled — favorites unchanged.", quote=True)
+            if bot_instance and fav_msg_id:
+                try:
+                    sig_settings = await get_signal_settings()
+                    await bot_instance.edit_message_text(
+                        chat_id=user_id,
+                        message_id=fav_msg_id,
+                        text=_favorites_panel_text(sig_settings),
+                        reply_markup=InlineKeyboardMarkup(_favorites_panel_keyboard(sig_settings)),
+                    )
+                except Exception:
+                    pass
+            return
+
+        from signal_parser import normalize_asset as _normalize_asset
+        normalized = _normalize_asset(raw)
+        sig_settings = await get_signal_settings()
+        favs = list(sig_settings.get('favorite_symbols', []))
+        if normalized in favs:
+            await message.reply_text(
+                f"ℹ️ `{normalized}` is already in your favorites.",
+                quote=True,
+            )
+        else:
+            favs.append(normalized)
+            await update_signal_settings({'favorite_symbols': favs})
+            await message.reply_text(
+                f"⭐ `{normalized}` added to favorites.",
+                quote=True,
+            )
+
+        if bot_instance and fav_msg_id:
+            try:
+                sig_settings = await get_signal_settings()
+                await bot_instance.edit_message_text(
+                    chat_id=user_id,
+                    message_id=fav_msg_id,
+                    text=_favorites_panel_text(sig_settings),
+                    reply_markup=InlineKeyboardMarkup(_favorites_panel_keyboard(sig_settings)),
+                )
+            except Exception:
+                pass
+
     # ── Symbol Override state handlers ────────────────────────────────────────
 
     elif state and state.startswith("waiting_sym_override_add:"):
@@ -5022,6 +5235,29 @@ async def execute_signal_trade(signal: Dict[str, Any]):
             return
     # ─────────────────────────────────────────────────────────────────────────
 
+    # ── Locked Mode: only trade favorite symbols ──────────────────────────────
+    if sig_settings.get('locked_mode', False):
+        _fav_list = [s.lower() for s in sig_settings.get('favorite_symbols', []) if s and s.strip()]
+        if _fav_list:
+            _asset_lower = (asset or '').lower()
+            _asset_base  = _asset_lower.replace('_otc', '')
+            if _asset_lower not in _fav_list and _asset_base not in _fav_list:
+                logger.info(
+                    f"[Signal Trade] Locked mode: {asset_display} ({asset}) not in favorites — trade skipped."
+                )
+                if bot_instance:
+                    try:
+                        await bot_instance.send_message(
+                            OWNER_ID,
+                            f"🔒 **Signal Skipped — Locked Mode**\n\n"
+                            f"Symbol `{asset_display}` is not in your favorites.\n"
+                            f"_Trade skipped. Go to Settings → Favorite Symbols to manage._",
+                        )
+                    except Exception:
+                        pass
+                return
+    # ─────────────────────────────────────────────────────────────────────────
+
     # ── Per-symbol overrides: look up asset in symbol_overrides dict ──────────
     _sym_overrides = sig_settings.get('symbol_overrides', {})
     _sym_ov: dict = {}
@@ -5045,6 +5281,61 @@ async def execute_signal_trade(signal: Dict[str, Any]):
         logger.info(f"[Signal Trade] Per-symbol entry_offset override for {asset}: {_global_ed}→{entry_delay}s")
     entry_time_str: Optional[str] = signal.get('entry_time')  # e.g. "18:20" or None
     timed_entry = False
+
+    # ── Concurrent timed-entry collision guard ────────────────────────────────
+    # If two signals arrive with the same entry_time for different pairs within
+    # _CTE_WINDOW seconds, cancel ALL of them to avoid simultaneous exposure.
+    _cte_cancel_event: Optional[asyncio.Event] = None
+    if entry_time_str:
+        global _cte_registry
+        now_ts = time.time()
+        # Prune expired entries
+        for _k in list(_cte_registry):
+            _cte_registry[_k] = [e for e in _cte_registry[_k] if now_ts - e['ts'] < _CTE_WINDOW]
+            if not _cte_registry[_k]:
+                del _cte_registry[_k]
+
+        existing = _cte_registry.get(entry_time_str, [])
+        # Check if a DIFFERENT asset already registered this entry_time
+        _other_assets = [e for e in existing if e['asset'].lower() != (asset or '').lower()]
+        if _other_assets:
+            # Collision detected — cancel the earlier signal(s) and skip this one
+            collision_names = [e['asset_display'] for e in _other_assets]
+            logger.warning(
+                f"[Signal Trade] ⚠ Concurrent entry-time collision at {entry_time_str}: "
+                f"{asset_display} vs {collision_names} — cancelling ALL."
+            )
+            # Signal the earlier entries to cancel via their events
+            for e in _other_assets:
+                e['cancel_event'].set()
+            # Remove colliding entries from registry
+            _cte_registry[entry_time_str] = [
+                e for e in existing if e['asset'].lower() == (asset or '').lower()
+            ]
+            # Notify owner
+            if bot_instance:
+                _collision_list = ', '.join(f'`{n}`' for n in collision_names)
+                try:
+                    await bot_instance.send_message(
+                        OWNER_ID,
+                        f"⚠️ **Concurrent Signal Collision — Trades Cancelled**\n\n"
+                        f"⏰ Entry time: **{entry_time_str}**\n"
+                        f"📊 Signals: `{asset_display}` + {_collision_list}\n\n"
+                        f"Multiple signals with the same entry time detected.\n"
+                        f"_All cancelled to avoid simultaneous exposure._",
+                    )
+                except Exception:
+                    pass
+            return
+
+        # No collision yet — register this signal with a cancel event
+        _cte_cancel_event = asyncio.Event()
+        _cte_registry.setdefault(entry_time_str, []).append({
+            'asset': asset,
+            'asset_display': asset_display,
+            'ts': now_ts,
+            'cancel_event': _cte_cancel_event,
+        })
 
     # ── Strategy Mode: override trade amount ──────────────────────────────────
     # ── Strategy Mode: override trade amount ──────────────────────────────────
@@ -5257,11 +5548,41 @@ async def execute_signal_trade(signal: Dict[str, Any]):
                         except Exception:
                             pass
                     return  # abort execute_signal_trade entirely
+                # Check concurrent collision cancel event
+                if _cte_cancel_event and _cte_cancel_event.is_set():
+                    _timed_entry_info = None
+                    logger.info(
+                        f"[Signal Trade] Timed entry for {asset_display} cancelled — "
+                        "concurrent entry-time collision detected."
+                    )
+                    if bot_instance and _te_notif_msg_id:
+                        try:
+                            await bot_instance.edit_message_text(
+                                chat_id=OWNER_ID,
+                                message_id=_te_notif_msg_id,
+                                text=(
+                                    f"⚠️ **Timed Entry Cancelled — Collision**\n\n"
+                                    f"📊 Asset: `{asset_display}`\n"
+                                    f"⌚ Entry time: {entry_time_str}\n"
+                                    f"Another signal with the same entry time was detected."
+                                ),
+                            )
+                        except Exception:
+                            pass
+                    return
                 await asyncio.sleep(min(_POLL_INTERVAL, remaining))
 
             # Clear active entry info now that target time has been reached
             _timed_entry_info = None
             _timed_entry_cancel = False
+            # Remove this signal from the collision registry
+            if entry_time_str in _cte_registry:
+                _cte_registry[entry_time_str] = [
+                    e for e in _cte_registry[entry_time_str]
+                    if e['asset'].lower() != (asset or '').lower()
+                ]
+                if not _cte_registry[entry_time_str]:
+                    del _cte_registry[entry_time_str]
             # Remove the cancel button in the background — don't block the trade entry.
             if bot_instance and _te_notif_msg_id:
                 async def _remove_cancel_button(_mid=_te_notif_msg_id):
@@ -5767,7 +6088,7 @@ async def _execute_single_account_signal_trade(
         if _stale_auth:
             logger.warning(
                 f"[Signal Trade] {account_doc_id}: stale auth detected — evicting client "
-                "and deleting session.json so next trade triggers a fresh login."
+                "and deleting session.json, then auto-reconnecting."
             )
             # Evict the cached client
             try:
@@ -5786,13 +6107,22 @@ async def _execute_single_account_signal_trade(
                     )
                 except Exception as _del_err:
                     logger.warning(f"[Signal Trade] Could not delete session.json: {_del_err}")
+            # Auto-reconnect in the background so the next signal is ready
+            async def _bg_reconnect(_aid=account_doc_id):
+                try:
+                    await asyncio.sleep(3)
+                    _rc, _rm = await get_quotex_client(OWNER_ID, _aid, "stale_auth_reconnect")
+                    logger.info(f"[Signal Trade] Auto-reconnect {_aid}: {'OK' if _rc else _rm}")
+                except Exception as _rc_err:
+                    logger.warning(f"[Signal Trade] Auto-reconnect {_aid} failed: {_rc_err}")
+            asyncio.create_task(_bg_reconnect())
 
         if bot_instance:
             try:
                 _msg = (
                     f"⚠️ **{email}**\n"
                     "Session expired mid-trade — stale session cleared.\n"
-                    "The next signal will re-authenticate automatically."
+                    "Auto-reconnecting now; next signal should work."
                     if _stale_auth else
                     f"❌ **{email}**\nUnexpected error during signal trade.\n`{type(e).__name__}: {e}`"
                 )
@@ -6444,17 +6774,26 @@ async def _quotex_ws_health_monitor():
                                     f"session.json: {_del_err}"
                                 )
 
-                        # Evict cache — next trade signal or keepalive will
-                        # fully reconnect using pyquotex's own HTTP auth.
+                        # Evict cache — then immediately reconnect with fresh auth.
                         try:
                             await qx_client.close()
                         except Exception:
                             pass
                         active_quotex_clients.pop(acct_id, None)
                         logger.info(
-                            f"[WSHealth] {acct_id}: evicted stale client. "
-                            "Will reconnect (native re-auth) on next signal."
+                            f"[WSHealth] {acct_id}: evicted stale client — "
+                            "attempting automatic reconnect ..."
                         )
+                        try:
+                            new_client, msg = await get_quotex_client(
+                                OWNER_ID, acct_id, "ws_health_reconnect",
+                            )
+                            if new_client:
+                                logger.info(f"[WSHealth] {acct_id}: reconnected — {msg}")
+                            else:
+                                logger.warning(f"[WSHealth] {acct_id}: reconnect failed — {msg}")
+                        except Exception as _rc_err:
+                            logger.warning(f"[WSHealth] {acct_id}: reconnect error — {_rc_err}")
                 else:
                     # Connection looks healthy — reset counter
                     _ws_fail_ticks[acct_id] = 0
