@@ -1175,13 +1175,15 @@ def _channels_panel_keyboard(channels: list) -> list:
     for idx, ch in enumerate(channels):
         active = ch.get('active', True)
         display = _ch_display(ch)
-        if len(display) > 15:
-            display = display[:12] + '…'
+
+        # Keep channel label on a full-width row so long names are visible.
         rows.append([
             InlineKeyboardButton(
                 f"{'🟢' if active else '🔴'} {display}",
                 callback_data=f"sig_ch_toggle:{idx}",
             ),
+        ])
+        rows.append([
             InlineKeyboardButton("✏️", callback_data=f"sig_ch_rename:{idx}"),
             InlineKeyboardButton("🌐", callback_data=f"sig_ch_tz:{idx}"),
             InlineKeyboardButton("🗑", callback_data=f"sig_ch_remove:{idx}"),
