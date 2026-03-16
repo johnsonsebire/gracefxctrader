@@ -5212,6 +5212,25 @@ async def execute_signal_trade(signal: Dict[str, Any]):
         logger.error(f"[Signal Trade] Cannot execute — missing asset or direction: {signal}")
         return
 
+    # ── Neutral trend filter ──────────────────────────────────────────────────
+    trend = signal.get('trend', '').lower()
+    if trend == 'neutral':
+        logger.info(
+            f"[Signal Trade] Skipping {asset_display} — trend is Neutral."
+        )
+        if bot_instance:
+            try:
+                await bot_instance.send_message(
+                    OWNER_ID,
+                    f"⚠️ **Signal Skipped — Neutral Trend**\n\n"
+                    f"Symbol: `{asset_display}`\n"
+                    f"The trend is reported as **Neutral**. Trade skipped to avoid weak setups.",
+                )
+            except Exception:
+                pass
+        return
+    # ─────────────────────────────────────────────────────────────────────────
+
     # ── Apply signal-delay compensation ──────────────────────────────────────
     sig_settings = await get_signal_settings()
 
@@ -5282,7 +5301,28 @@ async def execute_signal_trade(signal: Dict[str, Any]):
         entry_delay = int(_sym_ov['entry_offset'])
         logger.info(f"[Signal Trade] Per-symbol entry_offset override for {asset}: {_global_ed}→{entry_delay}s")
     entry_time_str: Optional[str] = signal.get('entry_time')  # e.g. "18:20" or None
+    entry_time_tz: str = signal.get('entry_time_tz', '')     # e.g. "UTC-3" or ""
     timed_entry = False
+
+    # ── Convert UTC-3 entry time to local/UTC ────────────────────────────────
+    # Some channels (like this one) broadcast entry times in UTC-3.
+    # We need to add 3 hours to get UTC, then compare against system UTC clock.
+    if entry_time_str and entry_time_tz == 'UTC-3':
+        try:
+            hh, mm = map(int, entry_time_str.split(':'))
+            # Convert UTC-3 → UTC by adding 3 hours
+            total_minutes = hh * 60 + mm + 180  # +3h = +180 min
+            total_minutes %= 1440  # wrap around midnight
+            hh_utc = total_minutes // 60
+            mm_utc = total_minutes % 60
+            entry_time_str = f"{hh_utc:02d}:{mm_utc:02d}"
+            logger.info(
+                f"[Signal Trade] Converted entry time UTC-3 → UTC: "
+                f"{signal.get('entry_time')} → {entry_time_str}"
+            )
+        except Exception as _tz_err:
+            logger.warning(f"[Signal Trade] Failed to convert UTC-3 entry time: {_tz_err}")
+    # ─────────────────────────────────────────────────────────────────────────
 
     # ── Concurrent timed-entry collision guard ────────────────────────────────
     # If two signals arrive with the same entry_time for different pairs within
@@ -5616,6 +5656,14 @@ async def execute_signal_trade(signal: Dict[str, Any]):
             raw_dur_display = f"{raw_duration // 60}m {raw_duration % 60}s" if raw_duration % 60 else f"{raw_duration // 60} min"
             entry_time_note = f"\n⌚ Entry time: `{entry_time_str}` _(timed entry)_" if entry_time_str else ""
             entry_delay_note = f"\n⏱ Entry delay applied: `{entry_delay}s`" if entry_delay > 0 else ""
+            # Extra metadata from signal
+            _trend = signal.get('trend', '')
+            _forecast = signal.get('forecast')
+            _payout = signal.get('payout')
+            _trend_icon = {'buy': '📈', 'sell': '📉', 'neutral': '➡️'}.get(_trend, '')
+            trend_note = f"\n🚦 Trend: `{_trend_icon} {_trend.title()}`" if _trend else ""
+            forecast_note = f"\n📊 Forecast: `{_forecast:.2f}%`" if _forecast is not None else ""
+            payout_note = f"\n💸 Payout: `{_payout:.1f}%`" if _payout is not None else ""
             _sig_recv_coro = bot_instance.send_message(
                 OWNER_ID,
                 f"🔔 **Signal Received — Executing Trades**\n\n"
@@ -5625,6 +5673,7 @@ async def execute_signal_trade(signal: Dict[str, Any]):
                 f"⏱ Duration: `{dur_display}`"
                 + (f" _(signal: {raw_dur_display}, −{signal_delay}s)_" if signal_delay > 0 else f" `({duration}s)`")
                 + entry_time_note + entry_delay_note
+                + trend_note + forecast_note + payout_note
                 + f"\n\n⚡ Placing on all **Active** accounts...",
             )
             # For timed entries fire the notification in the background so it

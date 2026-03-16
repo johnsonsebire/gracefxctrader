@@ -141,8 +141,6 @@ def parse_direction(text: str) -> Optional[str]:
         r'\bBULLISH\b',
         r'\bLONG\b',
     ]
-    UP_CHARS = ['🔼', '📈', '↑', '🟢', '⬆']
-
     DOWN_PATTERNS = [
         r'\bENTERING\s+DOWN\b',
         r'\bFALLING\b',
@@ -153,21 +151,32 @@ def parse_direction(text: str) -> Optional[str]:
         r'\bBEARISH\b',
         r'\bSHORT\b',
     ]
-    DOWN_CHARS = ['🔽', '📉', '↓', '🔴', '⬇']
+    UP_CHARS_PRIMARY   = ['🔼', '↑', '⬆']          # unambiguous directional
+    UP_CHARS_SECONDARY = ['📈', '🟢']               # may appear in forecast/chart context
+    DOWN_CHARS_PRIMARY   = ['🔽', '↓', '⬇']        # unambiguous directional
+    DOWN_CHARS_SECONDARY = ['📉', '🔴']             # may appear in metadata lines
 
-    # Emoji/char indicators (unambiguous — check first)
-    for ch in UP_CHARS:
-        if ch in text:
-            return 'call'
-    for ch in DOWN_CHARS:
+    # Check unambiguous directional emojis first (🔽/🔼/⬆/⬇)
+    for ch in DOWN_CHARS_PRIMARY:
         if ch in text:
             return 'put'
+    for ch in UP_CHARS_PRIMARY:
+        if ch in text:
+            return 'call'
 
     for pattern in UP_PATTERNS:
         if re.search(pattern, t):
             return 'call'
     for pattern in DOWN_PATTERNS:
         if re.search(pattern, t):
+            return 'put'
+
+    # Secondary emoji check (📈/📉) — only if no keyword match above
+    for ch in UP_CHARS_SECONDARY:
+        if ch in text:
+            return 'call'
+    for ch in DOWN_CHARS_SECONDARY:
+        if ch in text:
             return 'put'
 
     return None
@@ -177,7 +186,7 @@ def parse_direction(text: str) -> Optional[str]:
 
 # Emojis that commonly precede the asset symbol line
 _ASSET_EMOJI_RE = re.compile(
-    r'(?:👉|📊|📈|📉|💹|🎯|⚡|🔔|🔸|🔹|➡|▶|💷|💵|•|\*)\s*(.+?)(?:\n|$)'
+    r'(?:👉|📊|📈|📉|💹|🎯|⚡|🔔|🔸|🔹|➡|▶|💷|💵|💳|•|\*)\s*(.+?)(?:\n|$)'
 )
 
 # Standalone forex-pair line: "USD/BRL (OTC)", "USDMXN-OTCq", "EURUSD_otc", "NZD/JPY"
@@ -247,6 +256,42 @@ def _extract_asset(text: str) -> Optional[tuple]:
     return None
 
 
+def parse_trend(text: str) -> Optional[str]:
+    """
+    Extract trend value from signal text.
+    Looks for patterns like '🚦 Tend: Buy', '🚦 Tend: Sell', '🚦 Tend: Neutral'.
+    Returns lowercase string: 'buy', 'sell', 'neutral', or None.
+    """
+    if not text:
+        return None
+    m = re.search(r'(?:Tend|Trend)\s*[:\-]\s*(Buy|Sell|Neutral|Up|Down)', text, re.IGNORECASE)
+    if m:
+        val = m.group(1).lower()
+        if val in ('buy', 'up'):
+            return 'buy'
+        if val in ('sell', 'down'):
+            return 'sell'
+        if val == 'neutral':
+            return 'neutral'
+    return None
+
+
+def parse_forecast(text: str) -> Optional[float]:
+    """Extract forecast percentage, e.g. '📈 Forecast: 83.35%' → 83.35."""
+    if not text:
+        return None
+    m = re.search(r'Forecast\s*[:\-]\s*([\d.]+)\s*%', text, re.IGNORECASE)
+    return float(m.group(1)) if m else None
+
+
+def parse_payout(text: str) -> Optional[float]:
+    """Extract payout percentage, e.g. '💸 Payout: 77.0%' → 77.0."""
+    if not text:
+        return None
+    m = re.search(r'Payout\s*[:\-]\s*([\d.]+)\s*%', text, re.IGNORECASE)
+    return float(m.group(1)) if m else None
+
+
 def parse_signal(text: str) -> Optional[Dict[str, Any]]:
     """
     Parse a signal message — full or partial.
@@ -275,10 +320,11 @@ def parse_signal(text: str) -> Optional[Dict[str, Any]]:
     # Minutes: ⏱ 2 MINUTE | ⌛ 1 Minutes | ⏰ 3 MINUTE | plain "5 MINUTES"
     # Seconds: ⌛ 30 SECONDS | ⏱ 30s | "30 SEC" | "30 SECOND"
     # Variation selector U+FE0F may trail clock emojis — consume it.
+    # Also handles 🔥 M1 / 🔥 1 MINUTE style used by some channels.
 
     # Try minutes first
     m = re.search(
-        r'[⏱⏰⌛⌚⏳]\ufe0f?[\s\ufe0f]*(\d+)\s*(?:MINUTES?|MINS?|MIN\b)',
+        r'[⏱⏰⌛⌚⏳🔥]\ufe0f?[\s\ufe0f]*(\d+)\s*(?:MINUTES?|MINS?|MIN\b)',
         text, re.IGNORECASE,
     )
     if not m:
@@ -286,9 +332,9 @@ def parse_signal(text: str) -> Optional[Dict[str, Any]]:
     if m:
         result['duration'] = int(m.group(1)) * 60
 
-    # Try M-notation shorthand: M1 / M5 / M15 / M30 (e.g. "⌚️ M1", "⏱ M5")
+    # Try M-notation shorthand: M1 / M5 / M15 / M30 (e.g. "⌚️ M1", "⏱ M5", "🔥 M1")
     if 'duration' not in result:
-        m = re.search(r'[⌚⏱⏰⌛⏳]\ufe0f?[\s]*[Mm](\d+)\b', text)
+        m = re.search(r'[⌚⏱⏰⌛⏳🔥]\ufe0f?[\s]*[Mm](\d+)\b', text)
         if not m:
             m = re.search(r'(?:^|\n)\s*[Mm](\d+)\b', text)
         if m:
@@ -313,31 +359,51 @@ def parse_signal(text: str) -> Optional[Dict[str, Any]]:
 
     # ── Entry Time (optional — ⏰ HH:MM or standalone HH:MM line) ─────────
     # Supports 24-hour (23:41) and 12-hour (11:41 PM / 11:41PM) formats.
+    # Also supports ⌛️ HH:MM:SS format used by some channels (UTC-3 timezone).
     # Must NOT fire on duration lines like "⏰ 3 MINUTES".
     # Strategy: match HH:MM only when NOT followed by a time-unit word.
     # Clock-face emojis 🕐–🕧 (U+1F550–U+1F567) are also used for entry times.
     _CLOCK_FACES = '\U0001F550-\U0001F567'
+
+    # First try ⌛️ HH:MM:SS format (e.g. "⌛️ 02:28:00")
     m_et = re.search(
-        rf'[⏰⏳{_CLOCK_FACES}]\ufe0f?\s*(\d{{1,2}}):(\d{{2}})[^\S\n]*(AM|PM)?[^\S\n]*(?!\S*(?:MINUTE|SECOND|MIN|SEC)\b)',
+        r'[⌛⏳]\ufe0f?\s*(\d{1,2}):(\d{2}):\d{2}[^\S\n]*(AM|PM)?',
         text, re.IGNORECASE,
     )
-    if not m_et:
-        # Fallback: standalone HH:MM on its own line — optional AM/PM on same line
-        m_et = re.search(
-            r'(?:^|\n)\s*(\d{1,2}):(\d{2})[^\S\n]*(AM|PM)?[^\S\n]*(?:\n|$)',
-            text, re.MULTILINE | re.IGNORECASE,
-        )
     if m_et:
         hh_v = int(m_et.group(1))
         mm_v = int(m_et.group(2))
         ampm = (m_et.group(3) or '').upper()
-        # Convert 12-hour to 24-hour
         if ampm == 'PM' and hh_v != 12:
             hh_v += 12
         elif ampm == 'AM' and hh_v == 12:
             hh_v = 0
         if 0 <= hh_v <= 23 and 0 <= mm_v <= 59:
             result['entry_time'] = f"{hh_v:02d}:{mm_v:02d}"
+            result['entry_time_tz'] = 'UTC-3'  # flag for caller to convert
+
+    if 'entry_time' not in result:
+        m_et = re.search(
+            rf'[⏰⏳{_CLOCK_FACES}]\ufe0f?\s*(\d{{1,2}}):(\d{{2}})[^\S\n]*(AM|PM)?[^\S\n]*(?!\S*(?:MINUTE|SECOND|MIN|SEC)\b)',
+            text, re.IGNORECASE,
+        )
+        if not m_et:
+            # Fallback: standalone HH:MM on its own line — optional AM/PM on same line
+            m_et = re.search(
+                r'(?:^|\n)\s*(\d{1,2}):(\d{2})[^\S\n]*(AM|PM)?[^\S\n]*(?:\n|$)',
+                text, re.MULTILINE | re.IGNORECASE,
+            )
+        if m_et:
+            hh_v = int(m_et.group(1))
+            mm_v = int(m_et.group(2))
+            ampm = (m_et.group(3) or '').upper()
+            # Convert 12-hour to 24-hour
+            if ampm == 'PM' and hh_v != 12:
+                hh_v += 12
+            elif ampm == 'AM' and hh_v == 12:
+                hh_v = 0
+            if 0 <= hh_v <= 23 and 0 <= mm_v <= 59:
+                result['entry_time'] = f"{hh_v:02d}:{mm_v:02d}"
 
     # ── Amount (optional) ──────────────────────────────────────────────────
     # Matches:  💵Use 200 $ from balance | Use 125$ | Use 1,000 $ | "Use 5 $"
@@ -360,6 +426,19 @@ def parse_signal(text: str) -> Optional[Dict[str, Any]]:
     direction = parse_direction(text)
     if direction:
         result['direction'] = direction
+
+    # ── Trend / Forecast / Payout (optional extra metadata) ───────────────
+    trend = parse_trend(text)
+    if trend:
+        result['trend'] = trend
+
+    forecast = parse_forecast(text)
+    if forecast is not None:
+        result['forecast'] = forecast
+
+    payout = parse_payout(text)
+    if payout is not None:
+        result['payout'] = payout
 
     return result
 
