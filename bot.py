@@ -5304,24 +5304,46 @@ async def execute_signal_trade(signal: Dict[str, Any]):
     entry_time_tz: str = signal.get('entry_time_tz', '')     # e.g. "UTC-3" or ""
     timed_entry = False
 
-    # ── Convert UTC-3 entry time to local/UTC ────────────────────────────────
-    # Some channels (like this one) broadcast entry times in UTC-3.
-    # We need to add 3 hours to get UTC, then compare against system UTC clock.
-    if entry_time_str and entry_time_tz == 'UTC-3':
-        try:
-            hh, mm = map(int, entry_time_str.split(':'))
-            # Convert UTC-3 → UTC by adding 3 hours
-            total_minutes = hh * 60 + mm + 180  # +3h = +180 min
-            total_minutes %= 1440  # wrap around midnight
-            hh_utc = total_minutes // 60
-            mm_utc = total_minutes % 60
-            entry_time_str = f"{hh_utc:02d}:{mm_utc:02d}"
-            logger.info(
-                f"[Signal Trade] Converted entry time UTC-3 → UTC: "
-                f"{signal.get('entry_time')} → {entry_time_str}"
-            )
-        except Exception as _tz_err:
-            logger.warning(f"[Signal Trade] Failed to convert UTC-3 entry time: {_tz_err}")
+    # ── Convert channel-timezone entry time → UTC ────────────────────────────
+    # Priority:
+    #   1. Channel's stored timezone (set via /setchannel → timezone button)
+    #   2. Timezone tag embedded in the parsed signal (e.g. 'UTC-3' from ⌛️)
+    #   3. No conversion — assume entry time is already UTC
+    if entry_time_str:
+        # 1. Look up channel timezone from settings
+        _ch_tz_str = ''
+        _sig_channel_id = signal.get('_channel_id')
+        if _sig_channel_id:
+            sig_settings_now = await get_signal_settings()
+            for _ch in sig_settings_now.get('channels', []):
+                if str(_ch.get('id', '')) == str(_sig_channel_id):
+                    _ch_tz_str = _ch.get('timezone', '').strip()
+                    break
+
+        # 2. Fall back to signal-embedded timezone tag if channel has none
+        if not _ch_tz_str:
+            _ch_tz_str = entry_time_tz  # e.g. "UTC-3" from ⌛️ parsing
+
+        # 3. Convert to UTC if we have a timezone
+        if _ch_tz_str:
+            try:
+                tz_obj = _resolve_tz(_ch_tz_str)
+                if tz_obj is not None:
+                    hh, mm = map(int, entry_time_str.split(':'))
+                    # Build a naive datetime for today, localize to channel tz, convert to UTC
+                    today = datetime.datetime.now(datetime.timezone.utc).date()
+                    local_dt = datetime.datetime(today.year, today.month, today.day, hh, mm,
+                                                 tzinfo=tz_obj)
+                    utc_dt = local_dt.astimezone(datetime.timezone.utc)
+                    entry_time_str = utc_dt.strftime('%H:%M')
+                    logger.info(
+                        f"[Signal Trade] Converted entry time {_ch_tz_str} → UTC: "
+                        f"{signal.get('entry_time')} → {entry_time_str}"
+                    )
+                else:
+                    logger.warning(f"[Signal Trade] Could not resolve timezone '{_ch_tz_str}', using entry time as-is")
+            except Exception as _tz_err:
+                logger.warning(f"[Signal Trade] Failed to convert entry time timezone: {_tz_err}")
     # ─────────────────────────────────────────────────────────────────────────
 
     # ── Concurrent timed-entry collision guard ────────────────────────────────
@@ -5474,17 +5496,6 @@ async def execute_signal_trade(signal: Dict[str, Any]):
     _late_timed_entry = False  # set True if signal arrived < 8s before target
     if entry_time_str:
         global _timed_entry_cancel, _timed_entry_info
-
-        # ── Future: per-channel timezone resolution (reserved) ───────────────
-        # ch_tz_str = ""
-        # sig_channel_id = signal.get('_channel_id')
-        # if sig_channel_id:
-        #     for ch in sig_settings.get('channels', []):
-        #         if str(ch.get('id', '')) == str(sig_channel_id):
-        #             ch_tz_str = ch.get('timezone', '')
-        #             break
-        # tz_obj = _resolve_tz(ch_tz_str)
-        # ─────────────────────────────────────────────────────────────────────
 
         # Capture current time and initial wait for the notification
         now_local = datetime.datetime.now()
